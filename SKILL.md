@@ -68,11 +68,11 @@ zot delete <item-key>                           # 删除条目
 
 ## 工具脚本
 
-脚本位置：`./zot.py`（与 SKILL.md 同级目录）
+脚本位置：`scripts/zot.py`（与 SKILL.md 同级目录）
 ```bash
-python3 ./zot.py <command>
+python3 scripts/zot.py <command>
 # 或创建别名
-alias zot="python3 ./zot.py"
+alias zot="python3 scripts/zot.py"
 ```
 
 ## 实现细节
