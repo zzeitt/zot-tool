@@ -1455,7 +1455,9 @@ if __name__ == "__main__":
             print("Usage: zot delete <item-key>")
         else:
             try:
-                zot.delete_item(item_key)
+                items = zot.item(item_key)
+                item = items[0] if isinstance(items, list) else items
+                zot.delete_item(item)
                 print(f"✅ Deleted item: {item_key}")
             except Exception as e:
                 print(f"❌ Failed: {e}")
