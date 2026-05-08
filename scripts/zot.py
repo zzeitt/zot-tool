@@ -1152,7 +1152,21 @@ def _create_content_note(url, title, item_type, parent_key):
     # === 通用内容 ===
     desc = getattr(sys.modules[__name__], '_last_fetched_description', '') or ''
 
-    # 优先 LLM 生成
+    # 描述为空时不调用 LLM（容易生成 prompt 回声），直接用规则生成
+    if not desc.strip():
+        note_text = (
+            f'<h3>📝 文章速览</h3>'
+            f'<p><strong>标题</strong>：{title}</p>'
+            f'<p><strong>来源</strong>：<a href="{url}">{url[:70]}</a></p>'
+        )
+        try:
+            zot.create_items([{'itemType': 'note', 'parentItem': parent_key, 'note': note_text}])
+            print("📝 Created content summary note")
+        except Exception as e:
+            print(f"⚠️ Note creation failed: {e}")
+        return
+
+    # 优先 LLM 生成（有描述内容时）
     summary = _llm_summarize(title, desc, item_type, url)
 
     if summary:
@@ -1183,8 +1197,8 @@ def _create_content_note(url, title, item_type, parent_key):
     try:
         zot.create_items([{'itemType': 'note', 'parentItem': parent_key, 'note': note_text}])
         print("📝 Created content summary note")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Note creation failed: {e}")
 
 
 def _generate_chinese_hook(title, description):
