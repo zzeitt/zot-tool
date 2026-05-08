@@ -6,7 +6,24 @@ import re
 import json
 import subprocess
 import html
+import tempfile
+import platform
 from pyzotero import zotero
+
+IS_WINDOWS = platform.system() == "Windows"
+
+def _get_temp_dir():
+    """Get platform-appropriate temp directory"""
+    if IS_WINDOWS:
+        return tempfile.gettempdir()
+    return "/tmp"
+
+def _get_offline_dir():
+    """Get offline storage directory"""
+    if IS_WINDOWS:
+        default_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Temp", "zotero-offline")
+        return os.environ.get("ZOTERO_OFFLINE_DIR", default_dir)
+    return os.environ.get("ZOTERO_OFFLINE_DIR", "/tmp/zotero-offline")
 
 LIBRARY_ID = os.environ.get("ZOTERO_LIBRARY_ID")
 API_KEY = os.environ.get("ZOTERO_API_KEY")
@@ -30,7 +47,7 @@ if not MISC_COLLECTION:
     print("Error: ZOTERO_MISC_COLLECTION not set")
     sys.exit(1)
 
-zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY)
+zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY, timeout=30)
 
 # Cache forbidden items
 _forbidden_item_keys = None
@@ -511,6 +528,9 @@ def _extract_concepts(text):
     """从文本中提取核心概念，生成 #tag 格式（无空格，不超过3个）"""
     text_lower = text.lower()
 
+    # 如果文本看起来像URL（而非真实标题），跳过概念规则匹配，直接走 fallback
+    is_url_text = _is_url(text)
+
     # 预设领域关键词到 tag 的映射
     concept_rules = [
         (["ai", "artificial intelligence", "大模型", "gpt", "claude", "llm", "machine learning", "机器学习", "deep learning", "深度学习", "transformer", "neural network"], "#AI-ML🤖"),
@@ -542,6 +562,12 @@ def _extract_concepts(text):
     ]
 
     tags = []
+
+    # URL文本：无法提取有意义的标签，直接返回空列表
+    if is_url_text:
+        return []
+
+    # 非URL文本：正常进行概念规则匹配
     for keywords, tag in concept_rules:
         if any(kw in text_lower for kw in keywords):
             if tag not in tags:
@@ -558,12 +584,21 @@ def _extract_concepts(text):
                       "tiny", "small", "large", "big", "new", "old", "best", "first", "last", "such"}
         candidates = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
         if candidates:
-            # 取最前面的名词
             core = candidates[0].lower()
             emoji = _emoji_for_tag(core)
             tags.append(f"#{core}{emoji}")
 
-    return tags if tags else ["#misc🔗"]
+    return tags if tags else []
+
+
+def _is_url(text):
+    """Check if text looks like a URL"""
+    return bool(re.match(r'^https?://', text.strip()))
+
+
+def _is_wechat_url(url):
+    """Check if URL is a WeChat article"""
+    return "mp.weixin.qq.com" in url.lower()
 
 
 def _extract_collection_keywords(name):
@@ -611,6 +646,11 @@ def _extract_text_keywords(text):
 def find_best_collection(title, description):
     """匹配最合适的 collection，无匹配则返回 None"""
     text = (title + " " + description).lower()
+
+    # 如果标题是URL，description也为空，则无法进行有意义的匹配
+    if _is_url(title) and not description.strip():
+        return None
+
     text_keywords = _extract_text_keywords(text)
     collections = zot.collections()
     best_match = None
@@ -636,13 +676,42 @@ def find_best_collection(title, description):
 
 def create_misc_subcollection(name_hint):
     """在 Misc 下创建新的子集合，名称格式：Misc--xxx"""
-    stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by", "as", "that"}
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name_hint)
-    keywords = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
-    if keywords:
-        sub_name = "/".join(keywords[:2]).lower()
+    # 如果 name_hint 是 URL，提取域名作为子集合名
+    if _is_url(name_hint):
+        url_lower = name_hint.lower()
+        if "weixin.qq.com" in url_lower or "mp.weixin.qq.com" in url_lower:
+            sub_name = "wechat"
+        elif "ycombinator.com" in url_lower:
+            sub_name = "hn"
+        elif "github.com" in url_lower:
+            sub_name = "github"
+        elif "bilibili.com" in url_lower:
+            sub_name = "bilibili"
+        elif "youtube.com" in url_lower:
+            sub_name = "youtube"
+        elif "arxiv.org" in url_lower:
+            sub_name = "arxiv"
+        elif "podcasts.apple.com" in url_lower:
+            sub_name = "podcast"
+        else:
+            # 尝试提取域名
+            domain_match = re.search(r'://([^/]+)', url_lower)
+            if domain_match:
+                domain = domain_match.group(1)
+                # 取主要部分（如 example.com -> example）
+                parts = domain.replace(".", " ").split()
+                sub_name = parts[0] if parts else "web"
+            else:
+                sub_name = "web"
     else:
-        sub_name = "uncategorized"
+        stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by", "as", "that",
+                      "https", "http", "com", "org", "net", "html", "php", "aspx", "weixin", "qq", "mp"}
+        words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name_hint)
+        keywords = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
+        if keywords:
+            sub_name = "/".join(keywords[:2]).lower()
+        else:
+            sub_name = "uncategorized"
     full_name = f"Misc--{sub_name}"
 
     existing = zot.collections()
@@ -673,9 +742,10 @@ def save_offline_copy(url, parent_item_key, title_hint=None):
     """
     # 检查 monolith 是否可用
     try:
-        result = subprocess.run(["which", "monolith"], capture_output=True, text=True)
+        cmd = "where" if IS_WINDOWS else "which"
+        result = subprocess.run([cmd, "monolith"], capture_output=True, text=True)
         if result.returncode != 0:
-            print("⚠️  monolith not installed. Run: apk add monolith")
+            print("⚠️  monolith not installed.")
             return None
     except Exception:
         print("⚠️  monolith not available")
@@ -689,7 +759,7 @@ def save_offline_copy(url, parent_item_key, title_hint=None):
 
     # 用 monolith 抓取
     print(f"💾 Saving offline copy with monolith...")
-    tmp_html = f"/tmp/{filename}"
+    tmp_html = os.path.join(_get_temp_dir(), filename)
     try:
         result = subprocess.run(
             ["monolith", "-o", tmp_html, url],
@@ -816,7 +886,7 @@ def _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, w
 
 def _save_local_with_note(tmp_html, parent_item_key, url, filename):
     """保存到本地目录，并添加导入说明 note"""
-    out_dir = os.environ.get("ZOTERO_OFFLINE_DIR", "/tmp/zotero-offline")
+    out_dir = os.environ.get("ZOTERO_OFFLINE_DIR") or _get_offline_dir()
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)
 
@@ -1053,7 +1123,7 @@ def _llm_summarize(title, description, item_type, url):
         input_obj = {
             "messages": [{"role": "user", "content": prompt}]
         }
-        tmp = f"/tmp/zot_llm_{os.getpid()}.json"
+        tmp = os.path.join(_get_temp_dir(), f"zot_llm_{os.getpid()}.json")
         with open(tmp, "w") as f:
             json.dump(input_obj, f, ensure_ascii=False)
         try:
@@ -1262,6 +1332,11 @@ def archive_url(url, title_hint=None, save_offline=True):
             hn_title_override = _cached_hn_info["title"]
             description = _cached_hn_info["title"]  # 用 HN 标题作为描述，提升 collection/tag 匹配质量
 
+    # WeChat 文章：标题需要浏览器渲染，curl 抓不到
+    if _is_wechat_url(url) and not title_hint:
+        print("⚠️  WeChat article detected. Title requires browser rendering.")
+        print("⚠️  Suggestion: use 'zot archive <url> \"<title-hint>\"' for better results.")
+
     print(f"🔍 Fetching metadata for: {url}")
     meta = fetch_url_metadata(url)
     title = title_hint or hn_title_override or meta.get("title", "Untitled")
@@ -1271,7 +1346,13 @@ def archive_url(url, title_hint=None, save_offline=True):
     if meta.get("error"):
         print(f"⚠️ Metadata fetch warning: {meta['error']}")
     print(f"📄 Title: {title[:80]}")
-    print(f"📝 Description: {description[:100]}...")
+    print(f"📝 Description: {description[:100] if description else '(no description)'}...")
+
+    # 如果标题是URL且没有任何描述，也没有提供title_hint，则无法进行有效归档
+    if _is_url(title) and not description.strip() and not title_hint:
+        print("❌ Cannot archive: title is URL and no description available.")
+        print("❌ Please provide a title hint: zot archive <url> \"<title>\"")
+        return None
 
     tags = infer_tags(title, description)
     print(f"🏷️  Inferred tags: {', '.join(tags)}")
@@ -1284,6 +1365,17 @@ def archive_url(url, title_hint=None, save_offline=True):
         print("🔨 No matching collection found, creating new Misc--xxx subcollection...")
         coll_key = create_misc_subcollection(title + " " + description)
         coll_name = "new Misc--xxx"
+
+    # 检查URL是否已存在（避免重复创建）
+    existing_items = zot.items(q=url, limit=10)
+    allowed = [i for i in existing_items if is_allowed(i['key'])]
+    if allowed:
+        existing_key = allowed[0]['key']
+        existing_title = allowed[0].get('data', {}).get('title', 'Unknown')
+        print(f"⚠️  URL already archived as item: {existing_key}")
+        print(f"⚠️  Existing title: {existing_title[:60]}")
+        print(f"⚠️  Skipping duplicate creation.")
+        return existing_key
 
     item = {
         'itemType': item_type,
