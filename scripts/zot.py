@@ -693,7 +693,7 @@ def save_offline_copy(url, parent_item_key, title_hint=None):
     try:
         result = subprocess.run(
             ["monolith", "-o", tmp_html, url],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
             print(f"⚠️  monolith failed: {result.stderr}")
@@ -1241,6 +1241,7 @@ def archive_url(url, title_hint=None, save_offline=True):
     # HN 帖子：先获取真实标题，优化后续匹配
     global _cached_hn_info
     hn_title_override = None
+    description = ""
     if "ycombinator.com" in url.lower():
         _cached_hn_info = _fetch_hn_thread_info(url)
         if _cached_hn_info and _cached_hn_info.get("title"):
