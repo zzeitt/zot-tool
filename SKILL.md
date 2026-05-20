@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.4.0
+version: 1.4.1
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -89,5 +89,5 @@ alias zot="python3 scripts/zot.py"
 - 使用 Zotero API v3
 - 缓存 forbidden items 避免重复请求
 - 支持递归排除子 collection
-- API 请求超时设置为 30 秒
+- pyzotero 版本需 ≥1.11.0（不支持旧版 `timeout=` 参数）
 

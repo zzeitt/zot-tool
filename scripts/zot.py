@@ -47,7 +47,7 @@ if not MISC_COLLECTION:
     print("Error: ZOTERO_MISC_COLLECTION not set")
     sys.exit(1)
 
-zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY, timeout=30)
+zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY)
 
 # Cache forbidden items
 _forbidden_item_keys = None
