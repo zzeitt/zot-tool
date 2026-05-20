@@ -1317,8 +1317,15 @@ _last_fetched_description = ""
 _cached_hn_info = None
 
 
-def archive_url(url, title_hint=None, save_offline=True):
-    """智能归档 URL 到 Zotero：自动推断 collection 和 tags，默认保存离线副本"""
+def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
+    """智能归档 URL 到 Zotero：自动推断 collection 和 tags，默认保存离线副本
+
+    Args:
+        url: 目标 URL
+        title_hint: 手动指定标题（可选，用于 JS 渲染页面等无法抓取标题的场景）
+        tag_hints: 用户建议的标签列表（如 ["#llm", "#visualize"]），会与 infer_tags 结果合并
+        save_offline: 是否保存离线 HTML 副本
+    """
     global _last_fetched_description
     _last_fetched_description = ""  # reset
 
@@ -1354,8 +1361,24 @@ def archive_url(url, title_hint=None, save_offline=True):
         print("❌ Please provide a title hint: zot archive <url> \"<title>\"")
         return None
 
-    tags = infer_tags(title, description)
-    print(f"🏷️  Inferred tags: {', '.join(tags)}")
+    # 合并 tags：用户建议优先（取前3个），不足时用 infer_tags 结果补满3个
+    inferred = infer_tags(title, description)
+    final_tags = []
+    if tag_hints:
+        for t in tag_hints:
+            tag = t if t.startswith("#") else f"#{t}"
+            if tag not in final_tags:
+                final_tags.append(tag)
+            if len(final_tags) >= 3:
+                break
+    if len(final_tags) < 3:
+        for t in inferred:
+            tag = t if t.startswith("#") else f"#{t}"
+            if tag not in final_tags:
+                final_tags.append(tag)
+            if len(final_tags) >= 3:
+                break
+    print(f"🏷️  Tags: {', '.join(final_tags)}")
 
     matched = find_best_collection(title, description)
     if matched:
@@ -1382,7 +1405,7 @@ def archive_url(url, title_hint=None, save_offline=True):
         'title': title,
         'url': url,
         'abstractNote': description,
-        'tags': [{'tag': '/unread', 'type': 1}] + [{'tag': t, 'type': 1} for t in tags]
+        'tags': [{'tag': '/unread', 'type': 1}] + [{'tag': t, 'type': 1} for t in final_tags]
     }
     if item_type == "podcast" and meta.get("seriesTitle"):
         item['seriesTitle'] = meta['seriesTitle']
@@ -1395,7 +1418,7 @@ def archive_url(url, title_hint=None, save_offline=True):
         fetched = items[0] if isinstance(items, list) else items
         zot.addto_collection(coll_key, fetched)
         print(f"📁 Archived to collection: {coll_key} ({coll_name})")
-        print(f"🏷️  Tagged with: /unread, {', '.join(tags)}")
+        print(f"🏷️  Tagged with: /unread, {', '.join(final_tags)}")
 
         # 保存离线副本
         if save_offline:
@@ -1420,8 +1443,8 @@ Commands:
   list [limit]                   List recent items
   collections                    List all collections
   add <type> <title> <url> <coll> [extra]   Add item with /unread tag
-  archive <url> [title-hint]     Smart archive URL with auto collection/tag
-  archive --no-offline <url>     Archive without saving offline copy
+  archive <url> [title-hint] [#tag1]...  Smart archive with auto collection/tag (+ optional tag hints)
+  archive --no-offline <url>    Archive without saving offline copy
   addnote <item-key> [content]   Add LLM-generated note to existing item
   delete <item-key>              Delete an item from library
   help                           Show this help
@@ -1529,17 +1552,35 @@ if __name__ == "__main__":
                     print(f"❌ Failed: {e}")
 
     elif cmd == "archive":
-        url = sys.argv[2] if len(sys.argv) > 2 else ""
-        title_hint = sys.argv[3] if len(sys.argv) > 3 else None
+        # 解析格式：zot archive [--no-offline] <url> [title-hint] [#tag1] [#tag2] ...
+        # - 非 # 开头的字符串（非 --no-offline）→ title_hint（取第一个）
+        # - # 开头的字符串 → tag_hints
+        url = ""
+        title_hint = None
+        tag_hints = []
         save_offline = True
-        if url == "--no-offline":
-            save_offline = False
-            url = sys.argv[3] if len(sys.argv) > 3 else ""
-            title_hint = sys.argv[4] if len(sys.argv) > 4 else None
+
+        raw_args = sys.argv[2:]
+        i = 0
+        while i < len(raw_args):
+            arg = raw_args[i]
+            if arg == "--no-offline":
+                save_offline = False
+            elif arg.startswith("http://") or arg.startswith("https://"):
+                url = arg
+            elif arg.startswith("#"):
+                tag_hints.append(arg)
+            elif not title_hint:
+                # 非 URL、非 #、非 flag 的第一个字符串 → title_hint
+                title_hint = arg
+            # 忽略多余的 non-URL/non-# 字符串
+            i += 1
+
         if not url:
-            print("Usage: zot archive [--no-offline] <url> [title-hint]")
+            print("Usage: zot archive [--no-offline] <url> [title-hint] [#tag1] [#tag2] ...")
+            print("Example: zot archive https://example.com \"Article Title\" #topic #ai")
         else:
-            archive_url(url, title_hint, save_offline=save_offline)
+            archive_url(url, title_hint, tag_hints, save_offline=save_offline)
 
     elif cmd == "delete":
         item_key = sys.argv[2] if len(sys.argv) > 2 else ""

@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.4.1
+version: 1.5.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -32,8 +32,8 @@ zot collections          # 列出所有 Collections
 ### 条目管理
 ```bash
 zot add <type> "<title>" <url> <coll> [extra]   # 添加新条目（自动带上 /unread 标签）
-zot archive <url> [hint]                        # 智能归档
-zot archive --no-offline <url>                  # 归档但不保存离线副本
+zot archive <url> ["title-hint"] [#tag1] [#tag2]   # 智能归档（tag 不覆盖标题）
+zot archive --no-offline <url> ["title-hint"] [#tag1]  # 归档但不保存离线副本
 zot addnote <item-key> [content]                # 添加 LLM 生成摘要的 Note
 zot delete <item-key>                           # 删除条目
 ```
@@ -48,8 +48,9 @@ zot delete <item-key>                           # 删除条目
 3. 推断合适的 itemType 和 tags
 4. 在已有 Collections 中查找最佳匹配，无匹配则创建 Misc--xxx 子集合
 5. 自动添加 /unread 标签
-6. 用 monolith 保存离线 HTML 副本
-7. 将离线文件作为附件上传到该条目
+6. 用户提供的 #tag 建议（若有）优先，未满 3 个时由 infer_tags 补足
+7. 用 monolith 保存离线 HTML 副本
+8. 将离线文件作为附件上传到该条目
 
 ## 标签约定
 
