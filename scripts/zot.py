@@ -732,14 +732,80 @@ def create_misc_subcollection(name_hint):
     return MISC_COLLECTION
 
 
-def save_offline_copy(url, parent_item_key, title_hint=None):
-    """保存离线 HTML 副本
+def _detect_binary_url(url):
+    """检测 URL 是否为二进制文件（PDF/EPUB 等），返回 (is_binary, content_type, filename_hint)"""
+    # 1. URL path 扩展名
+    url_lower = url.lower()
+    path_hint = None
+    # 常见二进制扩展名模式（排除 query string 中的扩展名）
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lower()
+    bin_exts = {".pdf": "application/pdf", ".epub": "application/epub+zip",
+                ".mobi": "application/x-mobipocket-ebook",
+                ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".zip": "application/zip"}
+    for ext, ct in bin_exts.items():
+        if path.endswith(ext):
+            path_hint = os.path.basename(path)
+            return True, ct, path_hint
+
+    # 2. 已知二进制文件站点的 URL 模式
+    # LibGen download pattern
+    if "libgen.li/get.php" in url_lower or "booksdl.lc/get.php" in url_lower:
+        return True, "application/pdf", None
+
+    # 3. Content-Disposition 重定向目标（需要 HEAD 请求）
+    # 简化为按域名判断
+    binary_domains = ["libgen.li", "booksdl.lc", "libgen.is", "libgen.rocks",
+                      "1lib.sk", "b-ok.cc", "b-ok.org", "bookfi.net", "libgen.fun"]
+    for dom in binary_domains:
+        if dom in url_lower and ("get.php" in url_lower or "/download" in url_lower):
+            return True, "application/pdf", None
+
+    return False, None, None
+
+
+def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
+    """保存离线副本（自动识别 HTML 或二进制文件）
 
     策略（按优先级）：
-    1. 若配置了 WebDAV（ZOTERO_WEBDAV_URL/USER/PASS）：
-       自动打包为 ZIP，通过 curl PUT 到 WebDAV，并创建 Zotero attachment item
-    2. 否则：保存到本地目录，并添加导入说明 note
+    1. 若 save_binary 参数显式指定，以其为准
+    2. 否则用 _detect_binary_url 检测
+    3. HTML：用 monolith 抓取
+    4. 二进制：用 archive_binary_url 下载 + 上传
+    5. 无 WebDAV：保存到本地目录
     """
+    # 检查是 HTML 还是二进制文件
+    is_binary, content_type, fname_hint = _detect_binary_url(url)
+
+    # 若 save_binary 显式指定，覆盖检测结果（None=auto, False=force HTML, True=force binary）
+    if save_binary is False:
+        is_binary = False
+    elif save_binary is True:
+        is_binary = True
+
+    webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
+    webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
+    webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
+    has_webdav = all([webdav_url, webdav_user, webdav_pass])
+
+    # ---- 二进制文件（PDF/EPUB等）----
+    if is_binary:
+        if not has_webdav:
+            print("⚠️  Binary file but WebDAV not configured, skipping offline save")
+            return None
+        if not content_type:
+            content_type = "application/octet-stream"
+        print(f"💾 Binary file detected: {content_type}")
+        return archive_binary_url(
+            url, parent_item_key,
+            content_type=content_type,
+            filename_hint=fname_hint,
+            title_hint=title_hint
+        )
+
+    # ---- HTML：用 monolith 抓取 ----
     # 检查 monolith 是否可用
     try:
         cmd = "where" if IS_WINDOWS else "which"
@@ -751,13 +817,11 @@ def save_offline_copy(url, parent_item_key, title_hint=None):
         print("⚠️  monolith not available")
         return None
 
-    # 生成文件名
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = re.sub(r'[^\w\-]', '_', (title_hint or url))[:40]
     filename = f"{timestamp}_{slug}.html"
 
-    # 用 monolith 抓取
     print(f"💾 Saving offline copy with monolith...")
     tmp_html = os.path.join(_get_temp_dir(), filename)
     try:
@@ -779,46 +843,46 @@ def save_offline_copy(url, parent_item_key, title_hint=None):
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
 
-    # 检查是否配置了 WebDAV
-    webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
-    webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
-    webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
-    has_webdav = all([webdav_url, webdav_user, webdav_pass])
-
     if has_webdav:
         return _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, webdav_pass)
     else:
         return _save_local_with_note(tmp_html, parent_item_key, url, filename)
 
 
-def _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, webdav_pass):
-    """打包为 ZIP，PUT 到 WebDAV，创建 Zotero attachment item"""
+def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_user, webdav_pass,
+                        content_type="text/html", archive_filename=None):
+    """打包为 ZIP，PUT 到 WebDAV，创建 Zotero attachment item
+
+    Args:
+        tmp_file_path: 原始文件路径（.html 或 .pdf 等）
+        content_type: MIME 类型，默认 text/html
+        archive_filename: 存档在 ZIP 内的文件名，默认取 basename
+    """
     import hashlib, zipfile
 
     # 1. 打包为 ZIP（Zotero 附件存储格式）
-    zip_path = tmp_html.replace(".html", ".zip")
-    html_filename = os.path.basename(tmp_html)
+    zip_path = tmp_file_path + ".zip"
+    internal_name = archive_filename or os.path.basename(tmp_file_path)
     with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.write(tmp_html, html_filename)
+        zf.write(tmp_file_path, internal_name)
 
     # 2. 计算 md5 和 mtime（必须是解压后原始文件的属性）
     # Zotero 客户端下载 ZIP 后会解压，然后验证解压后文件的 md5
-    with open(tmp_html, "rb") as f:
+    with open(tmp_file_path, "rb") as f:
         md5 = hashlib.md5(f.read()).hexdigest()
-    mtime = int(os.path.getmtime(tmp_html) * 1000)
+    mtime = int(os.path.getmtime(tmp_file_path) * 1000)
 
     # 3. 创建 Zotero attachment item
     # filename 和 contentType 必须是解压后的原始文件属性
     # WebDAV 上存的是 <itemKey>.zip，但 Zotero 客户端解压后按 filename 识别
-    html_filename = os.path.basename(tmp_html)
     try:
         attach = zot.create_items([{
             "itemType": "attachment",
             "parentItem": parent_item_key,
             "linkMode": "imported_file",
-            "title": html_filename,
-            "filename": html_filename,
-            "contentType": "text/html",
+            "title": internal_name,
+            "filename": internal_name,
+            "contentType": content_type,
             "md5": md5,
             "mtime": mtime
         }])
@@ -874,7 +938,7 @@ def _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, w
         return None
 
     # 6. 清理临时文件
-    for f in [tmp_html, zip_path]:
+    for f in [tmp_file_path, zip_path]:
         try:
             os.remove(f)
         except OSError:
@@ -924,6 +988,114 @@ def _save_local_with_note(tmp_html, parent_item_key, url, filename):
         print(f"⚠️  Failed to add note: {e}")
 
     return out_path
+
+
+def save_file_attachment(file_path, parent_item_key, content_type, archive_filename=None, title_hint=None):
+    """保存任意文件为 Zotero 附件（PDF/EPUB/DOC 等），自动上传 WebDAV
+
+    Args:
+        file_path: 本地文件路径
+        parent_item_key: 父条目的 key
+        content_type: MIME 类型（如 application/pdf、application/epub+zip）
+        archive_filename: ZIP 内存档名，默认取 basename
+        title_hint: 备用标题（用于 slug 生成）
+    """
+    if not os.path.exists(file_path):
+        print(f"❌ File not found: {file_path}")
+        return None
+
+    file_size = os.path.getsize(file_path)
+    print(f"📄 Attachment: {file_path} ({file_size/1024/1024:.1f} MB)")
+
+    webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
+    webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
+    webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
+    has_webdav = all([webdav_url, webdav_user, webdav_pass])
+
+    if not has_webdav:
+        print("❌ WebDAV not configured (ZOTERO_WEBDAV_URL/USER/PASS)")
+        return None
+
+    fname = archive_filename or os.path.basename(file_path)
+    print(f"💾 Uploading {fname} to WebDAV...")
+
+    attach_key = _upload_to_webdav(
+        tmp_file_path=file_path,
+        parent_item_key=parent_item_key,
+        url=None,
+        webdav_url=webdav_url,
+        webdav_user=webdav_user,
+        webdav_pass=webdav_pass,
+        content_type=content_type,
+        archive_filename=fname
+    )
+
+    if attach_key:
+        print(f"✅ Attachment saved: {attach_key} ({fname})")
+    return attach_key
+
+
+def _download_binary(url, dest_path):
+    """下载二进制文件（PDF/EPUB 等），跟随重定向直到最终文件"""
+    print(f"⬇️  Downloading: {url}")
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-L", "-o", dest_path, "--max-time", "120", url],
+            capture_output=True, text=True, timeout=150
+        )
+        if result.returncode != 0:
+            print(f"⚠️  Download failed: {result.stderr}")
+            return False
+        if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+            print("⚠️  Downloaded file is empty")
+            return False
+        return True
+    except Exception as e:
+        print(f"⚠️  Download error: {e}")
+        return False
+
+
+def _ext_for_content_type(ct):
+    """根据 MIME 类型推断文件扩展名"""
+    mapping = {
+        "application/pdf": "pdf",
+        "application/epub+zip": "epub",
+        "application/zip": "zip",
+        "application/msword": "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.ms-excel": "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "application/x-mobipocket-ebook": "mobi",
+        "application/octet-stream": "bin",
+    }
+    return mapping.get(ct, "bin")
+
+
+def archive_binary_url(url, item_key, content_type, filename_hint=None, title_hint=None):
+    """下载二进制文件（PDF/EPUB 等）并保存为 Zotero 附件
+
+    Args:
+        url: 下载 URL
+        item_key: Zotero 条目 key
+        content_type: MIME 类型（application/pdf、application/epub+zip 等）
+        filename_hint: 下载后的文件名
+        title_hint: 用于 slug 生成
+    """
+    slug = re.sub(r'[^\w\-]', '_', (title_hint or url))[:40]
+    default_ext = _ext_for_content_type(content_type)
+    fname = f"{filename_hint or slug}.{default_ext}"
+    tmp_path = os.path.join(_get_temp_dir(), fname)
+
+    if not _download_binary(url, tmp_path):
+        return None
+
+    return save_file_attachment(
+        file_path=tmp_path,
+        parent_item_key=item_key,
+        content_type=content_type,
+        archive_filename=fname,
+        title_hint=title_hint
+    )
 
 
 def _fetch_hn_thread_info(url):

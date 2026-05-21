@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.5.0
+version: 1.6.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -12,6 +12,7 @@ Zotero 文献库命令行管理工具，支持高级搜索、标签过滤、Coll
 - `ZOTERO_API_KEY` 环境变量已设置
 - `ZOTERO_LIBRARY_ID` 环境变量已设置（你的 Zotero Library ID）
 - Library Type: user
+- `ZOTERO_WEBDAV_URL/USER/PASS`：坚果云 WebDAV 端点及凭证（附件上传必需）
 
 ## 核心命令
 
@@ -32,8 +33,8 @@ zot collections          # 列出所有 Collections
 ### 条目管理
 ```bash
 zot add <type> "<title>" <url> <coll> [extra]   # 添加新条目（自动带上 /unread 标签）
-zot archive <url> ["title-hint"] [#tag1] [#tag2]   # 智能归档（tag 不覆盖标题）
-zot archive --no-offline <url> ["title-hint"] [#tag1]  # 归档但不保存离线副本
+zot archive <url> ["title-hint"] [#tag1] [#tag2]   # 智能归档（自动识别 HTML/二进制文件）
+zot archive --no-offline <url> ["title-hint] [#tag1]  # 归档但不保存离线副本
 zot addnote <item-key> [content]                # 添加 LLM 生成摘要的 Note
 zot delete <item-key>                           # 删除条目
 ```
@@ -49,8 +50,19 @@ zot delete <item-key>                           # 删除条目
 4. 在已有 Collections 中查找最佳匹配，无匹配则创建 Misc--xxx 子集合
 5. 自动添加 /unread 标签
 6. 用户提供的 #tag 建议（若有）优先，未满 3 个时由 infer_tags 补足
-7. 用 monolith 保存离线 HTML 副本
-8. 将离线文件作为附件上传到该条目
+7. **自动识别文件类型**：
+   - 二进制文件（PDF/EPUB 等）→ 直接下载原始文件，上传到 WebDAV
+   - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
+8. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
+
+### 二进制文件识别规则
+- URL path 以 `.pdf`/`.epub`/`.mobi`/`.docx` 等扩展名结尾
+- 已知二进制站点（LibGen、booksdl 等）的 `get.php` 下载链接
+- LibGen 格式：`https://libgen.li/ads.php?md5=...`（对应下载链接自动识别）
+
+### 不保存离线副本
+- 二进制文件无 WebDAV 配置时跳过离线保存
+- `--no-offline` 参数可强制跳过
 
 ## 标签约定
 
@@ -91,4 +103,6 @@ alias zot="python3 scripts/zot.py"
 - 缓存 forbidden items 避免重复请求
 - 支持递归排除子 collection
 - pyzotero 版本需 ≥1.11.0（不支持旧版 `timeout=` 参数）
-
+- 二进制附件通过 `_detect_binary_url` + `archive_binary_url` + `save_file_attachment` 自动处理
+- HTML 附件通过 `monolith` 抓取，经 `_upload_to_webdav` 上传
+- 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
