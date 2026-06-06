@@ -601,12 +601,49 @@ def _is_wechat_url(url):
     return "mp.weixin.qq.com" in url.lower()
 
 
+# 匹配时的停用词（v1.7.1 新增）
+# 出现在 coll 名字或文章文本中都不应作为匹配信号
+# "introduction" "guide" "overview" 这种泛词在 collection 命名里很常见
+_MATCH_STOPWORDS = {
+    # 英文冠词/介词/连词
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by",
+    "as", "that", "this", "it", "from", "at", "up", "out", "about", "into", "over",
+    "what", "which", "who", "when", "where", "why", "how", "all", "some", "any", "each",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "must", "can", "shall",
+    # 英文泛词（v1.7.1 新增，匹配噪声主因）
+    "introduction", "intro", "overview", "summary", "guide", "tutorial", "primer",
+    "basics", "fundamental", "fundamentals", "beginner", "beginners", "advanced",
+    "essentials", "concepts", "principles", "key", "complete", "comprehensive",
+    "practical", "modern", "new", "old", "best", "first", "last", "such",
+    # 中文常用停用词
+    "的", "了", "是", "在", "和", "与", "或", "等", "之", "为", "以", "于", "对",
+    "上", "下", "中", "也", "就", "都", "而", "及", "把", "被", "从", "到",
+    "一个", "一些", "这", "那", "此", "本", "其", "我们", "你", "他", "她", "它",
+}
+
+
 def _extract_collection_keywords(name):
-    """从 collection 名称中提取匹配关键词"""
+    """从 collection 名称中提取匹配关键词
+
+    设计原则（v1.7.0 重构）：
+    - 仅整词匹配，**不再**用 4 字符前缀子串匹配
+    - 4 字符前缀会误判（"transformer" 与 "transferable" 前缀相等）
+    - 保留常见缩写的 variant 映射（math↔mathematics, llm→large language model 等）
+    - 过滤停用词（v1.7.1 新增）："introduction" "guide" 等泛词不参与匹配
+    - 过滤单字符英文（v1.7.2 新增）：避免 "Euclid's" → "s" 与 "beginner's" → "s" 误匹配
+    """
     keywords = set()
     words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name)
     for w in words:
         w_lower = w.lower()
+        # 过滤停用词
+        if w_lower in _MATCH_STOPWORDS:
+            continue
+        # 过滤单字符英文（撇号分词产物，如 Euclid's → "s"）
+        # 中文单字通常有意义，保留
+        if len(w) == 1 and w.isascii():
+            continue
         keywords.add(w_lower)
         # 常见变体映射
         if w_lower == "math":
@@ -623,28 +660,118 @@ def _extract_collection_keywords(name):
             keywords.add("computer science")
         elif w_lower == "hpc":
             keywords.add("high performance computing")
-        if len(w_lower) > 3:
-            keywords.add(w_lower[:4])
     return keywords
 
 
 def _extract_text_keywords(text):
-    """从文本中提取关键词，包括合并形式"""
+    """从文本中提取关键词，包括合并形式
+
+    设计原则（v1.7.0 重构）：
+    - 仅整词匹配，**不再**加 4 字符前缀（4 字符前缀是误判主因）
+    - 保留两两相邻词合并（用于"deep learning"等短语概念匹配）
+    - 过滤停用词（v1.7.1 新增）：避免"introduction"等泛词触发误匹配
+    - 过滤单字符英文（v1.7.2 新增）：避免 "Euclid's" → "s" 等误匹配
+    """
     keywords = set()
     words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', text.lower())
+    filtered = []
     for w in words:
+        if w in _MATCH_STOPWORDS:
+            continue
+        # 过滤单字符英文
+        if len(w) == 1 and w.isascii():
+            continue
+        filtered.append(w)
+    for w in filtered:
         keywords.add(w)
-        if len(w) > 4:
-            keywords.add(w[:4])
-    # 两两相邻词合并
-    for i in range(len(words) - 1):
-        combined = words[i] + words[i+1]
+    # 两两相邻词合并（短语匹配）
+    for i in range(len(filtered) - 1):
+        combined = filtered[i] + filtered[i+1]
         keywords.add(combined)
     return keywords
 
 
+# 缓存 collection 内容签名（5 分钟 TTL）
+# 避免每次 archive 都重新拉 collection 内的 items
+_collection_sig_cache = {}
+_COLLECTION_SIG_TTL = 300  # seconds
+
+
+def _collection_content_signature(coll_key, limit=20):
+    """提取 collection 内容的关键词签名 + tag 频次
+
+    作用：让 collection 内的实际内容（标题/摘要/标签）也参与匹配
+    例如：Misc--neuroscience 已收录若干神经科学文章 → 新文章含"brain"也能匹配
+
+    Args:
+        coll_key: collection 的 Zotero key
+        limit: 取最近多少个 items（默认 20，平衡准确性与性能）
+
+    Returns:
+        (keywords_set, tag_counter_dict)
+
+    实现（v1.7.2 性能优化）：
+    - 旧实现：单次 bulk zot.items(limit=1000) + 本地分组 → 受 pyzotero 分页限制漏数据
+    - 新实现：单次 zot.collection_items(coll_key, limit) 直接拉 → 更快更准
+    - 配合 find_best_collection 的两遍扫描：仅对 top 5 候选调用 → 100×0.5s → 5×0.5s
+    """
+    import time
+    now = time.time()
+    cached = _collection_sig_cache.get(coll_key)
+    if cached and now - cached[0] < _COLLECTION_SIG_TTL:
+        return cached[1]
+
+    # 单次单 coll API 调用（pyzotero 内部分页）
+    try:
+        coll_items = zot.collection_items(coll_key, limit=limit)
+    except Exception as e:
+        print(f"⚠️  Failed to fetch items for collection {coll_key}: {e}")
+        result = (set(), {})
+        _collection_sig_cache[coll_key] = (now, result)
+        return result
+
+    text_parts = []
+    tag_counter = {}
+    for it in coll_items:
+        data = it.get('data', {})
+        title = data.get('title', '')
+        abstract = data.get('abstractNote', '')
+        if title:
+            text_parts.append(title)
+        if abstract:
+            text_parts.append(abstract)
+        for t in data.get('tags', []):
+            tag = t.get('tag', '').lower()
+            # 跳过系统标签（带 / 的）
+            if tag and not tag.startswith('/'):
+                tag_counter[tag] = tag_counter.get(tag, 0) + 1
+
+    full_text = " ".join(text_parts)
+    keywords = _extract_text_keywords(full_text) if full_text else set()
+
+    result = (keywords, tag_counter)
+    _collection_sig_cache[coll_key] = (now, result)
+    return result
+
+
 def find_best_collection(title, description):
-    """匹配最合适的 collection，无匹配则返回 None"""
+    """匹配最合适的 collection，无匹配则返回 None
+
+    多信号评分策略（v1.7.x 重构）：
+    1. coll 名字关键词 ∩ text 关键词 → +1/词
+    2. coll 内容关键词（最近 20 条 items 的 title+abstract）∩ text 关键词 → +2/词
+    3. 阈值：非空 coll 需 ≥ 3；空 coll 只需 ≥ 1
+
+    两遍扫描策略（v1.7.2 性能优化）：
+    - 第 1 遍：仅用 name 评分（无 API 调用）→ 找出 top 候选
+    - 第 2 遍：只对 top 候选（默认前 5）fetch content signature
+    - 大幅减少 API 调用次数：100 colls × 0.5s → 5 colls × 0.5s
+
+    改进前的问题（v1.6.x）：
+    - 4 字符前缀匹配导致"transferable"误匹配"transformer"（今天 Quanta 那条）
+    - 完全忽略 coll 已收录的内容信号
+    - 旧 v1.7.0 实现：100 colls × bulk items() 拉取 → 50s 超时
+    """
     text = (title + " " + description).lower()
 
     # 如果标题是URL，description也为空，则无法进行有意义的匹配
@@ -653,9 +780,9 @@ def find_best_collection(title, description):
 
     text_keywords = _extract_text_keywords(text)
     collections = zot.collections()
-    best_match = None
-    best_score = 0
 
+    # 第 1 遍：name-only 评分
+    candidates = []  # (name_score, name_hits, key, name)
     for c in collections:
         name = c['data'].get('name', '')
         key = c['key']
@@ -664,14 +791,49 @@ def find_best_collection(title, description):
         if key == MISC_COLLECTION:
             continue
 
-        coll_keywords = _extract_collection_keywords(name)
-        score = len(coll_keywords & text_keywords)
+        name_keywords = _extract_collection_keywords(name)
+        name_hits = name_keywords & text_keywords
+        if name_hits:
+            candidates.append((len(name_hits), name_hits, key, name))
 
-        if score >= 1 and score > best_score:
+    if not candidates:
+        return None
+
+    # 按 name 得分排序，取 top 5 作为 content fetch 候选
+    candidates.sort(key=lambda x: -x[0])
+    top_candidates = candidates[:5]
+
+    # 第 2 遍：对 top 候选 fetch content signature
+    best_match = None
+    best_score = 0
+    best_is_empty = False
+    best_breakdown = ""
+
+    for name_score, name_hits, key, name in top_candidates:
+        score = name_score
+        reasons = [f"name+{name_score}:{list(name_hits)[:3]}"]
+        coll_is_empty = False
+
+        # 内容匹配
+        content_keywords, _ = _collection_content_signature(key)
+        content_hits = content_keywords & text_keywords
+        if content_hits:
+            score += 2 * len(content_hits)
+            reasons.append(f"content+{2*len(content_hits)}:{list(content_hits)[:3]}")
+        elif not content_keywords:
+            coll_is_empty = True
+
+        if score > best_score:
             best_score = score
             best_match = (key, name)
+            best_is_empty = coll_is_empty
+            best_breakdown = ", ".join(reasons)
 
-    return best_match
+    # 变阈值
+    threshold = 1 if best_is_empty else 3
+    if best_score >= threshold and best_match:
+        return best_match
+    return None
 
 
 def create_misc_subcollection(name_hint):

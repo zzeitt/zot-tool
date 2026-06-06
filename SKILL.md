@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.6.0
+version: 1.7.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -47,13 +47,25 @@ zot delete <item-key>                           # 删除条目
 1. 提取 URL
 2. 抓取标题、描述、平台类型
 3. 推断合适的 itemType 和 tags
-4. 在已有 Collections 中查找最佳匹配，无匹配则创建 Misc--xxx 子集合
+4. 在已有 Collections 中查找最佳匹配（**多信号评分**，v1.7.0+），无匹配则创建 Misc--xxx 子集合
 5. 自动添加 /unread 标签
 6. 用户提供的 #tag 建议（若有）优先，未满 3 个时由 infer_tags 补足
 7. **自动识别文件类型**：
    - 二进制文件（PDF/EPUB 等）→ 直接下载原始文件，上传到 WebDAV
    - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
 8. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
+
+### Collection 匹配策略（v1.7.0 重构）
+**问题**：早期版本用 4 字符前缀子串匹配 → "transferable" 误匹配 "transformer"；完全忽略 coll 已收录的内容信号。
+
+**新策略**——三维信号评分，阈值 ≥ 3 才匹配：
+1. **coll 名字关键词** ∩ text 关键词 → **+1/词**（整词匹配，保留 math↔mathematics 缩写映射）
+2. **coll 内容关键词**（最近 20 条 items 的 title+abstract）∩ text 关键词 → **+2/词**（强信号）
+3. 缓存：单次 bulk zot.items() 拉取所有 items 本地分组，签名缓存 5 分钟 TTL
+
+**典型场景**：
+- Quanta 神经科学文章 → 既有 `Misc--neuroscience`（内容已含 brain/memory/neural 等词）→ 稳稳匹配
+- 全新主题文章（如 Rust 入门）→ 无任何 coll 匹配 → 新建 `Misc--rust/xxx`（保留你主动建 coll 的习惯）
 
 ### 二进制文件识别规则
 - URL path 以 `.pdf`/`.epub`/`.mobi`/`.docx` 等扩展名结尾
