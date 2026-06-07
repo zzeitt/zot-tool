@@ -387,6 +387,14 @@ def fetch_url_metadata(url):
             capture_output=True, text=True, timeout=20
         )
         html = result.stdout
+
+        # Cloudflare 反爬检测（v1.7.1 新增）
+        # 标记 "cf_blocked" 让 archive_url 知道需要浏览器 fallback 补抓 body
+        cf_blocked = bool(re.search(
+            r'Attention Required|cf-error-code|cf-browser-verification|cloudflare',
+            html, re.IGNORECASE
+        ))
+
         title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
         title = title_match.group(1).strip() if title_match else url
         desc_match = re.search(
@@ -402,7 +410,12 @@ def fetch_url_metadata(url):
         item_type = "webpage"
         if re.search(r'podcast|episode|播客', title + description, re.I):
             item_type = "podcast"
-        return {"title": title, "description": description, "itemType": item_type}
+        return {
+            "title": title,
+            "description": description,
+            "itemType": item_type,
+            "cf_blocked": cf_blocked,  # v1.7.1 新增
+        }
     except Exception as e:
         return {"title": url, "description": "", "itemType": "webpage", "error": str(e)}
 
@@ -1688,6 +1701,15 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         print(f"⚠️ Metadata fetch warning: {meta['error']}")
     print(f"📄 Title: {title[:80]}")
     print(f"📝 Description: {description[:100] if description else '(no description)'}...")
+
+    # Cloudflare 反爬检测（v1.7.1 新增）
+    # 标记清晰，让 AI 看到后可以用 browser 抓正文补 note
+    if meta.get("cf_blocked"):
+        print("⚠️ CLOUDFLARE_BLOCKED")
+        print("⚠️  This URL is behind Cloudflare anti-bot protection.")
+        print("⚠️  Description is empty; body text was NOT saved.")
+        print("⚠️  AI assistant: please use browser_use to fetch body text")
+        print("⚠️  and save it to the item's note via pyzotero.")
 
     # 如果标题是URL且没有任何描述，也没有提供title_hint，则无法进行有效归档
     if _is_url(title) and not description.strip() and not title_hint:

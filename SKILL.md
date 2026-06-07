@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.7.0
+version: 1.7.1
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -46,14 +46,23 @@ zot delete <item-key>                           # 删除条目
 ### 归档流程
 1. 提取 URL
 2. 抓取标题、描述、平台类型
-3. 推断合适的 itemType 和 tags
-4. 在已有 Collections 中查找最佳匹配（**多信号评分**，v1.7.0+），无匹配则创建 Misc--xxx 子集合
-5. 自动添加 /unread 标签
-6. 用户提供的 #tag 建议（若有）优先，未满 3 个时由 infer_tags 补足
-7. **自动识别文件类型**：
+3. **Cloudflare 反爬检测**（v1.7.1+）：若 curl 拿到 `Attention Required` 等 CF 拦截页，输出 `⚠️ CLOUDFLARE_BLOCKED` 标记，让 AI 看到后用 browser fallback 补抓正文
+4. 推断合适的 itemType 和 tags
+5. 在已有 Collections 中查找最佳匹配（**多信号评分**，v1.7.0+），无匹配则创建 Misc--xxx 子集合
+6. 自动添加 /unread 标签
+7. 用户提供的 #tag 建议（若有）优先，未满 3 个时由 infer_tags 补足
+8. **自动识别文件类型**：
    - 二进制文件（PDF/EPUB 等）→ 直接下载原始文件，上传到 WebDAV
    - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
-8. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
+9. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
+
+### Cloudflare 反爬场景处理（v1.7.1+）
+- **问题**：部分网站（如 johndcook.com）用 Cloudflare 拦截 curl user-agent，导致 `fetch_url_metadata` 拿到 "Attention Required" 页面，description 为空
+- **检测**：v1.7.1 在 `fetch_url_metadata` 里检查 `Attention Required` / `cf-error-code` 等关键字，标记 `cf_blocked: true`
+- **fallback**：archive_url 输出 `⚠️ CLOUDFLARE_BLOCKED` 标记。AI 看到后：
+  1. 用 `browser_use navigate` + `execute_js` 拿 body text
+  2. 用 `pyzotero` 更新 item 的 note，把 body text 写进去
+- **当前边界**：fallback 仍依赖 AI 主动处理，未做到完全自动化
 
 ### Collection 匹配策略（v1.7.0 重构）
 **问题**：早期版本用 4 字符前缀子串匹配 → "transferable" 误匹配 "transformer"；完全忽略 coll 已收录的内容信号。
