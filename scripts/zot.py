@@ -1178,6 +1178,23 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
 
+    # v1.7.3: 复制一份到稳定位置，让 AI（minis）能本地打开做 visual sanity check
+    # /tmp 会被系统清理，WebDAV 上传后 tmp_html 也会被删除
+    # AI 看到下面的 VISUAL_CHECK_READY 标记后应该：
+    #   1. 用 browser_use 打开 stable_path
+    #   2. screenshot 全页
+    #   3. 分析是否 CSS 完整、板式正常
+    #   4. 如有异常则提示重抓
+    import shutil
+    stable_dir = "/var/minis/offloads"
+    try:
+        os.makedirs(stable_dir, exist_ok=True)
+        stable_path = os.path.join(stable_dir, filename)
+        shutil.copy(tmp_html, stable_path)
+        print(f"📸 VISUAL_CHECK_READY: {stable_path}")
+    except Exception as e:
+        print(f"⚠️  Could not prepare visual check copy: {e}")
+
     if has_webdav:
         return _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, webdav_pass)
     else:

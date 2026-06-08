@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.7.2
+version: 1.7.3
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -63,6 +63,19 @@ zot delete <item-key>                           # 删除条目
   1. 用 `browser_use navigate` + `execute_js` 拿 body text
   2. 用 `pyzotero` 更新 item 的 note，把 body text 写进去
 - **当前边界**：fallback 仍依赖 AI 主动处理，未做到完全自动化
+
+### 离线副本 Visual Sanity Check（v1.7.3+）
+- **触发**：每次 `zot archive` 成功保存 monolith HTML 后，输出 `📸 VISUAL_CHECK_READY: /var/minis/offloads/<file>.html`
+- **AI 处理流程**（必做）：
+  1. 用 `browser_use navigate` 打开该路径（minis:// 形式）
+  2. `screenshot full_page=true` 抓全页截图
+  3. **视觉分析**：
+     - CSS 是否完整（卡片、代码块、字体、配色）
+     - 板式是否正常（标题、段落、间距）
+     - 是否有缺图/错位
+     - 数学公式、交互组件是否保留
+  4. 异常时主动重抓或提示用户
+- **为什么必要**：之前的感知机文章归档后用户报告 CSS 缺失，本地浏览器打开其实是好的——是 Zotero 客户端渲染 bug。提前发现能避免上传错误文件。
 
 ### Collection 匹配策略（v1.7.0 重构）
 **问题**：早期版本用 4 字符前缀子串匹配 → "transferable" 误匹配 "transformer"；完全忽略 coll 已收录的内容信号。
