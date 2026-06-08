@@ -52,6 +52,42 @@ zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY)
 # Cache forbidden items
 _forbidden_item_keys = None
 
+# Cache all collections（v1.7.4 修复分页 bug）
+# 旧实现 zot.collections() 默认只返回第一页 100 条，导致 700+ colls 的库
+# 只能看到 ~14%，关键的 coll 匹配全部失效
+# 新实现：分页拉所有 + 缓存 5 分钟
+_all_collections_cache = None
+_all_collections_cache_ts = 0
+_ALL_COLLECTIONS_TTL = 300  # seconds
+
+
+def _all_collections():
+    """分页拉取所有 colls（5 分钟缓存）
+
+    关键修复（v1.7.4）：旧代码用 zot.collections() 默认 limit=100，
+    库 > 100 colls 时只能看到第一页。用户的库有 707 colls，旧代码漏了 86%。
+    """
+    global _all_collections_cache, _all_collections_cache_ts
+    import time
+    now = time.time()
+    if _all_collections_cache is not None and (now - _all_collections_cache_ts) < _ALL_COLLECTIONS_TTL:
+        return _all_collections_cache
+
+    all_coll = []
+    start = 0
+    while True:
+        page = zot.collections(start=start, limit=100)
+        if not page:
+            break
+        all_coll.extend(page)
+        start += len(page)
+        if len(page) < 100:
+            break
+    _all_collections_cache = all_coll
+    _all_collections_cache_ts = now
+    return all_coll
+
+
 def get_forbidden_items():
     """Get all item keys in 🙊Personal collection (recursively)"""
     global _forbidden_item_keys
@@ -63,7 +99,7 @@ def get_forbidden_items():
     # Get all collections under 🙊Personal (recursive)
     def get_sub_collections(parent_key):
         subs = [parent_key]
-        for c in zot.collections():
+        for c in _all_collections():
             if c['data'].get('parentCollection') == parent_key:
                 subs.extend(get_sub_collections(c['key']))
         return subs
@@ -89,12 +125,12 @@ def is_allowed(item_key):
 
 def get_collection_map():
     """Build collection key->name mapping"""
-    collections = zot.collections()
+    collections = _all_collections()
     return {c['key']: c['data'].get('name', 'Unknown') for c in collections}
 
 def get_item_collections(item_key):
     """Get collection names for an item"""
-    collections = zot.collections()
+    collections = _all_collections()
     item_collections = []
     for c in collections:
         coll_key = c['key']
@@ -111,7 +147,7 @@ def search(query, limit=10, search_tags=False, search_collections=False):
     
     if search_collections:
         # Search by collection name
-        collections = zot.collections()
+        collections = _all_collections()
         coll_map = get_collection_map()
         for c in collections:
             coll_name = c['data'].get('name', '')
@@ -183,7 +219,7 @@ def search(query, limit=10, search_tags=False, search_collections=False):
 def search_by_collection(collection_name, limit=10):
     """Search items by collection name"""
     forbidden = get_forbidden_items()
-    collections = zot.collections()
+    collections = _all_collections()
     
     results = []
     for c in collections:
@@ -261,7 +297,7 @@ def search_emacs(limit=20):
         
         # Check collection
         if item not in results:
-            for c in zot.collections():
+            for c in _all_collections():
                 if 'emacs' in c['data'].get('name', '').lower():
                     coll_items = zot.collection_items(c['key'])
                     if any(i['key'] == item['key'] for i in coll_items):
@@ -300,7 +336,7 @@ def list_items(limit=10):
 
 def list_collections():
     """List all collections (excluding 🙊Personal)"""
-    collections = zot.collections()
+    collections = _all_collections()
     forbidden_coll = FORBIDDEN_COLLECTION
     
     print(f"\n📁 Collections (excluding 🙊Personal):\n")
@@ -639,22 +675,26 @@ _MATCH_STOPWORDS = {
 def _extract_collection_keywords(name):
     """从 collection 名称中提取匹配关键词
 
-    设计原则（v1.7.0 重构）：
+    设计原则（v1.7.0 重构 + v1.7.4 增 Greek/符号支持）：
     - 仅整词匹配，**不再**用 4 字符前缀子串匹配
     - 4 字符前缀会误判（"transformer" 与 "transferable" 前缀相等）
     - 保留常见缩写的 variant 映射（math↔mathematics, llm→large language model 等）
     - 过滤停用词（v1.7.1 新增）："introduction" "guide" 等泛词不参与匹配
     - 过滤单字符英文（v1.7.2 新增）：避免 "Euclid's" → "s" 与 "beginner's" → "s" 误匹配
+    - 包含 Greek 字母（v1.7.4 新增）：π/τ/σ 等数学符号不被漏掉
     """
     keywords = set()
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name)
+    # v1.7.4: 加入 Greek block (U+0370-U+03FF) 和 Greek Extended (U+1F00-U+1FFF)
+    # 否则 Misc--pi/π 里的 π 永远无法匹配
+    # 保留 [a-zA-Z\u4e00-\u9fff] 三种，加上 \u0370-\u03ff\u1f00-\u1fff
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff\u0370-\u03ff\u1f00-\u1fff]+', name)
     for w in words:
         w_lower = w.lower()
         # 过滤停用词
         if w_lower in _MATCH_STOPWORDS:
             continue
         # 过滤单字符英文（撇号分词产物，如 Euclid's → "s"）
-        # 中文单字通常有意义，保留
+        # 中文/Greek 单字通常有意义，保留
         if len(w) == 1 and w.isascii():
             continue
         keywords.add(w_lower)
@@ -679,14 +719,16 @@ def _extract_collection_keywords(name):
 def _extract_text_keywords(text):
     """从文本中提取关键词，包括合并形式
 
-    设计原则（v1.7.0 重构）：
+    设计原则（v1.7.0 重构 + v1.7.4 增 Greek/符号支持）：
     - 仅整词匹配，**不再**加 4 字符前缀（4 字符前缀是误判主因）
     - 保留两两相邻词合并（用于"deep learning"等短语概念匹配）
     - 过滤停用词（v1.7.1 新增）：避免"introduction"等泛词触发误匹配
     - 过滤单字符英文（v1.7.2 新增）：避免 "Euclid's" → "s" 等误匹配
+    - 包含 Greek 字母（v1.7.4 新增）：π/τ/σ 等数学符号不被漏掉
     """
     keywords = set()
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', text.lower())
+    # v1.7.4: 加入 Greek block 同 coll 提取
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff\u0370-\u03ff\u1f00-\u1fff]+', text.lower())
     filtered = []
     for w in words:
         if w in _MATCH_STOPWORDS:
@@ -792,7 +834,7 @@ def find_best_collection(title, description):
         return None
 
     text_keywords = _extract_text_keywords(text)
-    collections = zot.collections()
+    collections = _all_collections()
 
     # 第 1 遍：name-only 评分
     candidates = []  # (name_score, name_hits, key, name)
@@ -1049,7 +1091,7 @@ def create_misc_subcollection(url, title=None, description=None, tag_hints=None)
 
     full_name = f"Misc--{sub_name}"
 
-    existing = zot.collections()
+    existing = _all_collections()
     for c in existing:
         if c['data'].get('name') == full_name:
             print(f"📁 Collection already exists: {full_name}")

@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.7.3
+version: 1.7.4
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -77,16 +77,24 @@ zot delete <item-key>                           # 删除条目
   4. 异常时主动重抓或提示用户
 - **为什么必要**：之前的感知机文章归档后用户报告 CSS 缺失，本地浏览器打开其实是好的——是 Zotero 客户端渲染 bug。提前发现能避免上传错误文件。
 
-### Collection 匹配策略（v1.7.0 重构）
-**问题**：早期版本用 4 字符前缀子串匹配 → "transferable" 误匹配 "transformer"；完全忽略 coll 已收录的内容信号。
+### Collection 匹配策略（v1.7.0 重构 + v1.7.4 关键修复）
+**问题**：
+- 早期版本用 4 字符前缀子串匹配 → "transferable" 误匹配 "transformer"
+- 完全忽略 coll 已收录的内容信号
+- **v1.7.4 发现的更严重 bug**：`zot.collections()` 默认 limit=100，但用户的库有 707 colls，旧代码只看了前 100 条（14%），86% 的 coll 完全没参与匹配。即使 `Misc--pi/π` 已经存在，旧代码也看不到！
 
 **新策略**——三维信号评分，阈值 ≥ 3 才匹配：
 1. **coll 名字关键词** ∩ text 关键词 → **+1/词**（整词匹配，保留 math↔mathematics 缩写映射）
 2. **coll 内容关键词**（最近 20 条 items 的 title+abstract）∩ text 关键词 → **+2/词**（强信号）
 3. 缓存：单次 bulk zot.items() 拉取所有 items 本地分组，签名缓存 5 分钟 TTL
 
+**两遍扫描**（v1.7.2 性能优化）：先用 name 评分筛出 top 5 候选（无 API 调用），再 fetch content signature。
+**希腊字母支持**（v1.7.4）：regex 包含 `\u0370-\u03ff\u1f00-\u1fff`，否则 `Misc--pi/π` 里的 `π` 永远无法匹配。
+**分页拉取所有 colls**（v1.7.4）：`_all_collections()` 替代 `zot.collections()`，分页拉完 + 5 分钟缓存。
+
 **典型场景**：
 - Quanta 神经科学文章 → 既有 `Misc--neuroscience`（内容已含 brain/memory/neural 等词）→ 稳稳匹配
+- John D. Cook "A crank formula for π" → 既有 `Misc--pi/π`（content 已含 π/transcendental 等词）→ 匹配！
 - 全新主题文章（如 Rust 入门）→ 无任何 coll 匹配 → 新建 `Misc--rust/xxx`（保留你主动建 coll 的习惯）
 
 ### Subcollection 命名策略（v1.7.2 重构）
