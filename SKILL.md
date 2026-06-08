@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.7.1
+version: 1.7.2
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -75,6 +75,23 @@ zot delete <item-key>                           # 删除条目
 **典型场景**：
 - Quanta 神经科学文章 → 既有 `Misc--neuroscience`（内容已含 brain/memory/neural 等词）→ 稳稳匹配
 - 全新主题文章（如 Rust 入门）→ 无任何 coll 匹配 → 新建 `Misc--rust/xxx`（保留你主动建 coll 的习惯）
+
+### Subcollection 命名策略（v1.7.2 重构）
+**问题**：旧实现 `create_misc_subcollection(title + " " + description)` 只取标题前 2 个词，对"标题党"文章（如 "The Smallest Brain You Can Build" 关于 perceptron）会错配成 `Misc--smallest/brain`。
+
+**新策略**——多信号优先级：
+1. **已知平台域名**（最高优先）：`weixin.qq.com→wechat`、`github.com→github`、`arxiv.org→arxiv` 等
+2. **URL slug**（路径 `-` 分隔词，去停用词 + 取前 2 个）：如 `perceptron-explained-from-scratch` → `perceptron/scratch`
+3. **用户提供的 #tag**：如 `#感知机` → `感知机`
+4. **title 词**（兜底）
+
+**停用词过滤**（`_MISC_NAMING_STOPWORDS`）：过滤"blog/post/article/explained/build"等无信息量词，避免 `Misc--introduction/xxx`、`Misc--build/neural` 这类名字。
+
+**典型场景**：
+- `ranpara.net/posts/perceptron-explained-from-scratch/` + `#感知机` → `Misc--perceptron/scratch`
+- `johndcook.com/blog/2026/06/06/from-kepler-to-bessel/` + `#math` → `Misc--kepler/bessel`
+- `github.com/zzeitt/zot-tool` → `Misc--github`（domain 优先）
+- `mp.weixin.qq.com/s/abc123` → `Misc--wechat`（domain 优先）
 
 ### 二进制文件识别规则
 - URL path 以 `.pdf`/`.epub`/`.mobi`/`.docx` 等扩展名结尾

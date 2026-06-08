@@ -849,44 +849,204 @@ def find_best_collection(title, description):
     return None
 
 
-def create_misc_subcollection(name_hint):
-    """在 Misc 下创建新的子集合，名称格式：Misc--xxx"""
-    # 如果 name_hint 是 URL，提取域名作为子集合名
-    if _is_url(name_hint):
-        url_lower = name_hint.lower()
-        if "weixin.qq.com" in url_lower or "mp.weixin.qq.com" in url_lower:
-            sub_name = "wechat"
-        elif "ycombinator.com" in url_lower:
-            sub_name = "hn"
-        elif "github.com" in url_lower:
-            sub_name = "github"
-        elif "bilibili.com" in url_lower:
-            sub_name = "bilibili"
-        elif "youtube.com" in url_lower:
-            sub_name = "youtube"
-        elif "arxiv.org" in url_lower:
-            sub_name = "arxiv"
-        elif "podcasts.apple.com" in url_lower:
-            sub_name = "podcast"
-        else:
-            # 尝试提取域名
-            domain_match = re.search(r'://([^/]+)', url_lower)
+# Subcollection 命名时过滤的"无信息词"（v1.7.2 新增）
+# 这些词在 coll 名字里没有区分度，避免选区名包含它们
+_MISC_NAMING_STOPWORDS = {
+    # 冠词/介词/连词
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "by", "as", "at",
+    "from", "into", "onto", "over", "under", "between", "about", "against",
+    "is", "are", "was", "were", "be", "been", "being",
+    "this", "that", "these", "those", "it", "its",
+    # 博客文章常用泛词（无信息量）
+    "post", "posts", "blog", "article", "articles", "page", "entry", "entries",
+    "tag", "tags", "category", "categories", "archive", "archives", "feed",
+    "index", "home", "about", "contact",
+    # 文章结构词
+    "part", "chapter", "section", "lesson", "step", "stages",
+    "introduction", "intro", "overview", "summary", "summary", "preface", "foreword",
+    "conclusion", "epilogue", "appendix", "references", "bibliography",
+    # 通用动词
+    "make", "makes", "making", "do", "does", "doing", "done",
+    "build", "builds", "building", "built", "create", "creates", "creating", "created",
+    "learn", "learns", "learning", "learned", "taught", "teach", "teaches", "teaching",
+    "use", "uses", "using", "used", "show", "shows", "showing", "shown",
+    "get", "gets", "getting", "got",
+    "find", "finds", "finding", "found",
+    "see", "sees", "seeing", "saw", "seen",
+    "know", "knows", "knowing", "knew", "known",
+    "try", "tries", "trying", "tried",
+    "go", "goes", "going", "went", "gone",
+    "come", "comes", "coming", "came",
+    "give", "gives", "giving", "given", "gave",
+    "take", "takes", "taking", "took", "taken",
+    "have", "has", "having", "had",
+    "explain", "explains", "explained", "explaining", "describe", "describes", "described",
+    "walk", "walks", "walked", "walking", "walkthrough",
+    "deep", "dive", "dives", "dived", "diving",
+    # 情态/助动词/系词（无信息量）
+    "can", "could", "should", "would", "may", "might", "must", "shall", "will",
+    "do", "did", "does", "doing", "done", "doing",
+    "all", "any", "some", "no", "not", "only", "just", "very", "too", "also",
+    "still", "already", "yet", "even", "now", "then", "than",
+    "yes", "yeah", "no", "nope",
+    # 通用形容词/副词
+    "new", "old", "good", "bad", "best", "worst", "first", "last", "next", "previous",
+    "many", "much", "few", "little", "more", "most", "less", "least",
+    "big", "small", "large", "tiny", "huge", "smallest", "largest", "biggest",
+    "easy", "hard", "simple", "complex", "real", "true", "false",
+    "modern", "ancient", "current", "recent", "early", "late",
+    # 博客"标题党"词
+    "everything", "nothing", "anything", "something", "someone", "anyone",
+    "why", "how", "what", "when", "where", "which", "who",
+    "you", "your", "i", "my", "we", "our", "they", "their", "he", "she", "his", "her",
+    # 时间/序号
+    "day", "week", "month", "year", "today", "yesterday", "tomorrow",
+    "one", "two", "three", "four", "five",
+    # 演示/示例
+    "demo", "demos", "example", "examples", "sample", "samples", "snippet", "snippets",
+    # 抽象名词
+    "thing", "things", "stuff", "way", "ways", "idea", "ideas", "concept", "concepts",
+    # 通用词
+    "brain", "build", "starter", "crash", "course", "journey", "story",
+    # 中文常用停用词
+    "的", "了", "是", "在", "和", "与", "或", "等", "之", "为", "以", "于", "对",
+    "上", "下", "中", "也", "就", "都", "而", "及", "把", "被", "从", "到",
+    "一个", "一些", "这", "那", "此", "本", "其", "我们", "你", "他", "她", "它",
+}
+
+
+def _slug_to_name(slug):
+    """从 URL slug 提取有意义的 coll 名字
+
+    示例:
+        'perceptron-explained-from-scratch' → 'perceptron/scratch'
+        'why-i-switched-to-vim' → 'switched/vim'
+        'posts/build-a-neural-net' → 'build/neural'
+        'perceptron' → 'perceptron'
+    """
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', slug.lower())
+    # 过滤无信息词 + 过短词（保留 vim/git/cpu 等 3 字符关键词）
+    meaningful = []
+    for w in words:
+        if w in _MISC_NAMING_STOPWORDS:
+            continue
+        if len(w) < 3:
+            continue
+        meaningful.append(w)
+        if len(meaningful) >= 2:
+            break
+    return "/".join(meaningful) if meaningful else None
+
+
+def _tag_to_name(tag):
+    """从用户提供的 tag（如 '#感知机' 或 '#rust'）提取 coll 名字"""
+    # 去掉 # 前缀和 emoji 后缀
+    cleaned = re.sub(r'^[#\s]+', '', tag)
+    cleaned = re.sub(r'[🤖💻🔢🎙️📺📚🛠️🔗💰📄🔬🎮🖼️🔒🌐💼📖🙏⚽⚖️📜✍️📊🎵🌱]+$', '', cleaned).strip()
+    if not cleaned:
+        return None
+    return cleaned
+
+
+def _title_to_name(title):
+    """从 title 提取 coll 名字（兜底方案）"""
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', title.lower())
+    meaningful = []
+    for w in words:
+        if w in _MISC_NAMING_STOPWORDS:
+            continue
+        if len(w) < 3:
+            continue
+        meaningful.append(w)
+        if len(meaningful) >= 2:
+            break
+    return "/".join(meaningful) if meaningful else None
+
+
+def create_misc_subcollection(url, title=None, description=None, tag_hints=None):
+    """在 Misc 下创建新的子集合，名称格式：Misc--<name>
+
+    v1.7.2 重构：选名优先级
+    1. **URL slug**（最可靠，标题党文章经常误导）→ 排除 stopwords
+    2. **用户提供的 #tag**（如 #感知机 → 'perceptron'/'感知机'）
+    3. **title 词**（兜底，filtered）
+
+    示例：
+    - URL=ranpara.net/posts/perceptron-explained-from-scratch, tag=#感知机
+      → Misc--perceptron（URL slug 命中）
+    - URL=example.com/article/123, title="Why I switched to Vim"
+      → Misc--switched/vim（title 兜底，filter 掉 "why/i/switched/to"）
+    - URL=github.com/xxx/yyy
+      → Misc--github（domain 命中）
+
+    Args:
+        url: 原始 URL（用于 slug 提取和域名匹配）
+        title: 文章标题（兜底选名）
+        description: 文章描述（可选）
+        tag_hints: 用户提供的 tag 列表
+    """
+    candidates = []  # (priority, sub_name)
+
+    # 优先级 0：已知平台域名（v1.7.2 调整）— 这些 coll 应按平台分类而不是按主题
+    # 理由：wechat/github 等平台的文章有强平台属性，按平台分 coll 更便于浏览
+    domain_subname = None
+    if url:
+        url_lower = url.lower()
+        domain_map = {
+            "weixin.qq.com": "wechat", "mp.weixin.qq.com": "wechat",
+            "ycombinator.com": "hn", "github.com": "github",
+            "bilibili.com": "bilibili", "youtube.com": "youtube",
+            "arxiv.org": "arxiv", "podcasts.apple.com": "podcast",
+        }
+        for dom, name in domain_map.items():
+            if dom in url_lower:
+                domain_subname = name
+                break
+    if domain_subname:
+        candidates.append((0, domain_subname))
+
+    # 优先级 1：URL slug（如果 URL 路径含 - 分隔的词）
+    if url:
+        from urllib.parse import urlparse
+        try:
+            path = urlparse(url).path
+            slug_name = _slug_to_name(path)
+            if slug_name:
+                candidates.append((1, slug_name))
+        except Exception:
+            pass
+
+    # 优先级 2：用户提供的 tag
+    if tag_hints:
+        for tag in tag_hints:
+            tag_name = _tag_to_name(tag)
+            if tag_name and tag_name.lower() not in _MISC_NAMING_STOPWORDS:
+                candidates.append((2, tag_name))
+                break  # 只取第一个有意义的
+
+    # 优先级 3：title 兜底
+    if title:
+        title_name = _title_to_name(title)
+        if title_name:
+            candidates.append((3, title_name))
+
+    # 选优先级最高的
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        sub_name = candidates[0][1]
+    else:
+        # 全部 fallback：用域名首段
+        if url:
+            domain_match = re.search(r'://([^/]+)', url.lower())
             if domain_match:
                 domain = domain_match.group(1)
-                # 取主要部分（如 example.com -> example）
                 parts = domain.replace(".", " ").split()
                 sub_name = parts[0] if parts else "web"
             else:
                 sub_name = "web"
-    else:
-        stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by", "as", "that",
-                      "https", "http", "com", "org", "net", "html", "php", "aspx", "weixin", "qq", "mp"}
-        words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name_hint)
-        keywords = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
-        if keywords:
-            sub_name = "/".join(keywords[:2]).lower()
         else:
             sub_name = "uncategorized"
+
     full_name = f"Misc--{sub_name}"
 
     existing = zot.collections()
@@ -1742,7 +1902,7 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         print(f"📁 Matched collection: {coll_name}")
     else:
         print("🔨 No matching collection found, creating new Misc--xxx subcollection...")
-        coll_key = create_misc_subcollection(title + " " + description)
+        coll_key = create_misc_subcollection(url, title=title, description=description, tag_hints=tag_hints)
         coll_name = "new Misc--xxx"
 
     # 检查URL是否已存在（避免重复创建）
