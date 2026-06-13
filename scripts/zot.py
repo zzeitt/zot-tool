@@ -52,42 +52,6 @@ zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY)
 # Cache forbidden items
 _forbidden_item_keys = None
 
-# Cache all collections（v1.7.4 修复分页 bug）
-# 旧实现 zot.collections() 默认只返回第一页 100 条，导致 700+ colls 的库
-# 只能看到 ~14%，关键的 coll 匹配全部失效
-# 新实现：分页拉所有 + 缓存 5 分钟
-_all_collections_cache = None
-_all_collections_cache_ts = 0
-_ALL_COLLECTIONS_TTL = 300  # seconds
-
-
-def _all_collections():
-    """分页拉取所有 colls（5 分钟缓存）
-
-    关键修复（v1.7.4）：旧代码用 zot.collections() 默认 limit=100，
-    库 > 100 colls 时只能看到第一页。用户的库有 707 colls，旧代码漏了 86%。
-    """
-    global _all_collections_cache, _all_collections_cache_ts
-    import time
-    now = time.time()
-    if _all_collections_cache is not None and (now - _all_collections_cache_ts) < _ALL_COLLECTIONS_TTL:
-        return _all_collections_cache
-
-    all_coll = []
-    start = 0
-    while True:
-        page = zot.collections(start=start, limit=100)
-        if not page:
-            break
-        all_coll.extend(page)
-        start += len(page)
-        if len(page) < 100:
-            break
-    _all_collections_cache = all_coll
-    _all_collections_cache_ts = now
-    return all_coll
-
-
 def get_forbidden_items():
     """Get all item keys in 🙊Personal collection (recursively)"""
     global _forbidden_item_keys
@@ -99,7 +63,7 @@ def get_forbidden_items():
     # Get all collections under 🙊Personal (recursive)
     def get_sub_collections(parent_key):
         subs = [parent_key]
-        for c in _all_collections():
+        for c in zot.collections():
             if c['data'].get('parentCollection') == parent_key:
                 subs.extend(get_sub_collections(c['key']))
         return subs
@@ -125,12 +89,12 @@ def is_allowed(item_key):
 
 def get_collection_map():
     """Build collection key->name mapping"""
-    collections = _all_collections()
+    collections = zot.collections()
     return {c['key']: c['data'].get('name', 'Unknown') for c in collections}
 
 def get_item_collections(item_key):
     """Get collection names for an item"""
-    collections = _all_collections()
+    collections = zot.collections()
     item_collections = []
     for c in collections:
         coll_key = c['key']
@@ -147,7 +111,7 @@ def search(query, limit=10, search_tags=False, search_collections=False):
     
     if search_collections:
         # Search by collection name
-        collections = _all_collections()
+        collections = zot.collections()
         coll_map = get_collection_map()
         for c in collections:
             coll_name = c['data'].get('name', '')
@@ -219,7 +183,7 @@ def search(query, limit=10, search_tags=False, search_collections=False):
 def search_by_collection(collection_name, limit=10):
     """Search items by collection name"""
     forbidden = get_forbidden_items()
-    collections = _all_collections()
+    collections = zot.collections()
     
     results = []
     for c in collections:
@@ -297,7 +261,7 @@ def search_emacs(limit=20):
         
         # Check collection
         if item not in results:
-            for c in _all_collections():
+            for c in zot.collections():
                 if 'emacs' in c['data'].get('name', '').lower():
                     coll_items = zot.collection_items(c['key'])
                     if any(i['key'] == item['key'] for i in coll_items):
@@ -336,7 +300,7 @@ def list_items(limit=10):
 
 def list_collections():
     """List all collections (excluding 🙊Personal)"""
-    collections = _all_collections()
+    collections = zot.collections()
     forbidden_coll = FORBIDDEN_COLLECTION
     
     print(f"\n📁 Collections (excluding 🙊Personal):\n")
@@ -423,14 +387,6 @@ def fetch_url_metadata(url):
             capture_output=True, text=True, timeout=20
         )
         html = result.stdout
-
-        # Cloudflare 反爬检测（v1.7.1 新增）
-        # 标记 "cf_blocked" 让 archive_url 知道需要浏览器 fallback 补抓 body
-        cf_blocked = bool(re.search(
-            r'Attention Required|cf-error-code|cf-browser-verification|cloudflare',
-            html, re.IGNORECASE
-        ))
-
         title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
         title = title_match.group(1).strip() if title_match else url
         desc_match = re.search(
@@ -446,12 +402,7 @@ def fetch_url_metadata(url):
         item_type = "webpage"
         if re.search(r'podcast|episode|播客', title + description, re.I):
             item_type = "podcast"
-        return {
-            "title": title,
-            "description": description,
-            "itemType": item_type,
-            "cf_blocked": cf_blocked,  # v1.7.1 新增
-        }
+        return {"title": title, "description": description, "itemType": item_type}
     except Exception as e:
         return {"title": url, "description": "", "itemType": "webpage", "error": str(e)}
 
@@ -575,7 +526,14 @@ def infer_tags(title, description):
 
 def _extract_concepts(text):
     """从文本中提取核心概念，生成 #tag 格式（无空格，不超过3个）"""
-    text_lower = text.lower()
+    # Unicode 处理：去除所有组合附加符（diacritics）
+    # "Gödel" (ö=U+00F6) → "Godel"; 避免 [A-Za-z] 被组合字符拆散
+    import unicodedata
+    def strip_diacritics(s):
+        return ''.join(c for c in unicodedata.normalize('NFD', s)
+                       if not unicodedata.combining(c))
+    text_stripped = strip_diacritics(text)
+    text_lower = text_stripped.lower()
 
     # 如果文本看起来像URL（而非真实标题），跳过概念规则匹配，直接走 fallback
     is_url_text = _is_url(text)
@@ -585,8 +543,8 @@ def _extract_concepts(text):
         (["ai", "artificial intelligence", "大模型", "gpt", "claude", "llm", "machine learning", "机器学习", "deep learning", "深度学习", "transformer", "neural network"], "#AI-ML🤖"),
         (["programming", "编程", "code", "代码", "developer", "开发", "software", "软件", "coding"], "#编程💻"),
         (["economics", "经济", "finance", "金融", "wealth", "财富", "investment", "投资", "market"], "#经济💰"),
-        (["mathematics", "数学", "math", "proof", "theorem", "证明", "algebra", "几何"], "#数学🔢"),
-        (["philosophy", "哲学", "logic", "逻辑", "ethics", "伦理", "metaphysics"], "#哲学🤔"),
+        (["mathematics", "数学", "math", "proof", "theorem", "theorems", "证明", "algebra", "几何", "axiom", "logic"], "#数学🔢"),
+        (["philosophy", "哲学", "logic", "logics", "logical", "ethics", "伦理", "metaphysics"], "#哲学🤔"),
         (["podcast", "播客", "episode", "广播", "interview", "访谈"], "#播客🎙️"),
         (["video", "视频", "youtube", "bilibili", "lecture", "讲座"], "#视频📺"),
         (["tutorial", "教程", "guide", "入门", "how to", "cheat sheet", "学习"], "#教程📚"),
@@ -616,9 +574,15 @@ def _extract_concepts(text):
     if is_url_text:
         return []
 
-    # 非URL文本：正常进行概念规则匹配
+    # 非URL文本：正常进行概念规则匹配（单词边界严格匹配）
     for keywords, tag in concept_rules:
-        if any(kw in text_lower for kw in keywords):
+        matched = False
+        for kw in keywords:
+            # \b 单词边界，中文/英文均可精确匹配，不会误匹配子串
+            if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE):
+                matched = True
+                break
+        if matched:
             if tag not in tags:
                 tags.append(tag)
             if len(tags) >= 3:
@@ -626,11 +590,14 @@ def _extract_concepts(text):
 
     # fallback：提取标题中的核心名词，生成无空格 tag
     if not tags:
-        words = re.findall(r'[A-Za-z\u4e00-\u9fff]+', text)
+        words = re.findall(r'[A-Za-z\u4e00-\u9fff]+', text_stripped)
         stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are",
                       "this", "that", "it", "by", "as", "from", "at", "up", "out", "about", "into", "over",
                       "what", "which", "who", "when", "where", "why", "how", "all", "some", "any", "each",
-                      "tiny", "small", "large", "big", "new", "old", "best", "first", "last", "such"}
+                      "tiny", "small", "large", "big", "new", "old", "best", "first", "last", "such",
+                      "does", "doesn", "did", "didn", "do", "don", "can", "could", "will", "would",
+                      "should", "may", "might", "must", "shall", "mayn", "mightn", "mustn", "shalln",
+                      "s", "re", "ve", "ll", "d", "won"}
         candidates = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
         if candidates:
             core = candidates[0].lower()
@@ -650,53 +617,12 @@ def _is_wechat_url(url):
     return "mp.weixin.qq.com" in url.lower()
 
 
-# 匹配时的停用词（v1.7.1 新增）
-# 出现在 coll 名字或文章文本中都不应作为匹配信号
-# "introduction" "guide" "overview" 这种泛词在 collection 命名里很常见
-_MATCH_STOPWORDS = {
-    # 英文冠词/介词/连词
-    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by",
-    "as", "that", "this", "it", "from", "at", "up", "out", "about", "into", "over",
-    "what", "which", "who", "when", "where", "why", "how", "all", "some", "any", "each",
-    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will", "would",
-    "could", "should", "may", "might", "must", "can", "shall",
-    # 英文泛词（v1.7.1 新增，匹配噪声主因）
-    "introduction", "intro", "overview", "summary", "guide", "tutorial", "primer",
-    "basics", "fundamental", "fundamentals", "beginner", "beginners", "advanced",
-    "essentials", "concepts", "principles", "key", "complete", "comprehensive",
-    "practical", "modern", "new", "old", "best", "first", "last", "such",
-    # 中文常用停用词
-    "的", "了", "是", "在", "和", "与", "或", "等", "之", "为", "以", "于", "对",
-    "上", "下", "中", "也", "就", "都", "而", "及", "把", "被", "从", "到",
-    "一个", "一些", "这", "那", "此", "本", "其", "我们", "你", "他", "她", "它",
-}
-
-
 def _extract_collection_keywords(name):
-    """从 collection 名称中提取匹配关键词
-
-    设计原则（v1.7.0 重构 + v1.7.4 增 Greek/符号支持）：
-    - 仅整词匹配，**不再**用 4 字符前缀子串匹配
-    - 4 字符前缀会误判（"transformer" 与 "transferable" 前缀相等）
-    - 保留常见缩写的 variant 映射（math↔mathematics, llm→large language model 等）
-    - 过滤停用词（v1.7.1 新增）："introduction" "guide" 等泛词不参与匹配
-    - 过滤单字符英文（v1.7.2 新增）：避免 "Euclid's" → "s" 与 "beginner's" → "s" 误匹配
-    - 包含 Greek 字母（v1.7.4 新增）：π/τ/σ 等数学符号不被漏掉
-    """
+    """从 collection 名称中提取匹配关键词"""
     keywords = set()
-    # v1.7.4: 加入 Greek block (U+0370-U+03FF) 和 Greek Extended (U+1F00-U+1FFF)
-    # 否则 Misc--pi/π 里的 π 永远无法匹配
-    # 保留 [a-zA-Z\u4e00-\u9fff] 三种，加上 \u0370-\u03ff\u1f00-\u1fff
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff\u0370-\u03ff\u1f00-\u1fff]+', name)
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name)
     for w in words:
         w_lower = w.lower()
-        # 过滤停用词
-        if w_lower in _MATCH_STOPWORDS:
-            continue
-        # 过滤单字符英文（撇号分词产物，如 Euclid's → "s"）
-        # 中文/Greek 单字通常有意义，保留
-        if len(w) == 1 and w.isascii():
-            continue
         keywords.add(w_lower)
         # 常见变体映射
         if w_lower == "math":
@@ -713,120 +639,62 @@ def _extract_collection_keywords(name):
             keywords.add("computer science")
         elif w_lower == "hpc":
             keywords.add("high performance computing")
+        if len(w_lower) > 3:
+            keywords.add(w_lower[:4])
     return keywords
 
 
 def _extract_text_keywords(text):
     """从文本中提取关键词，包括合并形式
 
-    设计原则（v1.7.0 重构 + v1.7.4 增 Greek/符号支持）：
-    - 仅整词匹配，**不再**加 4 字符前缀（4 字符前缀是误判主因）
-    - 保留两两相邻词合并（用于"deep learning"等短语概念匹配）
-    - 过滤停用词（v1.7.1 新增）：避免"introduction"等泛词触发误匹配
-    - 过滤单字符英文（v1.7.2 新增）：避免 "Euclid's" → "s" 等误匹配
-    - 包含 Greek 字母（v1.7.4 新增）：π/τ/σ 等数学符号不被漏掉
+    Bugfix: 跨学科通用词（如 cycles/kernel/thread/cache/chain/tree/graph/sort/
+    search/heap/stack/queue/link/node/path/route）容易与图论/数据结构 collection
+    产生误匹配。添加为停用词表，在 text_keywords 层面过滤。
+    https://github.com/zzeitt/zot-tool/issues/TODO  （归档时补充 issue 号）
     """
+    cross_domain_stopwords = {
+        # 通用 CS 词：几乎每个子领域都在用
+        "cycle", "cycles", "kernel", "thread", "cache",
+        "chain", "tree", "graph", "sort", "sorts", "sorting",
+        "search", "heap", "heaps", "stack", "stacks", "queue",
+        "link", "links", "linked", "node", "nodes", "edge", "edges",
+        "path", "paths", "route", "routes", "routing",
+        "split", "merge", "join", "load", "pool", "pools",
+        "lock", "locks", "lockfree", "atomic", "sync", "async",
+        "pipe", "pipeline", "filter", "map", "reduce",
+        "index", "indexing", "scan", "scan", "batch",
+        "call", "invoke", "dispatch", "schedule",
+        "frame", "buffer", "stream", "chunk", "block",
+        "init", "initializer", "alloc", "allocate", "dealloc",
+        "handle", "handler", "event", "signal", "interrupt",
+        "port", "socket", "host", "client", "server",
+        # 通用数学/统计词
+        "set", "sets", "function", "model", "models", "learning",
+        "train", "test", "data", "feature", "features",
+        # 常见动词/形容词（全文搜索时容易误触）
+        "get", "set", "put", "add", "remove", "delete", "create", "destroy",
+        "new", "old", "first", "last", "next", "prev", "current",
+        "high", "low", "fast", "slow", "big", "small", "long", "short",
+        "run", "runs", "running", "start", "stop", "end", "ends",
+    }
     keywords = set()
-    # v1.7.4: 加入 Greek block 同 coll 提取
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff\u0370-\u03ff\u1f00-\u1fff]+', text.lower())
-    filtered = []
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', text.lower())
     for w in words:
-        if w in _MATCH_STOPWORDS:
-            continue
-        # 过滤单字符英文
-        if len(w) == 1 and w.isascii():
-            continue
-        filtered.append(w)
-    for w in filtered:
-        keywords.add(w)
-    # 两两相邻词合并（短语匹配）
-    for i in range(len(filtered) - 1):
-        combined = filtered[i] + filtered[i+1]
-        keywords.add(combined)
+        if w not in cross_domain_stopwords:
+            keywords.add(w)
+            if len(w) > 4:
+                keywords.add(w[:4])
+    # 两两相邻词合并（仅非停用词）
+    for i in range(len(words) - 1):
+        w1, w2 = words[i], words[i+1]
+        if w1 not in cross_domain_stopwords and w2 not in cross_domain_stopwords:
+            combined = w1 + w2
+            keywords.add(combined)
     return keywords
 
 
-# 缓存 collection 内容签名（5 分钟 TTL）
-# 避免每次 archive 都重新拉 collection 内的 items
-_collection_sig_cache = {}
-_COLLECTION_SIG_TTL = 300  # seconds
-
-
-def _collection_content_signature(coll_key, limit=20):
-    """提取 collection 内容的关键词签名 + tag 频次
-
-    作用：让 collection 内的实际内容（标题/摘要/标签）也参与匹配
-    例如：Misc--neuroscience 已收录若干神经科学文章 → 新文章含"brain"也能匹配
-
-    Args:
-        coll_key: collection 的 Zotero key
-        limit: 取最近多少个 items（默认 20，平衡准确性与性能）
-
-    Returns:
-        (keywords_set, tag_counter_dict)
-
-    实现（v1.7.2 性能优化）：
-    - 旧实现：单次 bulk zot.items(limit=1000) + 本地分组 → 受 pyzotero 分页限制漏数据
-    - 新实现：单次 zot.collection_items(coll_key, limit) 直接拉 → 更快更准
-    - 配合 find_best_collection 的两遍扫描：仅对 top 5 候选调用 → 100×0.5s → 5×0.5s
-    """
-    import time
-    now = time.time()
-    cached = _collection_sig_cache.get(coll_key)
-    if cached and now - cached[0] < _COLLECTION_SIG_TTL:
-        return cached[1]
-
-    # 单次单 coll API 调用（pyzotero 内部分页）
-    try:
-        coll_items = zot.collection_items(coll_key, limit=limit)
-    except Exception as e:
-        print(f"⚠️  Failed to fetch items for collection {coll_key}: {e}")
-        result = (set(), {})
-        _collection_sig_cache[coll_key] = (now, result)
-        return result
-
-    text_parts = []
-    tag_counter = {}
-    for it in coll_items:
-        data = it.get('data', {})
-        title = data.get('title', '')
-        abstract = data.get('abstractNote', '')
-        if title:
-            text_parts.append(title)
-        if abstract:
-            text_parts.append(abstract)
-        for t in data.get('tags', []):
-            tag = t.get('tag', '').lower()
-            # 跳过系统标签（带 / 的）
-            if tag and not tag.startswith('/'):
-                tag_counter[tag] = tag_counter.get(tag, 0) + 1
-
-    full_text = " ".join(text_parts)
-    keywords = _extract_text_keywords(full_text) if full_text else set()
-
-    result = (keywords, tag_counter)
-    _collection_sig_cache[coll_key] = (now, result)
-    return result
-
-
 def find_best_collection(title, description):
-    """匹配最合适的 collection，无匹配则返回 None
-
-    多信号评分策略（v1.7.x 重构）：
-    1. coll 名字关键词 ∩ text 关键词 → +1/词
-    2. coll 内容关键词（最近 20 条 items 的 title+abstract）∩ text 关键词 → +2/词
-    3. 阈值：非空 coll 需 ≥ 3；空 coll 只需 ≥ 1
-
-    两遍扫描策略（v1.7.2 性能优化）：
-    - 第 1 遍：仅用 name 评分（无 API 调用）→ 找出 top 候选
-    - 第 2 遍：只对 top 候选（默认前 5）fetch content signature
-    - 大幅减少 API 调用次数：100 colls × 0.5s → 5 colls × 0.5s
-
-    改进前的问题（v1.6.x）：
-    - 4 字符前缀匹配导致"transferable"误匹配"transformer"（今天 Quanta 那条）
-    - 完全忽略 coll 已收录的内容信号
-    - 旧 v1.7.0 实现：100 colls × bulk items() 拉取 → 50s 超时
-    """
+    """匹配最合适的 collection，无匹配则返回 None"""
     text = (title + " " + description).lower()
 
     # 如果标题是URL，description也为空，则无法进行有意义的匹配
@@ -834,10 +702,10 @@ def find_best_collection(title, description):
         return None
 
     text_keywords = _extract_text_keywords(text)
-    collections = _all_collections()
+    collections = zot.collections()
+    best_match = None
+    best_score = 0
 
-    # 第 1 遍：name-only 评分
-    candidates = []  # (name_score, name_hits, key, name)
     for c in collections:
         name = c['data'].get('name', '')
         key = c['key']
@@ -846,252 +714,57 @@ def find_best_collection(title, description):
         if key == MISC_COLLECTION:
             continue
 
-        name_keywords = _extract_collection_keywords(name)
-        name_hits = name_keywords & text_keywords
-        if name_hits:
-            candidates.append((len(name_hits), name_hits, key, name))
+        coll_keywords = _extract_collection_keywords(name)
+        score = len(coll_keywords & text_keywords)
 
-    if not candidates:
-        return None
-
-    # 按 name 得分排序，取 top 5 作为 content fetch 候选
-    candidates.sort(key=lambda x: -x[0])
-    top_candidates = candidates[:5]
-
-    # 第 2 遍：对 top 候选 fetch content signature
-    best_match = None
-    best_score = 0
-    best_is_empty = False
-    best_breakdown = ""
-
-    for name_score, name_hits, key, name in top_candidates:
-        score = name_score
-        reasons = [f"name+{name_score}:{list(name_hits)[:3]}"]
-        coll_is_empty = False
-
-        # 内容匹配
-        content_keywords, _ = _collection_content_signature(key)
-        content_hits = content_keywords & text_keywords
-        if content_hits:
-            score += 2 * len(content_hits)
-            reasons.append(f"content+{2*len(content_hits)}:{list(content_hits)[:3]}")
-        elif not content_keywords:
-            coll_is_empty = True
-
-        if score > best_score:
+        if score >= 1 and score > best_score:
             best_score = score
             best_match = (key, name)
-            best_is_empty = coll_is_empty
-            best_breakdown = ", ".join(reasons)
 
-    # 变阈值
-    threshold = 1 if best_is_empty else 3
-    if best_score >= threshold and best_match:
-        return best_match
-    return None
+    return best_match
 
 
-# Subcollection 命名时过滤的"无信息词"（v1.7.2 新增）
-# 这些词在 coll 名字里没有区分度，避免选区名包含它们
-_MISC_NAMING_STOPWORDS = {
-    # 冠词/介词/连词
-    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "by", "as", "at",
-    "from", "into", "onto", "over", "under", "between", "about", "against",
-    "is", "are", "was", "were", "be", "been", "being",
-    "this", "that", "these", "those", "it", "its",
-    # 博客文章常用泛词（无信息量）
-    "post", "posts", "blog", "article", "articles", "page", "entry", "entries",
-    "tag", "tags", "category", "categories", "archive", "archives", "feed",
-    "index", "home", "about", "contact",
-    # 文章结构词
-    "part", "chapter", "section", "lesson", "step", "stages",
-    "introduction", "intro", "overview", "summary", "summary", "preface", "foreword",
-    "conclusion", "epilogue", "appendix", "references", "bibliography",
-    # 通用动词
-    "make", "makes", "making", "do", "does", "doing", "done",
-    "build", "builds", "building", "built", "create", "creates", "creating", "created",
-    "learn", "learns", "learning", "learned", "taught", "teach", "teaches", "teaching",
-    "use", "uses", "using", "used", "show", "shows", "showing", "shown",
-    "get", "gets", "getting", "got",
-    "find", "finds", "finding", "found",
-    "see", "sees", "seeing", "saw", "seen",
-    "know", "knows", "knowing", "knew", "known",
-    "try", "tries", "trying", "tried",
-    "go", "goes", "going", "went", "gone",
-    "come", "comes", "coming", "came",
-    "give", "gives", "giving", "given", "gave",
-    "take", "takes", "taking", "took", "taken",
-    "have", "has", "having", "had",
-    "explain", "explains", "explained", "explaining", "describe", "describes", "described",
-    "walk", "walks", "walked", "walking", "walkthrough",
-    "deep", "dive", "dives", "dived", "diving",
-    # 情态/助动词/系词（无信息量）
-    "can", "could", "should", "would", "may", "might", "must", "shall", "will",
-    "do", "did", "does", "doing", "done", "doing",
-    "all", "any", "some", "no", "not", "only", "just", "very", "too", "also",
-    "still", "already", "yet", "even", "now", "then", "than",
-    "yes", "yeah", "no", "nope",
-    # 通用形容词/副词
-    "new", "old", "good", "bad", "best", "worst", "first", "last", "next", "previous",
-    "many", "much", "few", "little", "more", "most", "less", "least",
-    "big", "small", "large", "tiny", "huge", "smallest", "largest", "biggest",
-    "easy", "hard", "simple", "complex", "real", "true", "false",
-    "modern", "ancient", "current", "recent", "early", "late",
-    # 博客"标题党"词
-    "everything", "nothing", "anything", "something", "someone", "anyone",
-    "why", "how", "what", "when", "where", "which", "who",
-    "you", "your", "i", "my", "we", "our", "they", "their", "he", "she", "his", "her",
-    # 时间/序号
-    "day", "week", "month", "year", "today", "yesterday", "tomorrow",
-    "one", "two", "three", "four", "five",
-    # 演示/示例
-    "demo", "demos", "example", "examples", "sample", "samples", "snippet", "snippets",
-    # 抽象名词
-    "thing", "things", "stuff", "way", "ways", "idea", "ideas", "concept", "concepts",
-    # 通用词
-    "brain", "build", "starter", "crash", "course", "journey", "story",
-    # 中文常用停用词
-    "的", "了", "是", "在", "和", "与", "或", "等", "之", "为", "以", "于", "对",
-    "上", "下", "中", "也", "就", "都", "而", "及", "把", "被", "从", "到",
-    "一个", "一些", "这", "那", "此", "本", "其", "我们", "你", "他", "她", "它",
-}
-
-
-def _slug_to_name(slug):
-    """从 URL slug 提取有意义的 coll 名字
-
-    示例:
-        'perceptron-explained-from-scratch' → 'perceptron/scratch'
-        'why-i-switched-to-vim' → 'switched/vim'
-        'posts/build-a-neural-net' → 'build/neural'
-        'perceptron' → 'perceptron'
-    """
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', slug.lower())
-    # 过滤无信息词 + 过短词（保留 vim/git/cpu 等 3 字符关键词）
-    meaningful = []
-    for w in words:
-        if w in _MISC_NAMING_STOPWORDS:
-            continue
-        if len(w) < 3:
-            continue
-        meaningful.append(w)
-        if len(meaningful) >= 2:
-            break
-    return "/".join(meaningful) if meaningful else None
-
-
-def _tag_to_name(tag):
-    """从用户提供的 tag（如 '#感知机' 或 '#rust'）提取 coll 名字"""
-    # 去掉 # 前缀和 emoji 后缀
-    cleaned = re.sub(r'^[#\s]+', '', tag)
-    cleaned = re.sub(r'[🤖💻🔢🎙️📺📚🛠️🔗💰📄🔬🎮🖼️🔒🌐💼📖🙏⚽⚖️📜✍️📊🎵🌱]+$', '', cleaned).strip()
-    if not cleaned:
-        return None
-    return cleaned
-
-
-def _title_to_name(title):
-    """从 title 提取 coll 名字（兜底方案）"""
-    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', title.lower())
-    meaningful = []
-    for w in words:
-        if w in _MISC_NAMING_STOPWORDS:
-            continue
-        if len(w) < 3:
-            continue
-        meaningful.append(w)
-        if len(meaningful) >= 2:
-            break
-    return "/".join(meaningful) if meaningful else None
-
-
-def create_misc_subcollection(url, title=None, description=None, tag_hints=None):
-    """在 Misc 下创建新的子集合，名称格式：Misc--<name>
-
-    v1.7.2 重构：选名优先级
-    1. **URL slug**（最可靠，标题党文章经常误导）→ 排除 stopwords
-    2. **用户提供的 #tag**（如 #感知机 → 'perceptron'/'感知机'）
-    3. **title 词**（兜底，filtered）
-
-    示例：
-    - URL=ranpara.net/posts/perceptron-explained-from-scratch, tag=#感知机
-      → Misc--perceptron（URL slug 命中）
-    - URL=example.com/article/123, title="Why I switched to Vim"
-      → Misc--switched/vim（title 兜底，filter 掉 "why/i/switched/to"）
-    - URL=github.com/xxx/yyy
-      → Misc--github（domain 命中）
-
-    Args:
-        url: 原始 URL（用于 slug 提取和域名匹配）
-        title: 文章标题（兜底选名）
-        description: 文章描述（可选）
-        tag_hints: 用户提供的 tag 列表
-    """
-    candidates = []  # (priority, sub_name)
-
-    # 优先级 0：已知平台域名（v1.7.2 调整）— 这些 coll 应按平台分类而不是按主题
-    # 理由：wechat/github 等平台的文章有强平台属性，按平台分 coll 更便于浏览
-    domain_subname = None
-    if url:
-        url_lower = url.lower()
-        domain_map = {
-            "weixin.qq.com": "wechat", "mp.weixin.qq.com": "wechat",
-            "ycombinator.com": "hn", "github.com": "github",
-            "bilibili.com": "bilibili", "youtube.com": "youtube",
-            "arxiv.org": "arxiv", "podcasts.apple.com": "podcast",
-        }
-        for dom, name in domain_map.items():
-            if dom in url_lower:
-                domain_subname = name
-                break
-    if domain_subname:
-        candidates.append((0, domain_subname))
-
-    # 优先级 1：URL slug（如果 URL 路径含 - 分隔的词）
-    if url:
-        from urllib.parse import urlparse
-        try:
-            path = urlparse(url).path
-            slug_name = _slug_to_name(path)
-            if slug_name:
-                candidates.append((1, slug_name))
-        except Exception:
-            pass
-
-    # 优先级 2：用户提供的 tag
-    if tag_hints:
-        for tag in tag_hints:
-            tag_name = _tag_to_name(tag)
-            if tag_name and tag_name.lower() not in _MISC_NAMING_STOPWORDS:
-                candidates.append((2, tag_name))
-                break  # 只取第一个有意义的
-
-    # 优先级 3：title 兜底
-    if title:
-        title_name = _title_to_name(title)
-        if title_name:
-            candidates.append((3, title_name))
-
-    # 选优先级最高的
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        sub_name = candidates[0][1]
-    else:
-        # 全部 fallback：用域名首段
-        if url:
-            domain_match = re.search(r'://([^/]+)', url.lower())
+def create_misc_subcollection(name_hint):
+    """在 Misc 下创建新的子集合，名称格式：Misc--xxx"""
+    # 如果 name_hint 是 URL，提取域名作为子集合名
+    if _is_url(name_hint):
+        url_lower = name_hint.lower()
+        if "weixin.qq.com" in url_lower or "mp.weixin.qq.com" in url_lower:
+            sub_name = "wechat"
+        elif "ycombinator.com" in url_lower:
+            sub_name = "hn"
+        elif "github.com" in url_lower:
+            sub_name = "github"
+        elif "bilibili.com" in url_lower:
+            sub_name = "bilibili"
+        elif "youtube.com" in url_lower:
+            sub_name = "youtube"
+        elif "arxiv.org" in url_lower:
+            sub_name = "arxiv"
+        elif "podcasts.apple.com" in url_lower:
+            sub_name = "podcast"
+        else:
+            # 尝试提取域名
+            domain_match = re.search(r'://([^/]+)', url_lower)
             if domain_match:
                 domain = domain_match.group(1)
+                # 取主要部分（如 example.com -> example）
                 parts = domain.replace(".", " ").split()
                 sub_name = parts[0] if parts else "web"
             else:
                 sub_name = "web"
+    else:
+        stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by", "as", "that",
+                      "https", "http", "com", "org", "net", "html", "php", "aspx", "weixin", "qq", "mp"}
+        words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name_hint)
+        keywords = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
+        if keywords:
+            sub_name = "/".join(keywords[:2]).lower()
         else:
             sub_name = "uncategorized"
-
     full_name = f"Misc--{sub_name}"
 
-    existing = _all_collections()
+    existing = zot.collections()
     for c in existing:
         if c['data'].get('name') == full_name:
             print(f"📁 Collection already exists: {full_name}")
@@ -1219,23 +892,6 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
-
-    # v1.7.3: 复制一份到稳定位置，让 AI（minis）能本地打开做 visual sanity check
-    # /tmp 会被系统清理，WebDAV 上传后 tmp_html 也会被删除
-    # AI 看到下面的 VISUAL_CHECK_READY 标记后应该：
-    #   1. 用 browser_use 打开 stable_path
-    #   2. screenshot 全页
-    #   3. 分析是否 CSS 完整、板式正常
-    #   4. 如有异常则提示重抓
-    import shutil
-    stable_dir = "/var/minis/offloads"
-    try:
-        os.makedirs(stable_dir, exist_ok=True)
-        stable_path = os.path.join(stable_dir, filename)
-        shutil.copy(tmp_html, stable_path)
-        print(f"📸 VISUAL_CHECK_READY: {stable_path}")
-    except Exception as e:
-        print(f"⚠️  Could not prepare visual check copy: {e}")
 
     if has_webdav:
         return _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, webdav_pass)
@@ -1674,10 +1330,12 @@ def _llm_summarize(title, description, item_type, url):
             capture_output=True, text=True, timeout=10
         )
         if list_res.returncode != 0:
+            print(f"[WARN] _llm_summarize: minis-model-use list failed (rc={list_res.returncode}): {list_res.stderr[:200]}", file=sys.stderr)
             return None
         list_data = json.loads(list_res.stdout)
         models = list_data.get("data", {}).get("models", [])
         if not models:
+            print(f"[WARN] _llm_summarize: no models available from minis-model-use list", file=sys.stderr)
             return None
         # 优先选 M2.5（更快），fallback 到第一个
         model_id = next(
@@ -1703,29 +1361,43 @@ def _llm_summarize(title, description, item_type, url):
             try: os.remove(tmp)
             except: pass
         if result.returncode != 0 or not result.stdout.strip():
+            print(f"[WARN] _llm_summarize: minis-model-use run failed (rc={result.returncode}); stdout={result.stdout[:100]!r} stderr={result.stderr[:100]!r}", file=sys.stderr)
             return None
         res_data = json.loads(result.stdout)
         if not res_data.get("ok"):
+            print(f"[WARN] _llm_summarize: minis-model-use run returned ok=False; response={str(res_data)[:200]}", file=sys.stderr)
             return None
         content = res_data.get("data", {}).get("output_text", "")
-        # Strip MiniMax think tags: split on \n\n marker
-        # Works for M2.5 (<think>\n...<\/think>) and M2.7 (<think>...) format
-        marker = '\n\n'
-        if marker in content:
-            parts = content.split(marker, 1)
-            content = parts[-1].strip()
+        # Strip MiniMax think tags using the closing </think> XML tag as anchor.
+        # M2.5 format: <think>\n...\n<\/think>\n\nACTUAL_OUTPUT
+        # M2.7 format: <think>...\n<\/think>\n\nACTUAL_OUTPUT
+        # We split on the closing tag + newline(s) boundary, keeping everything after it.
+        # Using </think> as the delimiter avoids false-positives from bare \n\n in content.
+        think_close = "</think>"
+        if think_close in content:
+            idx = content.rfind(think_close)
+            after = content[idx + len(think_close):]
+            # skip trailing newlines/whitespace then split on first meaningful \n\n
+            after = after.lstrip("\n ")
+            if after.startswith("\n"):
+                content = after.lstrip("\n").strip()
+            else:
+                content = after.strip()
         else:
             content = content.strip()
         if not content:
+            print("[WARN] _llm_summarize: LLM returned empty content after stripping think tags", file=sys.stderr)
             return None
         # If LLM echoed the prompt back, discard
         if "\u4e0b\u9762\u662f\u5f85\u6458\u8981\u7684\u5185\u5bb9" in content:
+            print("[WARN] _llm_summarize: LLM echoed prompt back; dropping output", file=sys.stderr)
             return None
         # If output is markdown (not HTML), convert to HTML
         if not content.lstrip().startswith("<") and not content.lstrip().startswith("<h"):
             content = _md_to_html(content)
         return content
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] _llm_summarize: unexpected exception {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
 
@@ -1808,6 +1480,7 @@ def _create_content_note(url, title, item_type, parent_key):
     if summary:
         note_text = f'<h3>📝 {title[:60]}...</h3>\n\n{summary}'
     else:
+        print(f"[WARN] _create_content_note: _llm_summarize returned None for {url!r}; falling back to rule-based generation (LLM failure — check stderr above for details)", file=sys.stderr)
         # 降级：规则生成中文引言
         hook = _generate_chinese_hook(title, desc[:600])
         type_map = {
@@ -1921,15 +1594,6 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     print(f"📄 Title: {title[:80]}")
     print(f"📝 Description: {description[:100] if description else '(no description)'}...")
 
-    # Cloudflare 反爬检测（v1.7.1 新增）
-    # 标记清晰，让 AI 看到后可以用 browser 抓正文补 note
-    if meta.get("cf_blocked"):
-        print("⚠️ CLOUDFLARE_BLOCKED")
-        print("⚠️  This URL is behind Cloudflare anti-bot protection.")
-        print("⚠️  Description is empty; body text was NOT saved.")
-        print("⚠️  AI assistant: please use browser_use to fetch body text")
-        print("⚠️  and save it to the item's note via pyzotero.")
-
     # 如果标题是URL且没有任何描述，也没有提供title_hint，则无法进行有效归档
     if _is_url(title) and not description.strip() and not title_hint:
         print("❌ Cannot archive: title is URL and no description available.")
@@ -1961,7 +1625,7 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         print(f"📁 Matched collection: {coll_name}")
     else:
         print("🔨 No matching collection found, creating new Misc--xxx subcollection...")
-        coll_key = create_misc_subcollection(url, title=title, description=description, tag_hints=tag_hints)
+        coll_key = create_misc_subcollection(title + " " + description)
         coll_name = "new Misc--xxx"
 
     # 检查URL是否已存在（避免重复创建）
@@ -2114,6 +1778,7 @@ if __name__ == "__main__":
                 if summary:
                     note_to_write = summary
                 else:
+                    print(f"[WARN] _llm_summarize returned None for item {item_key}; falling back to raw note content (LLM generation failed — check stderr above for details)", file=sys.stderr)
                     note_to_write = note_content
                 note_html = f'<h3>📝 内容提纲</h3>\n\n{note_to_write}'
                 try:
