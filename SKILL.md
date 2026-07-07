@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.8.2
+version: 1.8.3
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -218,3 +218,16 @@ alias zot="python3 scripts/zot.py"
 - 二进制附件通过 `_detect_binary_url` + `archive_binary_url` + `save_file_attachment` 自动处理
 - HTML 附件通过 `monolith` 抓取，经 `_upload_to_webdav` 上传
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
+
+## 版本历史
+
+### v1.8.3 — Note 生成质量修复
+
+**问题（v1.8.2 及之前）**：`fetch_url_metadata` 拿不到 description 时（微信公众号、Wikipedia、部分博客等），`_create_content_note` 直接跳过 LLM，输出**"两行 URL 标题"的垃圾 note**——用户称之为"两行 url 一样的无用信息 note"。讽刺的是：LLM API 已配置好但完全没用上。
+
+**修复（v1.8.3）**：
+1. **`_llm_summarize` 支持空 description**：新增 fallback mode prompt，基于标题+URL+类型推断内容（"预期核心议题 / 平台与定位 / 阅读建议"）
+2. **`_create_content_note` 不再跳过 LLM**：无论 description 是否为空，都调 `_llm_summarize`
+3. **`_build_minimal_fallback_note` 全新 helper**：LLM 完全失败时仍生成 metadata-rich note + 明确"未生成摘要"标记 + 修复建议（运行 `zot addnote <item-key>` 重试）
+
+**实测**：archive Wikipedia 文章（description 为空）自动生成 555 chars 的 rich LLM 摘要，含 Grothendieck 1966 菲尔兹奖、隐居经历等准确信号——**不是 prompt 回声**。
