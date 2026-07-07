@@ -198,9 +198,23 @@ def _invalidate_collections_cache():
 def _fix_wechat_html(filepath):
     """Post-process monolith-saved WeChat MP HTML for offline/Zotero viewing.
 
-    Fixes two JS-dependent issues:
-      1. #js_content inline ``visibility: hidden; opacity: 0`` → removed
-      2. ``<img data-src="...">`` → ``<img src="...">`` (lazy-load → eager)
+    Fixes JS-dependent issues that break offline rendering in simple WebView
+    renderers (Zotero's Qt WebEngine, simplified HTML readers):
+
+      1. ``#js_content`` inline ``visibility: hidden; opacity: 0`` → removed
+         (WeChat's default state — JS unhides after font/network readiness check)
+      2. ``<img data-src="URL" src="data:image/...base64...">`` → keep the base64
+         ``src`` (it's the actual image data, not a placeholder) and strip
+         ``data-src`` (lazy-load trigger that's useless offline)
+      3. Strip WeChat-specific debugging attributes (data-aistatus, data-imgfileid,
+         data-s, data-ratio, data-type, data-w) — these are noise that bloats the
+         file by ~8 KB total and serves no offline purpose.
+
+    v1.8.2 fix: previous version replaced the inline ``src="data:image/...base64"``
+    with the external ``data-src`` URL, **destroying 19.6 MB of image data** for
+    a 20.9 MB article. The base64 src is NOT a placeholder — it's the real image
+    data that WeChat inlines so the article can be cached by MP client. Without
+    it, offline Zotero rendering shows no images.
 
     Uses regex-based matching so minor spacing/order variations are tolerated.
     Returns True if any changes were made, False otherwise.
@@ -229,25 +243,32 @@ def _fix_wechat_html(filepath):
         _clean_js_content_style, html
     )
 
-    # 2. Convert lazy-loaded images:
-    #    <img data-src="URL" ... src="data:image;base64,..." />
-    #    -> <img src="URL" ... /> — browser will use src; data-src is harmless.
-    def _replace_img_tag(m):
+    # 2. Strip data-src from lazy-loaded images, KEEPING the inline base64 src.
+    #    WeChat pages have <img data-src="https://..." src="data:image/...;base64,..."/>
+    #    The src is the ACTUAL image data (inlined for offline caching) — NOT a
+    #    placeholder. v1.8.1's bug replaced src with data-src URL, losing 19.6MB
+    #    of image data. We now just drop the redundant data-src attribute.
+    def _strip_data_src(m):
         tag = m.group(0)
-        ds_match = re.search(r'data-src="(https?://[^"]*)"', tag)
-        if not ds_match:
-            return tag
-        url = ds_match.group(1).replace('&amp;', '&')
-        # replace placeholder base64 src with real URL
-        tag = re.sub(r'src="data:image[^"]*"', f'src="{url}"', tag)
+        tag = re.sub(r'\s*data-src="[^"]*"', '', tag)
         return tag
 
     html, n2 = re.subn(
         r'<img[^>]*data-src="https?://[^"]*"[^>]*>',
-        _replace_img_tag, html
+        _strip_data_src, html
     )
 
-    if n1 or n2:
+    # 3. Strip WeChat-specific debugging attributes (cosmetic noise, ~8KB savings)
+    def _strip_wechat_attrs(m):
+        tag = m.group(0)
+        for attr in ['data-aistatus', 'data-imgfileid', 'data-s', 'data-ratio',
+                     'data-type', 'data-w']:
+            tag = re.sub(rf'\s*{attr}="[^"]*"', '', tag)
+        return tag
+
+    html, n3 = re.subn(r'<img[^>]*>', _strip_wechat_attrs, html)
+
+    if n1 or n2 or n3:
         changed = True
 
     if changed:
