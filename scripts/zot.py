@@ -1537,23 +1537,38 @@ def _llm_summarize(title, description, item_type, url):
       minis-model-use run --model <model> --input-json '{"messages": [{"role": "user", "content": ...}]}'
       → 输出 JSON，含 ok + data.choices[0].message.content 字段
 
+    支持两种模式（v1.8.3 起）：
+      - 有 description：5 段式 rich 摘要（基本信息 / 核心结论 / 主要观点 / 元观察 / 延伸方向）
+      - 无 description：基于标题+URL 推断的"预期内容指南"，避免 prompt 回声
+
     若未配置模型或调用失败，返回 None 并降级到规则生成。
     """
-    prompt = f"""你是一个严格的学术笔记助手。请为以下内容生成一段**中文内容提纲**，用纯 HTML 格式输出（不是 markdown！），结构如下：
+    has_desc = bool(description and description.strip())
 
-<h3>📝 内容提纲</h3>
-<p><strong>作者/来源</strong>：（从内容中提取，如无则写"不明"）</p>
-<hr/>
-<p><strong>核心论点</strong>：（2-4 句话，高度概括作者的核心主张，避免摘抄原文）</p>
-<hr/>
-<p><strong>主要观点</strong>：</p>
+    if has_desc:
+        # Full mode: 5 段式 rich 摘要（参照 /summarize skill 的输出结构）
+        prompt = f"""你是中文内容摘要助手。请根据以下内容生成结构化中文摘要，用**纯 HTML 格式**输出（不是 markdown！）：
+
+<h3>📋 基本信息</h3>
+<p><strong>标题</strong>：{title}</p>
+<p><strong>类型</strong>：{item_type}</p>
+<p><strong>URL</strong>：{url}</p>
+
+<h3>🎯 核心结论</h3>
+<p>（用 2-4 句话高度概括作者的核心主张，避免摘抄原文）</p>
+
+<h3>📝 主要观点</h3>
 <ol>
 <li>（第一观点，1-2 句话）</li>
 <li>（第二观点...）</li>
-<li>（第三观点...）</li>
+<li>（第三观点，可选）</li>
 </ol>
-<hr/>
-<p><strong>一句话总结</strong>：（用一句话点明这篇文章/视频/帖子为什么值得关注）</p>
+
+<h3>💡 值得关注的信息</h3>
+<p>（1-3 条文章里没说但读者容易忽略的信号，例如跨篇联系 / 被忽略的细节 / 内部矛盾）</p>
+
+<h3>🔍 延伸方向</h3>
+<p>（2-3 个深入阅读方向，帮助读者决定是否要展开研究）</p>
 
 ---下面是待摘要的内容---
 **标题**：{title}
@@ -1561,6 +1576,33 @@ def _llm_summarize(title, description, item_type, url):
 **URL**：{url}
 **描述/摘要**：
 {description[:2000] if description else "(无详细描述)"}
+"""
+    else:
+        # Fallback mode: 无 meta description 时基于标题+URL 推断
+        # 避免完全跳过 LLM（v1.8.2 之前的行为是"desc 空就跳过 LLM 给两行 URL 垃圾 note"）
+        prompt = f"""你是中文内容摘要助手。原始页面未提供 meta description，请基于标题、类型、URL 推断内容，生成"预期内容指南"。
+
+用**纯 HTML 格式**输出（不是 markdown！）：
+
+<h3>📋 基本信息</h3>
+<p><strong>标题</strong>：{title}</p>
+<p><strong>类型</strong>：{item_type}</p>
+<p><strong>URL</strong>：{url}</p>
+
+<h3>🎯 预期核心议题</h3>
+<p>（基于标题推断这篇文章可能讨论的核心议题，2-3 句话）</p>
+
+<h3>💡 平台与定位</h3>
+<p>（从 URL 域名推断发布平台，例如 weixin.qq.com = 微信公众号生态；mp.weixin.qq.com/s/ = 单篇文章；github.com/&lt;user&gt;/&lt;repo&gt; = 开源项目主页）</p>
+
+<h3>🔍 阅读建议</h3>
+<p>（基于标题+平台类型，判断这篇文章是否值得读、适合谁读，1-2 句话）</p>
+
+---下面是仅有的信息---
+**标题**：{title}
+**类型**：{item_type}
+**URL**：{url}
+**描述/摘要**：（无 meta description 可用，请基于标题和 URL 推断）
 """
     try:
         # 获取可用的模型
@@ -1699,54 +1741,102 @@ def _create_content_note(url, title, item_type, parent_key):
     # === 通用内容 ===
     desc = getattr(sys.modules[__name__], '_last_fetched_description', '') or ''
 
-    # 描述为空时不调用 LLM（容易生成 prompt 回声），直接用规则生成
-    if not desc.strip():
-        note_text = (
-            f'<h3>📝 文章速览</h3>'
-            f'<p><strong>标题</strong>：{title}</p>'
-            f'<p><strong>来源</strong>：<a href="{url}">{url[:70]}</a></p>'
-        )
-        try:
-            zot.create_items([{'itemType': 'note', 'parentItem': parent_key, 'note': note_text}])
-            print("📝 Created content summary note")
-        except Exception as e:
-            print(f"⚠️ Note creation failed: {e}")
-        return
-
-    # 优先 LLM 生成（有描述内容时）
+    # v1.8.3：无论 desc 是否为空，都尝试调 LLM（之前 desc 为空时直接跳过 LLM
+    # 输出"两行 URL"的垃圾 note）。_llm_summarize 内部已支持空 desc 模式。
     summary = _llm_summarize(title, desc, item_type, url)
 
     if summary:
         note_text = f'<h3>📝 {title[:60]}...</h3>\n\n{summary}'
     else:
         print(f"[WARN] _create_content_note: _llm_summarize returned None for {url!r}; falling back to rule-based generation (LLM failure — check stderr above for details)", file=sys.stderr)
-        # 降级：规则生成中文引言
-        hook = _generate_chinese_hook(title, desc[:600])
-        type_map = {
-            "podcast": ("播客", "本集核心话题"),
-            "video": ("视频", "本期核心内容"),
-            "arxiv": ("论文", "论文核心贡献"),
-            "book": ("书籍", "本书核心主题"),
-            "github": ("项目", "项目亮点"),
-            "webpage": ("文章", "文章核心议题"),
-        }
-        type_label, topic_label = type_map.get(item_type, ("内容", "核心议题"))
-        core_topic = re.split(r'[|—–\-]', title)[0].strip()
-        note_text = (
-            f'<h3>📝 {type_label}速览</h3>'
-            f'<p><strong>标题</strong>：{title}</p>'
-            f'<hr/>'
-            f'<p><strong>📖 中文引言</strong>：{hook}</p>'
-            f'<p><strong>{topic_label}</strong>：{core_topic}</p>'
-            f'<p><strong>来源</strong>：<a href="{url}">{url[:70]}</a></p>'
-            f'<hr/><p><strong>🔍 阅读提示</strong>：先读中文引言判断是否感兴趣，再深入阅读完整内容。</p>'
-        )
+        # 降级：规则生成
+        if desc.strip():
+            # 有 description：使用原 hook-based fallback
+            hook = _generate_chinese_hook(title, desc[:600])
+            type_map = {
+                "podcast": ("播客", "本集核心话题"),
+                "video": ("视频", "本期核心内容"),
+                "arxiv": ("论文", "论文核心贡献"),
+                "book": ("书籍", "本书核心主题"),
+                "github": ("项目", "项目亮点"),
+                "webpage": ("文章", "文章核心议题"),
+            }
+            type_label, topic_label = type_map.get(item_type, ("内容", "核心议题"))
+            core_topic = re.split(r'[|—–\-]', title)[0].strip()
+            note_text = (
+                f'<h3>📝 {type_label}速览</h3>'
+                f'<p><strong>标题</strong>：{title}</p>'
+                f'<hr/>'
+                f'<p><strong>📖 中文引言</strong>：{hook}</p>'
+                f'<p><strong>{topic_label}</strong>：{core_topic}</p>'
+                f'<p><strong>来源</strong>：<a href="{url}">{url[:70]}</a></p>'
+                f'<hr/><p><strong>🔍 阅读提示</strong>：先读中文引言判断是否感兴趣，再深入阅读完整内容。</p>'
+            )
+        else:
+            # 无 description 且 LLM 不可用：使用新的 metadata-rich fallback
+            # （之前的 v1.8.2 行为是直接 return 不生成 note，导致 note 缺失；
+            #  v1.8.3 改为：LLM 也失败时仍生成有元数据的 note + 明确"未生成摘要"标记）
+            note_text = _build_minimal_fallback_note(title, url, item_type)
 
     try:
         zot.create_items([{'itemType': 'note', 'parentItem': parent_key, 'note': note_text}])
         print("📝 Created content summary note")
     except Exception as e:
         print(f"⚠️ Note creation failed: {e}")
+
+
+def _build_minimal_fallback_note(title, url, item_type):
+    """LLM 不可用且无 description 时的 metadata-rich fallback note（v1.8.3+）。
+
+    与 v1.8.2 的"两行 URL 垃圾 note"不同，本函数提供：
+      - 类型标签（带 emoji）
+      - 标题
+      - 发布平台域名（从 URL 提取）
+      - URL 路径
+      - 完整链接
+      - 明确的"未生成摘要"提示 + 修复建议
+
+    让用户在 Zotero 客户端能一眼看出"这是 fallback，不是摘要"。
+    """
+    from urllib.parse import urlparse
+
+    try:
+        p = urlparse(url)
+        domain = p.netloc or "(无法解析)"
+        path = p.path or "/"
+    except Exception:
+        domain, path = "(URL 解析失败)", ""
+
+    type_label_map = {
+        "podcast": "🎙️ 播客",
+        "video": "📺 视频",
+        "arxiv": "📄 论文",
+        "book": "📖 书籍",
+        "github": "🛠️ GitHub 项目",
+        "webpage": "🌐 网页文章",
+    }
+    type_label = type_label_map.get(item_type, "📄 内容")
+
+    url_display = url if len(url) <= 70 else url[:70] + "..."
+
+    return (
+        f'<h3>📝 自动归档条目（未生成摘要）</h3>'
+        f'<p><strong>类型</strong>：{type_label}</p>'
+        f'<p><strong>标题</strong>：{title}</p>'
+        f'<p><strong>发布平台</strong>：{domain}</p>'
+        f'<p><strong>URL 路径</strong>：<code>{path[:120]}</code></p>'
+        f'<p><strong>完整链接</strong>：<a href="{url}">{url_display}</a></p>'
+        f'<hr/>'
+        f'<p style="color:#c00"><em>⚠️ 自动摘要未生成</em></p>'
+        f'<ul style="color:#666;font-size:90%">'
+        f'<li>原因：原始页面未提供 meta description，且 LLM 摘要不可用（minis-model-use 未配置或调用失败）</li>'
+        f'<li>建议：'
+        f'<ol style="margin-top:4px">'
+        f'<li>打开原文阅读后手动添加摘要；或</li>'
+        f'<li>运行 <code>zot addnote &lt;item-key&gt;</code> 重试 LLM 摘要</li>'
+        f'</ol></li>'
+        f'</ul>'
+    )
 
 
 def _generate_chinese_hook(title, description):
