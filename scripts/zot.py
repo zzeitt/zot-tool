@@ -49,6 +49,143 @@ if not MISC_COLLECTION:
 
 zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY)
 
+
+# ---------------------------------------------------------------------------
+# v1.8.0 — Domain hard-mapping & helpers
+# ---------------------------------------------------------------------------
+# 已知平台域名 → 推荐的 Misc 子集合名（短而稳定，方便人工识别）
+# - 用作 find_best_collection 的高优先级硬信号
+# - 用作 create_misc_subcollection 的命名约定
+# - 新增平台时同时加进两个地方（这里 + 文档 SKILL.md 平台映射表）
+DOMAIN_TO_SUBCOLL = {
+    # 中文平台
+    "mp.weixin.qq.com": "wechat",
+    "weixin.qq.com": "wechat",
+    "chaspark.com": "chaspark",          # 华为背景的茶思屋
+    "bilibili.com": "bilibili",
+    "xiaohongshu.com": "xhs",            # 小红书
+    "zhihu.com": "zhihu",
+    "juejin.cn": "juejin",
+    # 开发者平台
+    "github.com": "github",
+    "arxiv.org": "arxiv",
+    "ycombinator.com": "hn",
+    "news.ycombinator.com": "hn",
+    "stackoverflow.com": "stackoverflow",
+    "medium.com": "medium",
+    "substack.com": "substack",
+    # 音视频
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "podcasts.apple.com": "podcast",
+    "open.spotify.com": "spotify",
+    # 知识/百科
+    "wikipedia.org": "wikipedia",
+}
+
+# 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
+_collections_cache = {"data": None, "ts": 0.0}
+_COLLECTIONS_CACHE_TTL = 300  # seconds
+
+
+def _domain_subcoll_name(url):
+    """从 URL 提取已知平台的子集合名。未命中返回 None。
+
+    Examples:
+        >>> _domain_subcoll_name("https://mp.weixin.qq.com/s/abc?scene=334")
+        'wechat'
+        >>> _domain_subcoll_name("https://github.com/zzeitt/zot-tool")
+        'github'
+        >>> _domain_subcoll_name("https://example.com/post/123")
+        None
+    """
+    if not url:
+        return None
+    url_lower = url.lower()
+    for dom, sub in DOMAIN_TO_SUBCOLL.items():
+        if dom in url_lower:
+            return sub
+    return None
+
+
+def _all_collections(force_refresh=False):
+    """分页拉取所有 collections（库大时 zot.collections() 默认 limit=100 会漏掉大部分）
+
+    5 分钟 TTL 缓存。v1.7.4 SKILL.md 已承诺该函数但代码未实现——v1.8.0 落地。
+    """
+    import time as _time
+    now = _time.time()
+    if not force_refresh and _collections_cache["data"] is not None and (now - _collections_cache["ts"]) < _COLLECTIONS_CACHE_TTL:
+        return _collections_cache["data"]
+    # pyzotero everything() 走分页 API
+    all_cols = list(zot.everything(zot.collections()))
+    _collections_cache["data"] = all_cols
+    _collections_cache["ts"] = now
+    return all_cols
+
+
+def _find_existing_domain_collection(url):
+    """根据 URL 域名在库内查找已存在的 Misc--<sub> 集合。
+
+    Returns:
+        (coll_key, coll_name) 或 None
+    """
+    sub = _domain_subcoll_name(url)
+    if not sub:
+        return None
+    target_name = f"Misc--{sub}"
+    for c in _all_collections():
+        if c['data'].get('name') == target_name:
+            return c['key'], target_name
+    return None
+
+
+def _is_collection_empty(coll_key):
+    """检查 collection 是否真的空（0 items）。
+
+    注意：zot.collection_items() 默认 limit=100，大库会漏判。
+    """
+    try:
+        items = list(zot.everything(zot.collection_items(coll_key)))
+        return len(items) == 0
+    except Exception:
+        return False
+
+
+def _delete_collection_raw(coll_key):
+    """通过 raw Zotero Web API 删除 collection（处理 version header）
+
+    pyzotero.delete_collection() 在 key-only 模式下报
+    "string indices must be integers"（参见 2026-07-06 π 事件踩坑）。
+    """
+    import requests as _requests
+    r = _requests.get(
+        f"https://api.zotero.org/users/{LIBRARY_ID}/collections/{coll_key}",
+        headers={"Authorization": f"Bearer {API_KEY}", "Zotero-API-Version": "3"},
+    )
+    if r.status_code != 200:
+        return False, f"GET failed: {r.status_code}"
+    ver = r.json().get("version") or r.json().get("data", {}).get("version")
+    if not ver:
+        return False, "no version found"
+    r = _requests.delete(
+        f"https://api.zotero.org/users/{LIBRARY_ID}/collections/{coll_key}",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Zotero-API-Version": "3",
+            "If-Unmodified-Since-Version": str(ver),
+        },
+    )
+    if r.status_code == 204:
+        return True, "deleted"
+    return False, f"HTTP {r.status_code}: {r.text[:200]}"
+
+
+def _invalidate_collections_cache():
+    """强制刷新 _all_collections() 缓存（写操作后调用）"""
+    _collections_cache["data"] = None
+    _collections_cache["ts"] = 0.0
+
 # Cache forbidden items
 _forbidden_item_keys = None
 
@@ -694,7 +831,12 @@ def _extract_text_keywords(text):
 
 
 def find_best_collection(title, description):
-    """匹配最合适的 collection，无匹配则返回 None"""
+    """匹配最合适的 collection，无匹配则返回 None
+
+    v1.8.0: 改用 _all_collections() (分页 + 缓存) 替代裸 zot.collections()。
+            早返回逻辑保持不变 —— description 为空时依然返回 None,domain
+            硬映射已由 archive_url 在调用本函数前先尝试。
+    """
     text = (title + " " + description).lower()
 
     # 如果标题是URL，description也为空，则无法进行有意义的匹配
@@ -702,7 +844,7 @@ def find_best_collection(title, description):
         return None
 
     text_keywords = _extract_text_keywords(text)
-    collections = zot.collections()
+    collections = _all_collections()
     best_match = None
     best_score = 0
 
@@ -724,50 +866,25 @@ def find_best_collection(title, description):
     return best_match
 
 
-def create_misc_subcollection(name_hint):
-    """在 Misc 下创建新的子集合，名称格式：Misc--xxx"""
-    # 如果 name_hint 是 URL，提取域名作为子集合名
-    if _is_url(name_hint):
-        url_lower = name_hint.lower()
-        if "weixin.qq.com" in url_lower or "mp.weixin.qq.com" in url_lower:
-            sub_name = "wechat"
-        elif "ycombinator.com" in url_lower:
-            sub_name = "hn"
-        elif "github.com" in url_lower:
-            sub_name = "github"
-        elif "bilibili.com" in url_lower:
-            sub_name = "bilibili"
-        elif "youtube.com" in url_lower:
-            sub_name = "youtube"
-        elif "arxiv.org" in url_lower:
-            sub_name = "arxiv"
-        elif "podcasts.apple.com" in url_lower:
-            sub_name = "podcast"
-        else:
-            # 尝试提取域名
-            domain_match = re.search(r'://([^/]+)', url_lower)
-            if domain_match:
-                domain = domain_match.group(1)
-                # 取主要部分（如 example.com -> example）
-                parts = domain.replace(".", " ").split()
-                sub_name = parts[0] if parts else "web"
-            else:
-                sub_name = "web"
+def create_misc_subcollection(name_hint, url=None):
+    """在 Misc 下创建新的子集合，名称格式：Misc--xxx
+
+    v1.8.0: 优先用 url 参数走 _domain_subcoll_name() 硬映射（覆盖 wechat/github/hn/...
+    这类已知平台），如果 name_hint 是 URL 也走同样路径。否则退回到 title-slug 算法。
+    """
+    # 1. URL 路径（显式 url 参数 > name_hint 是 URL）
+    target_url = url if url and _is_url(url) else (name_hint if _is_url(name_hint) else None)
+
+    if target_url:
+        sub_name = _domain_subcoll_name(target_url) or _fallback_sub_name_from_url(target_url)
     else:
-        stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by", "as", "that",
-                      "https", "http", "com", "org", "net", "html", "php", "aspx", "weixin", "qq", "mp"}
-        words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name_hint)
-        keywords = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
-        if keywords:
-            sub_name = "/".join(keywords[:2]).lower()
-        else:
-            sub_name = "uncategorized"
+        sub_name = _fallback_sub_name_from_title(name_hint)
     full_name = f"Misc--{sub_name}"
 
-    existing = zot.collections()
-    for c in existing:
+    for c in _all_collections():
         if c['data'].get('name') == full_name:
             print(f"📁 Collection already exists: {full_name}")
+            _invalidate_collections_cache()
             return c['key']
 
     coll_template = {'name': full_name, 'parentCollection': MISC_COLLECTION}
@@ -776,10 +893,32 @@ def create_misc_subcollection(name_hint):
         if resp.get('successful'):
             new_key = resp['successful']['0']['key']
             print(f"📁 Created new collection: {full_name} ({new_key})")
+            _invalidate_collections_cache()
             return new_key
     except Exception as e:
         print(f"⚠️ Failed to create collection: {e}")
     return MISC_COLLECTION
+
+
+def _fallback_sub_name_from_url(url):
+    """URL 路径走完硬映射还没命中时的兜底（取主域名第一段）"""
+    domain_match = re.search(r'://([^/]+)', url.lower())
+    if domain_match:
+        domain = domain_match.group(1)
+        parts = domain.replace(".", " ").split()
+        return parts[0] if parts else "web"
+    return "web"
+
+
+def _fallback_sub_name_from_title(name_hint):
+    """name_hint 不是 URL 时，从标题文本里取前 2 个有意义的中英文 token"""
+    stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are", "by", "as", "that",
+                  "https", "http", "com", "org", "net", "html", "php", "aspx", "weixin", "qq", "mp"}
+    words = re.findall(r'[a-zA-Z\u4e00-\u9fff]+', name_hint)
+    keywords = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
+    if keywords:
+        return "/".join(keywords[:2]).lower()
+    return "uncategorized"
 
 
 def _detect_binary_url(url):
@@ -1619,14 +1758,23 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
                 break
     print(f"🏷️  Tags: {', '.join(final_tags)}")
 
-    matched = find_best_collection(title, description)
-    if matched:
-        coll_key, coll_name = matched
-        print(f"📁 Matched collection: {coll_name}")
+    # v1.8.0: 域名硬映射优先 (优先于多信号评分,优先于 create_misc_subcollection)
+    # 场景: WeChat 文章 description 为空 → find_best_collection 早返回 None
+    #       旧代码会 fall through 到 create_misc_subcollection 创建中文长名 coll
+    #       修复: 已知平台域名直接命中已有 Misc--<sub> coll
+    domain_match = _find_existing_domain_collection(url)
+    if domain_match:
+        coll_key, coll_name = domain_match
+        print(f"📁 Domain-mapped collection: {coll_name} (from URL domain)")
     else:
-        print("🔨 No matching collection found, creating new Misc--xxx subcollection...")
-        coll_key = create_misc_subcollection(title + " " + description)
-        coll_name = "new Misc--xxx"
+        matched = find_best_collection(title, description)
+        if matched:
+            coll_key, coll_name = matched
+            print(f"📁 Matched collection: {coll_name}")
+        else:
+            print("🔨 No matching collection found, creating new Misc--xxx subcollection...")
+            coll_key = create_misc_subcollection(title + " " + description, url=url)
+            coll_name = "new Misc--xxx"
 
     # 检查URL是否已存在（避免重复创建）
     existing_items = zot.items(q=url, limit=10)
@@ -1686,6 +1834,7 @@ Commands:
   archive --no-offline <url>    Archive without saving offline copy
   addnote <item-key> [content]   Add LLM-generated note to existing item
   delete <item-key>              Delete an item from library
+  cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
   help                           Show this help
 
 Examples:
@@ -1698,6 +1847,7 @@ Examples:
   zot add podcast "My Podcast" "https://..." LKRM6B4Y
   zot archive "https://podcasts.apple.com/..."
   zot delete KC5ETPXM
+  zot cleanup-empty-collections
 
 🚫 Note: Items in 🙊Personal collection are always excluded.
 📌 Convention: All new items are auto-tagged with /unread.
@@ -1834,6 +1984,38 @@ if __name__ == "__main__":
                 print(f"✅ Deleted item: {item_key}")
             except Exception as e:
                 print(f"❌ Failed: {e}")
+
+    elif cmd == "cleanup-empty-collections":
+        # v1.8.0: 扫描所有子 collection（跳过根/Personal/Misc），
+        # 找出空 collection 并通过 raw API 删除
+        protect = {FORBIDDEN_COLLECTION, MISC_COLLECTION}
+        prefix_protect = ["🙊", "📢"]  # 顶层隐私 / 公开目录，不动
+        deleted = 0
+        skipped_protected = 0
+        skipped_with_items = 0
+        for c in _all_collections(force_refresh=True):
+            ck = c['key']
+            name = c['data'].get('name', '')
+            parent = c['data'].get('parentCollection')
+            if ck in protect or parent is None or parent in protect:
+                skipped_protected += 1
+                continue
+            if any(name.startswith(p) for p in prefix_protect):
+                skipped_protected += 1
+                continue
+            if not _is_collection_empty(ck):
+                skipped_with_items += 1
+                continue
+            ok, msg = _delete_collection_raw(ck)
+            if ok:
+                print(f"🗑️  Deleted empty collection: {name} ({ck})", flush=True)
+                deleted += 1
+            else:
+                print(f"❌ Failed to delete {name} ({ck}): {msg}", flush=True)
+        _invalidate_collections_cache()
+        print()
+        print(f"📊 Summary: deleted={deleted}, protected={skipped_protected}, "
+              f"non-empty={skipped_with_items}", flush=True)
 
     elif cmd == "help":
         show_help()
