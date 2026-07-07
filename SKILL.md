@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.8.0
+version: 1.8.1
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -105,6 +105,16 @@ v1.7.4 之前空 coll 永久累积（GLOBAL.md 已记 2026-07-06 踩坑），v1.
      - 数学公式、交互组件是否保留
   4. 异常时主动重抓或提示用户
 - **为什么必要**：之前的感知机文章归档后用户报告 CSS 缺失，本地浏览器打开其实是好的——是 Zotero 客户端渲染 bug。提前发现能避免上传错误文件。
+
+### 微信公众号 HTML 后处理（v1.8.1）
+
+- **问题**：微信公众号文章由 monolith 保存后，正文被 `visibility: hidden; opacity: 0;` 隐藏，图片使用 `data-src` 懒加载——两者都依赖 JavaScript。Zotero 禁用 JS，导致正文完全空白。
+- **修复**：`save_offline_copy` 在 monolith 完成后自动调用 `_fix_wechat_html()` 对 HTML 做后处理：
+  1. 移除 `#js_content` 上的 `visibility: hidden; opacity: 0;` 内联样式
+  2. 将 `<img data-src="URL" src="data:image...">` 中的懒加载占位符替换为真实图片 URL
+- **函数签名**：`_fix_wechat_html(filepath)`，返回 `True` 表示做了修改，`False` 表示无需处理（非微信文章或已修复）
+- **幂等性**：通过检测特征字符串 `id="js_content" style="visibility: hidden; opacity: 0; "` 判断是否需要处理，重复调用安全
+- **已知局限**：微信 CDN 图片（`mmbiz.qpic.cn`）在 Zotero 内仍可能因网络策略无法加载，但正文已正常显示
 
 ### Collection 匹配策略（v1.7.0 重构 + v1.7.4 关键修复 + **v1.8.0 域名硬映射优先级最高**）
 

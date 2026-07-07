@@ -186,6 +186,77 @@ def _invalidate_collections_cache():
     _collections_cache["data"] = None
     _collections_cache["ts"] = 0.0
 
+
+# ---------------------------------------------------------------------------
+# v1.8.1 — WeChat MP article HTML post-processing
+# ---------------------------------------------------------------------------
+# 微信公众号文章由 monolith 保存后，正文被 visibility:hidden + opacity:0 隐藏，
+# 图片用 data-src 懒加载——两者都依赖 JS。Zotero 禁用 JS，导致正文空白。
+# 此函数在 monolith 完成后对 HTML 做后处理，移除反爬样式并展开图片 src。
+
+
+def _fix_wechat_html(filepath):
+    """Post-process monolith-saved WeChat MP HTML for offline/Zotero viewing.
+
+    Fixes two JS-dependent issues:
+      1. #js_content inline ``visibility: hidden; opacity: 0`` → removed
+      2. ``<img data-src="...">`` → ``<img src="...">`` (lazy-load → eager)
+
+    Uses regex-based matching so minor spacing/order variations are tolerated.
+    Returns True if any changes were made, False otherwise.
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        html = f.read()
+
+    # Guard: must contain the WeChat article body div
+    if 'id="js_content"' not in html:
+        return False
+
+    changed = False
+
+    # 1. Unhide the article body — strip visibility:hidden and opacity:0
+    #    from the #js_content inline style attribute.
+    def _clean_js_content_style(m):
+        tag = m.group(0)
+        tag = re.sub(r'visibility\s*:\s*hidden\s*;?\s*', '', tag,
+                     flags=re.IGNORECASE)
+        tag = re.sub(r'opacity\s*:\s*0\s*;?\s*', '', tag,
+                     flags=re.IGNORECASE)
+        return tag
+
+    html, n1 = re.subn(
+        r'<div[^>]*\s+id="js_content"[^>]*style="[^"]*"[^>]*>',
+        _clean_js_content_style, html
+    )
+
+    # 2. Convert lazy-loaded images:
+    #    <img data-src="URL" ... src="data:image;base64,..." />
+    #    -> <img src="URL" ... /> — browser will use src; data-src is harmless.
+    def _replace_img_tag(m):
+        tag = m.group(0)
+        ds_match = re.search(r'data-src="(https?://[^"]*)"', tag)
+        if not ds_match:
+            return tag
+        url = ds_match.group(1).replace('&amp;', '&')
+        # replace placeholder base64 src with real URL
+        tag = re.sub(r'src="data:image[^"]*"', f'src="{url}"', tag)
+        return tag
+
+    html, n2 = re.subn(
+        r'<img[^>]*data-src="https?://[^"]*"[^>]*>',
+        _replace_img_tag, html
+    )
+
+    if n1 or n2:
+        changed = True
+
+    if changed:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(html)
+
+    return changed
+
+
 # Cache forbidden items
 _forbidden_item_keys = None
 
@@ -1031,6 +1102,14 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
+
+    # v1.8.1: fix WeChat MP articles whose content is hidden by JS-dependent styles
+    try:
+        if _fix_wechat_html(tmp_html):
+            fixed_size = os.path.getsize(tmp_html)
+            print(f"🔧 Post-processed WeChat article: {file_size} → {fixed_size} bytes")
+    except Exception as e:
+        print(f"⚠️  WeChat HTML post-processing skipped: {e}")
 
     if has_webdav:
         return _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, webdav_pass)
