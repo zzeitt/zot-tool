@@ -1210,7 +1210,7 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
     prop_content = f'<properties version="1"><mtime>{mtime}</mtime><hash>{md5}</hash></properties>'
     try:
         prop_res = subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            ["curl", "-s", "-o", os.devnull, "-w", "%{http_code}",
              "-X", "PUT",
              "-H", "Content-Type: text/xml",
              "-u", f"{webdav_user}:{webdav_pass}",
@@ -2023,6 +2023,7 @@ Commands:
   archive <url> [title-hint] [#tag1]...  Smart archive with auto collection/tag (+ optional tag hints)
   archive --no-offline <url>    Archive without saving offline copy
   addnote <item-key> [content]   Add LLM-generated note to existing item
+  attach <item-key> <file> [name] Upload local file as attachment via WebDAV
   delete <item-key>              Delete an item from library
   cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
   help                           Show this help
@@ -2036,6 +2037,7 @@ Examples:
   zot collections
   zot add podcast "My Podcast" "https://..." LKRM6B4Y
   zot archive "https://podcasts.apple.com/..."
+  zot attach KC5ETPXM /tmp/article.html article.html
   zot delete KC5ETPXM
   zot cleanup-empty-collections
 
@@ -2130,6 +2132,28 @@ if __name__ == "__main__":
                     print(f"✅ Added note to item {item_key}")
                 except Exception as e:
                     print(f"❌ Failed: {e}")
+
+    elif cmd == "attach":
+        # zot attach <item-key> <file-path> [archive-filename]
+        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        file_path = sys.argv[3] if len(sys.argv) > 3 else ""
+        archive_filename = sys.argv[4] if len(sys.argv) > 4 else None
+        if not item_key or not file_path:
+            print("Usage: zot attach <item-key> <file-path> [archive-filename]")
+            print("  Upload a local file as a Zotero attachment via WebDAV.")
+            print("  Content type is inferred from file extension (default: application/octet-stream).")
+        else:
+            ext_map = {
+                ".html": "text/html", ".htm": "text/html",
+                ".pdf": "application/pdf",
+                ".epub": "application/epub+zip",
+                ".zip": "application/zip",
+                ".doc": "application/msword",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            }
+            _, ext = os.path.splitext(file_path)
+            content_type = ext_map.get(ext.lower(), "application/octet-stream")
+            save_file_attachment(file_path, item_key, content_type, archive_filename=archive_filename)
 
     elif cmd == "archive":
         # 解析格式：zot archive [--no-offline] <url> [title-hint] [#tag1] [#tag2] ...
