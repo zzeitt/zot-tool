@@ -2022,7 +2022,8 @@ Commands:
   add <type> <title> <url> <coll> [extra]   Add item with /unread tag
   archive <url> [title-hint] [#tag1]...  Smart archive with auto collection/tag (+ optional tag hints)
   archive --no-offline <url>    Archive without saving offline copy
-  addnote <item-key> [content]   Add LLM-generated note to existing item
+  addnote <item-key> [content]   Add LLM-summarized note to existing item
+  setnote <item-key> [content]   Set raw note content directly (no LLM)
   attach <item-key> <file> [name] Upload local file as attachment via WebDAV
   delete <item-key>              Delete an item from library
   cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
@@ -2038,6 +2039,7 @@ Examples:
   zot add podcast "My Podcast" "https://..." LKRM6B4Y
   zot archive "https://podcasts.apple.com/..."
   zot attach KC5ETPXM /tmp/article.html article.html
+  zot setnote KC5ETPXM "<p>raw html note</p>"
   zot delete KC5ETPXM
   zot cleanup-empty-collections
 
@@ -2130,6 +2132,31 @@ if __name__ == "__main__":
                         'note': note_html
                     }])
                     print(f"✅ Added note to item {item_key}")
+                except Exception as e:
+                    print(f"❌ Failed: {e}")
+
+    elif cmd == "setnote":
+        # zot setnote <item-key> [note-content]
+        # Directly set note content WITHOUT LLM summarization.
+        # Reads note from stdin if no content arg given.
+        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        note_content = sys.argv[3] if len(sys.argv) > 3 else None
+        if not item_key:
+            print("Usage: zot setnote <item-key> [note-content]")
+            print("       echo '<p>HTML</p>' | zot setnote <item-key>  (pipe mode)")
+        else:
+            if note_content is None:
+                note_content = sys.stdin.read()
+            if not note_content.strip():
+                print("Error: no note content")
+            else:
+                try:
+                    zot.create_items([{
+                        'itemType': 'note',
+                        'parentItem': item_key,
+                        'note': note_content.strip()
+                    }])
+                    print(f"✅ Set note on item {item_key}")
                 except Exception as e:
                     print(f"❌ Failed: {e}")
 
