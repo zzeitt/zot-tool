@@ -1324,6 +1324,146 @@ def save_file_attachment(file_path, parent_item_key, content_type, archive_filen
     return attach_key
 
 
+# ---------------------------------------------------------------------------
+# v1.9.0 — Attachment management: list / detach / reattach
+# ---------------------------------------------------------------------------
+
+def list_attachments(parent_key):
+    """列出父条目下所有 attachment children"""
+    try:
+        parent = zot.item(parent_key)
+        parent_data = parent[0] if isinstance(parent, list) else parent
+        parent_data = parent_data.get('data', parent_data)
+    except Exception as e:
+        print(f"❌ Failed to fetch item {parent_key}: {e}")
+        return
+
+    parent_title = parent_data.get('title', 'Unknown')[:60]
+
+    try:
+        children = zot.children(parent_key)
+    except Exception as e:
+        print(f"❌ Failed to fetch children: {e}")
+        return
+
+    attachments = [c for c in children
+                   if c.get('data', {}).get('itemType') == 'attachment']
+
+    if not attachments:
+        print(f"\n📎 No attachments for: {parent_title} ({parent_key})")
+        return
+
+    print(f"\n📎 Attachments for: {parent_title} ({parent_key})\n")
+    for i, att in enumerate(attachments, 1):
+        data = att.get('data', {})
+        title = data.get('title', 'Untitled')
+        content_type = data.get('contentType', 'unknown')
+        key = att.get('key', '?')
+        link_mode = data.get('linkMode', '?')
+        filename = data.get('filename', '')
+        fname_str = f" | 📄 {filename}" if filename else ""
+        print(f"{i}. {title}")
+        print(f"   🔑 {key} | {content_type} | linkMode={link_mode}{fname_str}\n")
+
+
+def detach_attachment(attach_key):
+    """删除指定 attachment child，并清理 WebDAV 上的文件"""
+    try:
+        items = zot.item(attach_key)
+        item = items[0] if isinstance(items, list) else items
+        data = item.get('data', {})
+        if data.get('itemType') != 'attachment':
+            print(f"⚠️  {attach_key} is not an attachment (type: {data.get('itemType')})")
+            print(f"    Use 'zot delete {attach_key}' to delete it instead.")
+            return
+
+        title = data.get('title', 'unknown')
+        zot.delete_item(item)
+        print(f"✅ Detached: {title} ({attach_key})")
+
+        # Clean up WebDAV (.zip + .prop)
+        webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
+        webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
+        webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
+        if all([webdav_url, webdav_user, webdav_pass]):
+            cleaned = 0
+            for ext in ['.zip', '.prop']:
+                try:
+                    subprocess.run(
+                        ["curl", "-s", "-X", "DELETE", "-u",
+                         f"{webdav_user}:{webdav_pass}",
+                         f"{webdav_url}{attach_key}{ext}"],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    cleaned += 1
+                except Exception:
+                    pass
+            if cleaned:
+                print(f"☁️  WebDAV files cleaned ({attach_key}.zip, .prop)")
+    except Exception as e:
+        print(f"❌ Failed: {e}")
+
+
+def reattach_attachment(attach_key, file_path, archive_filename=None):
+    """替换指定 attachment：删旧 → 挂新（保留 parent 关联）"""
+    if not os.path.exists(file_path):
+        print(f"❌ File not found: {file_path}")
+        return
+
+    # 1. 拿旧 attachment 的 parent key
+    try:
+        items = zot.item(attach_key)
+        item = items[0] if isinstance(items, list) else items
+        data = item.get('data', {})
+        if data.get('itemType') != 'attachment':
+            print(f"⚠️  {attach_key} is not an attachment (type: {data.get('itemType')})")
+            return
+
+        parent_key = data.get('parentItem')
+        old_title = data.get('title', 'unknown')
+
+        if not parent_key:
+            print(f"❌ Cannot find parent item for attachment {attach_key}")
+            return
+
+        # 2. 删旧 attachment
+        zot.delete_item(item)
+        print(f"🗑️  Removed old: {old_title} ({attach_key})")
+    except Exception as e:
+        print(f"❌ Failed to delete old attachment: {e}")
+        return
+
+    # 3. WebDAV 清理旧文件
+    webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
+    webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
+    webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
+    if all([webdav_url, webdav_user, webdav_pass]):
+        for ext in ['.zip', '.prop']:
+            try:
+                subprocess.run(
+                    ["curl", "-s", "-X", "DELETE", "-u",
+                     f"{webdav_user}:{webdav_pass}",
+                     f"{webdav_url}{attach_key}{ext}"],
+                    capture_output=True, text=True, timeout=30
+                )
+            except Exception:
+                pass
+
+    # 4. 挂新文件（复用 save_file_attachment）
+    ext_map = {
+        ".html": "text/html", ".htm": "text/html",
+        ".pdf": "application/pdf",
+        ".epub": "application/epub+zip",
+        ".zip": "application/zip",
+        ".doc": "application/msword",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    _, ext = os.path.splitext(file_path)
+    content_type = ext_map.get(ext.lower(), "application/octet-stream")
+    save_file_attachment(file_path, parent_key, content_type,
+                         archive_filename=archive_filename)
+
+
 def _download_binary(url, dest_path):
     """下载二进制文件（PDF/EPUB 等），跟随重定向直到最终文件"""
     print(f"⬇️  Downloading: {url}")
@@ -2025,6 +2165,9 @@ Commands:
   addnote <item-key> [content]   Add LLM-summarized note to existing item
   setnote <item-key> [content]   Set raw note content directly (no LLM)
   attach <item-key> <file> [name] Upload local file as attachment via WebDAV
+  attachments <item-key>         List all attachment children of an item
+  detach <attachment-key>        Delete a specific attachment (not parent item)
+  reattach <att-key> <file> [name] Replace an attachment with a new file
   delete <item-key>              Delete an item from library
   cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
   help                           Show this help
@@ -2039,6 +2182,9 @@ Examples:
   zot add podcast "My Podcast" "https://..." LKRM6B4Y
   zot archive "https://podcasts.apple.com/..."
   zot attach KC5ETPXM /tmp/article.html article.html
+  zot attachments KC5ETPXM
+  zot detach A1B2C3D4
+  zot reattach A1B2C3D4 /tmp/updated.pdf updated.pdf
   zot setnote KC5ETPXM "<p>raw html note</p>"
   zot delete KC5ETPXM
   zot cleanup-empty-collections
@@ -2181,6 +2327,38 @@ if __name__ == "__main__":
             _, ext = os.path.splitext(file_path)
             content_type = ext_map.get(ext.lower(), "application/octet-stream")
             save_file_attachment(file_path, item_key, content_type, archive_filename=archive_filename)
+
+    elif cmd == "attachments":
+        # zot attachments <parent-item-key>
+        parent_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not parent_key:
+            print("Usage: zot attachments <parent-item-key>")
+            print("  List all attachment children of an item.")
+        else:
+            list_attachments(parent_key)
+
+    elif cmd == "detach":
+        # zot detach <attachment-key>
+        attach_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not attach_key:
+            print("Usage: zot detach <attachment-key>")
+            print("  Delete a specific attachment child (not the parent item).")
+            print("  Find attachment keys with: zot attachments <parent-key>")
+        else:
+            detach_attachment(attach_key)
+
+    elif cmd == "reattach":
+        # zot reattach <attachment-key> <file-path> [archive-filename]
+        attach_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        file_path = sys.argv[3] if len(sys.argv) > 3 else ""
+        archive_filename = sys.argv[4] if len(sys.argv) > 4 else None
+        if not attach_key or not file_path:
+            print("Usage: zot reattach <attachment-key> <file-path> [archive-filename]")
+            print("  Replace an existing attachment with a new file.")
+            print("  Equivalent to: zot detach <key> && zot attach <parent> <file>")
+            print("  Find attachment keys with: zot attachments <parent-key>")
+        else:
+            reattach_attachment(attach_key, file_path, archive_filename=archive_filename)
 
     elif cmd == "archive":
         # 解析格式：zot archive [--no-offline] <url> [title-hint] [#tag1] [#tag2] ...

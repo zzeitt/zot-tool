@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.8.5
+version: 1.9.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -36,9 +36,20 @@ zot add <type> "<title>" <url> <coll> [extra]   # 添加新条目（自动带上
 zot archive <url> ["title-hint"] [#tag1] [#tag2]   # 智能归档（自动识别 HTML/二进制文件）
 zot archive --no-offline <url> ["title-hint] [#tag1]  # 归档但不保存离线副本
 zot addnote <item-key> [content]                # 添加 LLM 生成摘要的 Note
+zot setnote <item-key> [content]                # 设置原始 Note 内容（不经过 LLM）
 zot delete <item-key>                           # 删除条目
 zot cleanup-empty-collections                   # 删除所有空的子 collection (v1.8.0)
 ```
+
+### 附件管理 (v1.9.0)
+```bash
+zot attach <item-key> <file> [name]             # 添加附件（上传到 WebDAV）
+zot attachments <item-key>                       # 列出某条目下所有附件
+zot detach <attachment-key>                      # 删除指定附件 child（不删父条目）
+zot reattach <att-key> <file> [name]             # 替换指定附件（删旧 + 挂新）
+```
+
+**工作流**：先用 `zot attachments <parent-key>` 查看附件列表获取 child key，再选择性 `detach` 删除或 `reattach` 替换。
 
 ## 归档工作流
 
@@ -220,6 +231,15 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v1.9.0 — 附件管理命令
+
+新增三个附件管理子命令，支持细粒度控制（不再 "一刀切删除全部附件"）：
+- `zot attachments <parent-key>` — 列出父条目下所有 attachment children（key + 标题 + MIME + linkMode）
+- `zot detach <attachment-key>` — 删除指定 attachment child，自动清理 WebDAV 上的 .zip/.prop
+- `zot reattach <att-key> <file> [name]` — 替换指定附件：删旧 attachment → 清理 WebDAV → 挂新文件
+
+工作流：先用 `attachments` 查看 → 选择性 `detach` 删除或用 `reattach` 替换。
 
 ### v1.8.3 — Note 生成质量修复
 
