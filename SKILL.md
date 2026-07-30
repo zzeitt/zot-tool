@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.8.4
+version: 1.9.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -36,6 +36,7 @@ zot add <type> "<title>" <url> <coll> [extra]   # 添加新条目（自动带上
 zot archive <url> ["title-hint"] [#tag1] [#tag2]   # 智能归档（自动识别 HTML/二进制文件）
 zot archive --no-offline <url> ["title-hint] [#tag1]  # 归档但不保存离线副本
 zot addnote <item-key> [content]                # 添加 LLM 生成摘要的 Note
+zot move <item-key> <collection>                # 移动条目到指定 collection（v1.9.0）
 zot delete <item-key>                           # 删除条目
 zot cleanup-empty-collections                   # 删除所有空的子 collection (v1.8.0)
 ```
@@ -220,6 +221,28 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v1.9.0 — 新增 `move` 命令（条目 collection 迁移）
+
+**问题**：现有命令只能创建条目时指定 collection，或批量清理空 collection，没有**单条条目跨 collection 移动**的能力。手工调整需要 zotero.org 网页端多次点击，或 pyzotero 脚本拼装 `addto_collection` + `deletefrom_collection`。
+
+**新增**：`zot move <item-key> <collection-name-or-key>`
+
+**语义**：
+- 解析 target：先按 exact key，再按 exact name，最后按 contains match（多个匹配会报错让用户细化）
+- 把 item 加入 target collection（如果尚未存在）
+- 从 item 当前所有 **非 target、非 🙊Personal** 的 collection 中移除
+- 🙊Personal collection（FORBIDDEN_COLLECTION）**永不被 move 命令自动触碰**
+- 边界保护：操作后 item 若没有任何 collection（理论上不该发生），自动回加到 target
+
+**示例**：
+```bash
+zot move KC5ETPXM "Math-Algebra"        # 按名字
+zot move KC5ETPXM LKRM6B4Y               # 按 key
+zot move KC5ETPXM "Math"                  # contains 匹配到唯一同名 coll
+```
+
+**不改变**：原有 `add` / `archive` / `addnote` / `delete` / `attach` 行为。
 
 ### v1.8.3 — Note 生成质量修复
 

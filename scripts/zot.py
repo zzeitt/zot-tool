@@ -580,6 +580,125 @@ def add_item(item_type, title, url, coll_key, extra_json=None):
         return None
 
 
+def resolve_collection(name_or_key):
+    """Resolve a collection name or key to (key, name).
+
+    Lookup order:
+      1. Exact key match
+      2. Exact name match (case-insensitive)
+      3. Single contains match (case-insensitive)
+
+    Returns None if not found or ambiguous (>1 contains match).
+    """
+    colls = zot.collections()
+    by_key = {c['key']: c['data'].get('name', '?') for c in colls}
+    # 1) Exact key
+    if name_or_key in by_key:
+        return name_or_key, by_key[name_or_key]
+    # 2) Exact name (case-insensitive)
+    for c in colls:
+        if c['data'].get('name', '').lower() == name_or_key.lower():
+            return c['key'], c['data']['name']
+    # 3) Contains match (case-insensitive)
+    needle = name_or_key.lower()
+    matches = [(c['key'], c['data'].get('name', '?'))
+               for c in colls
+               if needle in c['data'].get('name', '').lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"❌ Multiple collections match '{name_or_key}':")
+        for k, n in matches:
+            print(f"   {k}  {n}")
+        print(f"💡 Please refine the name or pass the collection key directly.")
+        return None
+    return None
+
+
+def move_item(item_key, target):
+    """Move an item to a target collection.
+
+    Behavior:
+      - Resolves target as collection key or name (exact / contains match).
+      - Adds the item to the target collection if not already there.
+      - Removes the item from all OTHER (non-forbidden, non-target) collections.
+      - Skips 🙊Personal collection (FORBIDDEN_COLLECTION) on removal — never
+        auto-touches it via this command.
+      - If item has no collection after move (edge case), re-adds to target.
+
+    Returns the item key on success, None on failure.
+    """
+    # 1. Resolve target
+    resolved = resolve_collection(target)
+    if not resolved:
+        print(f"❌ Collection '{target}' not found. Run `zot collections` to list.")
+        return None
+    target_key, target_name = resolved
+    print(f"🎯 Target: {target_name} ({target_key})")
+
+    # 2. Fetch item
+    try:
+        result = zot.item(item_key)
+    except Exception as e:
+        print(f"❌ Failed to fetch item {item_key}: {e}")
+        return None
+    fetched = result[0] if isinstance(result, list) else result
+    if not fetched:
+        print(f"❌ Item {item_key} not found")
+        return None
+    data = fetched['data']
+    item_title = (data.get('title') or '(no title)')[:60]
+    item_type = data.get('itemType', '?')
+    old_colls = data.get('collections', []) or []
+    print(f"📄 Item: [{item_type}] {item_title} ({item_key})")
+    print(f"   Currently in {len(old_colls)} collection(s)")
+
+    # 3. Determine operations
+    need_addto = target_key not in old_colls
+    to_remove = [c for c in old_colls if c != target_key]
+
+    if not need_addto and not to_remove:
+        print(f"✅ Item is already only in target collection, no change needed")
+        return item_key
+
+    # 4. Addto target (if needed)
+    if need_addto:
+        try:
+            zot.addto_collection(target_key, fetched)
+            print(f"✅ Added to {target_name}")
+        except Exception as e:
+            print(f"❌ Failed to add to target: {e}")
+            return None
+
+    # 5. Deletefrom others (skip forbidden + skip target)
+    for coll_key in to_remove:
+        if coll_key == FORBIDDEN_COLLECTION:
+            print(f"⏭️  Skipping forbidden collection {coll_key}")
+            continue
+        try:
+            # Re-fetch in case version bumped after addto
+            cur_result = zot.item(item_key)
+            cur = cur_result[0] if isinstance(cur_result, list) else cur_result
+            zot.deletefrom_collection(coll_key, cur)
+            print(f"✅ Removed from {coll_key}")
+        except Exception as e:
+            print(f"⚠️  Failed to remove from {coll_key}: {e}")
+
+    # 6. Sanity: ensure item has at least one collection
+    try:
+        final_result = zot.item(item_key)
+        final = final_result[0] if isinstance(final_result, list) else final_result
+        final_colls = (final.get('data') or {}).get('collections', []) or []
+        if not final_colls:
+            print(f"⚠️  Item had no collection after move — re-adding to target")
+            zot.addto_collection(target_key, final)
+    except Exception:
+        pass
+
+    print(f"✅ Moved {item_key} → {target_name}")
+    return item_key
+
+
 # ========== 归档工作流 ==========
 
 def fetch_url_metadata(url):
@@ -2024,6 +2143,7 @@ Commands:
   archive --no-offline <url>    Archive without saving offline copy
   addnote <item-key> [content]   Add LLM-generated note to existing item
   attach <item-key> <file> [name] Upload local file as attachment via WebDAV
+  move <item-key> <collection>   Move item to target collection (by key or name)
   delete <item-key>              Delete an item from library
   cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
   help                           Show this help
@@ -2038,6 +2158,7 @@ Examples:
   zot add podcast "My Podcast" "https://..." LKRM6B4Y
   zot archive "https://podcasts.apple.com/..."
   zot attach KC5ETPXM /tmp/article.html article.html
+  zot move KC5ETPXM "Math-Algebra"
   zot delete KC5ETPXM
   zot cleanup-empty-collections
 
@@ -2198,6 +2319,15 @@ if __name__ == "__main__":
                 print(f"✅ Deleted item: {item_key}")
             except Exception as e:
                 print(f"❌ Failed: {e}")
+
+    elif cmd == "move":
+        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        target = sys.argv[3] if len(sys.argv) > 3 else ""
+        if not item_key or not target:
+            print("Usage: zot move <item-key> <collection-name-or-key>")
+            print("Example: zot move KC5ETPXM 'Math-Algebra'")
+        else:
+            move_item(item_key, target)
 
     elif cmd == "cleanup-empty-collections":
         # v1.8.0: 扫描所有子 collection（跳过根/Personal/Misc），
