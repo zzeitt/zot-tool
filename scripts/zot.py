@@ -1325,11 +1325,11 @@ def save_file_attachment(file_path, parent_item_key, content_type, archive_filen
 
 
 # ---------------------------------------------------------------------------
-# v1.9.0 — Attachment management: list / detach / reattach
+# v1.9.0 — Child management: list / detach / reattach
 # ---------------------------------------------------------------------------
 
 def list_attachments(parent_key):
-    """列出父条目下所有 attachment children"""
+    """列出父条目下所有子条目（attachment + note）"""
     try:
         parent = zot.item(parent_key)
         parent_data = parent[0] if isinstance(parent, list) else parent
@@ -1346,60 +1346,78 @@ def list_attachments(parent_key):
         print(f"❌ Failed to fetch children: {e}")
         return
 
-    attachments = [c for c in children
-                   if c.get('data', {}).get('itemType') == 'attachment']
-
-    if not attachments:
-        print(f"\n📎 No attachments for: {parent_title} ({parent_key})")
+    if not children:
+        print(f"\n📎 No children for: {parent_title} ({parent_key})")
         return
 
-    print(f"\n📎 Attachments for: {parent_title} ({parent_key})\n")
-    for i, att in enumerate(attachments, 1):
-        data = att.get('data', {})
+    print(f"\n📎 Children of: {parent_title} ({parent_key})\n")
+    for i, child in enumerate(children, 1):
+        data = child.get('data', {})
+        item_type = data.get('itemType', '?')
         title = data.get('title', 'Untitled')
-        content_type = data.get('contentType', 'unknown')
-        key = att.get('key', '?')
-        link_mode = data.get('linkMode', '?')
-        filename = data.get('filename', '')
-        fname_str = f" | 📄 {filename}" if filename else ""
-        print(f"{i}. {title}")
-        print(f"   🔑 {key} | {content_type} | linkMode={link_mode}{fname_str}\n")
+        key = child.get('key', '?')
+
+        # Type badge
+        if item_type == 'attachment':
+            badge = '📄'
+            content_type = data.get('contentType', '?')
+            link_mode = data.get('linkMode', '?')
+            filename = data.get('filename', '')
+            fname_str = f" | {filename}" if filename else ""
+            detail = f"{content_type} | linkMode={link_mode}{fname_str}"
+        elif item_type == 'note':
+            badge = '📝'
+            # Show first ~80 chars of note content as preview
+            note_text = data.get('note', '')
+            # Strip HTML tags for preview
+            import re as _re
+            preview = _re.sub(r'<[^>]+>', '', note_text).strip()[:80]
+            detail = f"\"{preview}...\"" if len(preview) >= 80 else f"\"{preview}\""
+        else:
+            badge = '❓'
+            detail = item_type
+
+        print(f"{i}. {badge} {title}")
+        print(f"   🔑 {key} | {detail}\n")
 
 
-def detach_attachment(attach_key):
-    """删除指定 attachment child，并清理 WebDAV 上的文件"""
+def detach_attachment(child_key):
+    """删除指定子条目（attachment 或 note），attachment 会自动清理 WebDAV"""
     try:
-        items = zot.item(attach_key)
+        items = zot.item(child_key)
         item = items[0] if isinstance(items, list) else items
         data = item.get('data', {})
-        if data.get('itemType') != 'attachment':
-            print(f"⚠️  {attach_key} is not an attachment (type: {data.get('itemType')})")
-            print(f"    Use 'zot delete {attach_key}' to delete it instead.")
+        item_type = data.get('itemType', '?')
+        title = data.get('title', 'unknown')
+        parent_key = data.get('parentItem', '')
+
+        if not parent_key:
+            print(f"⚠️  {child_key} has no parent — use 'zot delete {child_key}' instead.")
             return
 
-        title = data.get('title', 'unknown')
         zot.delete_item(item)
-        print(f"✅ Detached: {title} ({attach_key})")
+        print(f"✅ Detached: {title} ({child_key}) [type={item_type}]")
 
-        # Clean up WebDAV (.zip + .prop)
-        webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
-        webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
-        webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
-        if all([webdav_url, webdav_user, webdav_pass]):
-            cleaned = 0
-            for ext in ['.zip', '.prop']:
-                try:
-                    subprocess.run(
-                        ["curl", "-s", "-X", "DELETE", "-u",
-                         f"{webdav_user}:{webdav_pass}",
-                         f"{webdav_url}{attach_key}{ext}"],
-                        capture_output=True, text=True, timeout=30
-                    )
-                    cleaned += 1
-                except Exception:
-                    pass
-            if cleaned:
-                print(f"☁️  WebDAV files cleaned ({attach_key}.zip, .prop)")
+        # Clean up WebDAV for attachment children
+        if item_type == 'attachment':
+            webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
+            webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
+            webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
+            if all([webdav_url, webdav_user, webdav_pass]):
+                cleaned = 0
+                for ext in ['.zip', '.prop']:
+                    try:
+                        subprocess.run(
+                            ["curl", "-s", "-X", "DELETE", "-u",
+                             f"{webdav_user}:{webdav_pass}",
+                             f"{webdav_url}{child_key}{ext}"],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        cleaned += 1
+                    except Exception:
+                        pass
+                if cleaned:
+                    print(f"☁️  WebDAV files cleaned ({child_key}.zip, .prop)")
     except Exception as e:
         print(f"❌ Failed: {e}")
 
@@ -2165,8 +2183,8 @@ Commands:
   addnote <item-key> [content]   Add LLM-summarized note to existing item
   setnote <item-key> [content]   Set raw note content directly (no LLM)
   attach <item-key> <file> [name] Upload local file as attachment via WebDAV
-  attachments <item-key>         List all attachment children of an item
-  detach <attachment-key>        Delete a specific attachment (not parent item)
+  attachments <item-key>         List all children (attachments + notes)
+  detach <child-key>             Delete a specific child (attachment or note)
   reattach <att-key> <file> [name] Replace an attachment with a new file
   delete <item-key>              Delete an item from library
   cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
@@ -2338,14 +2356,14 @@ if __name__ == "__main__":
             list_attachments(parent_key)
 
     elif cmd == "detach":
-        # zot detach <attachment-key>
-        attach_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not attach_key:
-            print("Usage: zot detach <attachment-key>")
-            print("  Delete a specific attachment child (not the parent item).")
-            print("  Find attachment keys with: zot attachments <parent-key>")
+        # zot detach <child-key>
+        child_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not child_key:
+            print("Usage: zot detach <child-key>")
+            print("  Delete a specific child item — attachment or note (not the parent).")
+            print("  Find child keys with: zot attachments <parent-key>")
         else:
-            detach_attachment(attach_key)
+            detach_attachment(child_key)
 
     elif cmd == "reattach":
         # zot reattach <attachment-key> <file-path> [archive-filename]

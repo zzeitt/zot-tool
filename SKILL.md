@@ -44,12 +44,12 @@ zot cleanup-empty-collections                   # 删除所有空的子 collecti
 ### 附件管理 (v1.9.0)
 ```bash
 zot attach <item-key> <file> [name]             # 添加附件（上传到 WebDAV）
-zot attachments <item-key>                       # 列出某条目下所有附件
-zot detach <attachment-key>                      # 删除指定附件 child（不删父条目）
+zot attachments <item-key>                       # 列出所有子条目（attachment + note）
+zot detach <child-key>                           # 删除指定子条目（attachment 或 note）
 zot reattach <att-key> <file> [name]             # 替换指定附件（删旧 + 挂新）
 ```
 
-**工作流**：先用 `zot attachments <parent-key>` 查看附件列表获取 child key，再选择性 `detach` 删除或 `reattach` 替换。
+**工作流**：先用 `zot attachments <parent-key>` 查看所有子条目（含 note），再选择性 `detach` 删除或 `reattach` 替换附件。note 清理现在也可以通过 `attachments` 查看 → `detach <note-key>` 完成。
 
 ## 归档工作流
 
@@ -232,14 +232,15 @@ alias zot="python3 scripts/zot.py"
 
 ## 版本历史
 
-### v1.9.0 — 附件管理命令
+### v1.9.0 — 附件与 Note 子条目管理
 
-新增三个附件管理子命令，支持细粒度控制（不再 "一刀切删除全部附件"）：
-- `zot attachments <parent-key>` — 列出父条目下所有 attachment children（key + 标题 + MIME + linkMode）
-- `zot detach <attachment-key>` — 删除指定 attachment child，自动清理 WebDAV 上的 .zip/.prop
+新增三个子条目管理命令，支持细粒度控制（不再 "一刀切删除全部附件"）：
+- `zot attachments <parent-key>` — 列出父条目下**所有子条目**（attachment + note），含类型标记、note 内容预览
+- `zot detach <child-key>` — 删除指定子条目（attachment 或 note 均可），attachment 自动清理 WebDAV
 - `zot reattach <att-key> <file> [name]` — 替换指定附件：删旧 attachment → 清理 WebDAV → 挂新文件
 
-工作流：先用 `attachments` 查看 → 选择性 `detach` 删除或用 `reattach` 替换。
+工作流：先用 `attachments` 查看所有子条目 → 选择性 `detach` 删除（含 note）或用 `reattach` 替换附件。
+解决了旧 note 无法清理导致重复累积的问题。
 
 ### v1.8.3 — Note 生成质量修复
 
