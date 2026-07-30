@@ -1482,6 +1482,117 @@ def reattach_attachment(attach_key, file_path, archive_filename=None):
                          archive_filename=archive_filename)
 
 
+# ---------------------------------------------------------------------------
+# v1.10.0 — Tag management: tags list / tag add / tag remove / tag set
+# ---------------------------------------------------------------------------
+
+def tags_list(item_key):
+    """列出某条目的所有 tags"""
+    try:
+        items = zot.item(item_key)
+        item = items[0] if isinstance(items, list) else items
+    except Exception as e:
+        print(f"❌ Failed to fetch item {item_key}: {e}")
+        return
+
+    data = item.get('data', {})
+    title = data.get('title', 'Unknown')[:60]
+    tags = data.get('tags', [])
+
+    if not tags:
+        print(f"\n🏷️  No tags on: {title} ({item_key})")
+        return
+
+    print(f"\n🏷️  Tags on: {title} ({item_key})\n")
+    for i, t in enumerate(tags, 1):
+        tag_name = t.get('tag', '?')
+        tag_type = t.get('type', 1)
+        type_str = "(auto)" if tag_type == 1 else ""
+        print(f"  {i}. {tag_name} {type_str}")
+
+
+def _tags_update(item_key, tags, mode):
+    """内部：更新 item 的 tags
+
+    Args:
+        item_key: 条目 key
+        tags: 新 tag 名列表 (如 ['/unread', '#AI-ML🤖'])
+        mode: 'add' | 'remove' | 'set'
+    """
+    try:
+        items = zot.item(item_key)
+        item = items[0] if isinstance(items, list) else items
+    except Exception as e:
+        print(f"❌ Failed to fetch item {item_key}: {e}")
+        return
+
+    data = item.get('data', {})
+    existing = data.get('tags', [])
+
+    if mode == 'set':
+        new_tags = [{'tag': t, 'type': 1} for t in tags]
+    elif mode == 'add':
+        existing_names = {t.get('tag', '') for t in existing}
+        new_tags = list(existing)
+        added = 0
+        for t in tags:
+            if t not in existing_names:
+                new_tags.append({'tag': t, 'type': 1})
+                existing_names.add(t)
+                added += 1
+        if added == 0:
+            print(f"⚠️  All tags already present — nothing to add.")
+            return
+    elif mode == 'remove':
+        remove_set = set(tags)
+        new_tags = [t for t in existing if t.get('tag', '') not in remove_set]
+        removed = len(existing) - len(new_tags)
+        if removed == 0:
+            print(f"⚠️  None of the specified tags found — nothing to remove.")
+            return
+    else:
+        print(f"❌ Unknown mode: {mode}")
+        return
+
+    item['data']['tags'] = new_tags
+    try:
+        zot.update_item(item)
+    except Exception as e:
+        print(f"❌ Update failed: {e}")
+        return
+
+    title = data.get('title', 'Unknown')[:50]
+    tag_names = [t['tag'] for t in new_tags]
+
+    if mode == 'set':
+        print(f"✅ Tags set on '{title}': {', '.join(tag_names) if tag_names else '(none)'}")
+    elif mode == 'add':
+        print(f"✅ Tags added to '{title}': {', '.join(tags)}")
+    elif mode == 'remove':
+        print(f"✅ Tags removed from '{title}': {', '.join(tags)}")
+
+
+def tags_add(item_key, *tag_names):
+    """添加 tag(s) 到条目（幂等，不重复添加）"""
+    if not tag_names:
+        print("Usage: zot tag add <item-key> <tag1> [tag2] ...")
+        return
+    _tags_update(item_key, list(tag_names), 'add')
+
+
+def tags_remove(item_key, *tag_names):
+    """从条目移除指定 tag(s)"""
+    if not tag_names:
+        print("Usage: zot tag remove <item-key> <tag1> [tag2] ...")
+        return
+    _tags_update(item_key, list(tag_names), 'remove')
+
+
+def tags_set(item_key, *tag_names):
+    """替换条目的全部 tags（允许清空——不传 tag 则设为空列表）"""
+    _tags_update(item_key, list(tag_names), 'set')
+
+
 def _download_binary(url, dest_path):
     """下载二进制文件（PDF/EPUB 等），跟随重定向直到最终文件"""
     print(f"⬇️  Downloading: {url}")
@@ -2173,6 +2284,10 @@ def show_help():
 Commands:
   search <query> [limit]         Search items by title/content
   tag <tag> [limit]              Search items by tag
+  tag add <key> <tag>...          Add tag(s) to an item (v1.10.0)
+  tag remove <key> <tag>...       Remove tag(s) from an item (v1.10.0)
+  tag set <key> <tag>...          Replace all tags on an item (v1.10.0)
+  tags <key>                      List all tags on an item (v1.10.0)
   coll <collection> [limit]       Search items by collection name
   emacs [limit]                  Search emacs-related items
   list [limit]                   List recent items
@@ -2193,6 +2308,10 @@ Commands:
 Examples:
   zot search "machine learning" 10
   zot tag "important" 5
+  zot tags KC5ETPXM
+  zot tag add KC5ETPXM "#AI-ML🤖" "#工具🛠️"
+  zot tag remove KC5ETPXM "/unread"
+  zot tag set KC5ETPXM "/unread" "#新标签🤖"
   zot coll "Cheat" 20
   zot emacs 20
   zot list 15
@@ -2229,13 +2348,39 @@ if __name__ == "__main__":
             search(query, limit)
     
     elif cmd == "tag":
-        tag = sys.argv[2] if len(sys.argv) > 2 else ""
-        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-        if not tag:
-            print("Usage: zot tag <tag> [limit]")
+        # zot tag add/remove/set <item-key> <tag>...   (v1.10.0 tag management)
+        # zot tag <query> [limit]                       (backward-compat search)
+        sub = sys.argv[2] if len(sys.argv) > 2 else ""
+        if sub in ("add", "remove", "set"):
+            item_key = sys.argv[3] if len(sys.argv) > 3 else ""
+            tag_args = sys.argv[4:]
+            if not item_key:
+                print(f"Usage: zot tag {sub} <item-key> <tag1> [tag2] ...")
+            elif sub == "add":
+                tags_add(item_key, *tag_args)
+            elif sub == "remove":
+                tags_remove(item_key, *tag_args)
+            elif sub == "set":
+                tags_set(item_key, *tag_args)
         else:
-            search_by_tag(tag, limit)
-    
+            # Backward-compatible: zot tag <query> [limit]
+            query = sub
+            limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+            if not query:
+                print("Usage: zot tag <tag> [limit]")
+                print("       zot tag add/remove/set <item-key> <tag1> [tag2] ...")
+            else:
+                search_by_tag(query, limit)
+
+    elif cmd == "tags":
+        # zot tags <item-key>
+        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not item_key:
+            print("Usage: zot tags <item-key>")
+            print("  List all tags on an item.")
+        else:
+            tags_list(item_key)
+
     elif cmd == "coll" or cmd == "collection":
         coll = sys.argv[2] if len(sys.argv) > 2 else ""
         limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10

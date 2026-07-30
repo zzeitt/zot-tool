@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.9.0
+version: 1.10.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -50,6 +50,16 @@ zot reattach <att-key> <file> [name]             # 替换指定附件（删旧 +
 ```
 
 **工作流**：先用 `zot attachments <parent-key>` 查看所有子条目（含 note），再选择性 `detach` 删除或 `reattach` 替换附件。note 清理现在也可以通过 `attachments` 查看 → `detach <note-key>` 完成。
+
+### Tag 管理 (v1.10.0)
+```bash
+zot tags <item-key>                              # 列出某条目的所有 tags
+zot tag add <item-key> <tag1> [tag2] ...         # 添加 tag(s)（幂等，不重复添加）
+zot tag remove <item-key> <tag1> [tag2] ...      # 移除指定 tag(s)
+zot tag set <item-key> <tag1> [tag2] ...         # 替换全部 tags（不传 tag 则清空）
+```
+
+**与旧搜索命令的兼容**：`zot tag <query> [limit]`（第一个参数不是 add/remove/set 时）仍触发按 tag 搜索。
 
 ## 归档工作流
 
@@ -231,6 +241,17 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v1.10.0 — Tag 增删改查
+
+新增四个 tag 管理命令，补全 tag CRUD：
+- `zot tags <key>` — 列出条目的所有 tags
+- `zot tag add <key> <tag>...` — 添加 tag(s)，幂等不重复
+- `zot tag remove <key> <tag>...` — 移除指定 tag(s)
+- `zot tag set <key> <tag>...` — 替换全部 tags（不传 tag 则清空）
+
+内部实现：`_tags_update()` 统一处理 add/remove/set 三种模式，通过 `zot.update_item()` 写入。
+向后兼容：`zot tag <query>` 仍然触发按 tag 搜索。
 
 ### v1.9.0 — 附件与 Note 子条目管理
 
