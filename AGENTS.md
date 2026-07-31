@@ -128,13 +128,19 @@ Considerations
 ```bash
 # Unix / Git Bash
 cp scripts/pre-commit .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
+cp scripts/commit-msg  .git/hooks/commit-msg
+chmod +x .git/hooks/pre-commit .git/hooks/commit-msg
 ```
 
 ```powershell
 # PowerShell
 Copy-Item scripts\pre-commit .git\hooks\pre-commit
+Copy-Item scripts\commit-msg  .git\hooks\commit-msg
 ```
+
+### pre-commit
+
+扫描 staged diff，拦截以下涉密内容：
 
 hook 会检查提交内容中是否包含：
 - API key（`ZOTERO_API_KEY` 赋值）
@@ -143,3 +149,20 @@ hook 会检查提交内容中是否包含：
 - WebDAV 用户名 / 密码赋值
 
 被拦截时输出具体问题行，拒绝提交。紧急绕过：`git commit --no-verify`。
+
+### commit-msg
+
+验证 commit message 格式符合 [Conventional Commits](#commit-message-format)：
+
+| 检查项 | 规则 |
+|--------|------|
+| 格式 | `type(scope): subject` |
+| type | 必须在 `feat/fix/refactor/docs/chore/test/style/perf/ci/build/revert` 中 |
+| scope | 必须在 `zot/skill/hook` 中（多 scope 用逗号，如 `zot,skill`） |
+| 长度 | subject ≤ 50 字符 |
+| 尾标点 | subject 不得以 `.!?;` 结尾 |
+| 空行 | subject 和 body 之间必须有空行 |
+| body 宽度 | 每行 ≤ 72 字符 |
+| `@` 残留 | 拦截 subject 首字符或 body 末行为 `@` 的情况（Bash here-string 误用） |
+
+紧急绕过：`git commit --no-verify`。

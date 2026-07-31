@@ -1,0 +1,114 @@
+#!/bin/bash
+# Commit-msg hook: enforce Conventional Commits format.
+# Install: cp scripts/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
+# Bypass:  git commit --no-verify
+
+set -e
+
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+MSG_FILE="$1"
+VIOLATIONS=0
+
+# Read the commit message
+SUBJECT=$(head -1 "$MSG_FILE")
+BODY=$(tail -n +2 "$MSG_FILE")
+
+# -----------------------------------------------------------------------
+# Rule 0: Leading @ artifact (wrong shell syntax: @'...'@ in Bash)
+# -----------------------------------------------------------------------
+if echo "$SUBJECT" | grep -qE '^\s*@'; then
+    echo -e "${RED}[BLOCKED] Subject starts with '@' — likely Bash syntax error.${NC}"
+    echo -e "  ${YELLOW}Use double-quotes or heredoc for multi-line messages, not @'...'@.${NC}"
+    echo -e "  ${YELLOW}Current: $SUBJECT${NC}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# Check trailing @ as well (for the closing '@ of here-string)
+if echo "$BODY" | tail -1 | grep -qE '@\s*$'; then
+    echo -e "${RED}[BLOCKED] Message body ends with '@' — likely Bash syntax error.${NC}"
+    echo -e "  ${YELLOW}Use double-quotes or heredoc for multi-line messages.${NC}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Rule 1: Subject format — type(scope): description
+# -----------------------------------------------------------------------
+VALID_TYPES="feat|fix|refactor|docs|chore|test|style|perf|ci|build|revert"
+VALID_SCOPES="zot|skill|hook"
+
+# Build the pattern dynamically — grep -E doesn't support (?: non-capturing groups
+PATTERN="^($VALID_TYPES)\\(($VALID_SCOPES)(,($VALID_SCOPES))*\\): .+"
+if ! echo "$SUBJECT" | grep -qE "$PATTERN"; then
+    echo -e "${RED}[BLOCKED] Subject must match: type(scope): description${NC}"
+    echo -e "  ${YELLOW}Valid types:  $VALID_TYPES${NC}"
+    echo -e "  ${YELLOW}Valid scopes: $VALID_SCOPES (comma-separated for multi-layer)${NC}"
+    echo -e "  ${YELLOW}Current: $SUBJECT${NC}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Rule 2: Subject length ≤ 50 characters
+# -----------------------------------------------------------------------
+SUBJ_LEN=$(echo -n "$SUBJECT" | wc -c)
+if [ "$SUBJ_LEN" -gt 50 ]; then
+    echo -e "${RED}[BLOCKED] Subject too long: ${SUBJ_LEN}/50 chars.${NC}"
+    echo -e "  ${YELLOW}$SUBJECT${NC}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Rule 3: No trailing punctuation in subject
+# -----------------------------------------------------------------------
+if echo "$SUBJECT" | grep -qE '[.!?;]$'; then
+    echo -e "${RED}[BLOCKED] Subject must not end with punctuation.${NC}"
+    echo -e "  ${YELLOW}$SUBJECT${NC}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# -----------------------------------------------------------------------
+# Rule 4: Blank line between subject and body
+# -----------------------------------------------------------------------
+SECOND_LINE=$(sed -n '2p' "$MSG_FILE")
+if [ -n "$SECOND_LINE" ]; then
+    # If there's content in the body, line 2 must be blank
+    if [ -n "$(echo "$SECOND_LINE" | tr -d '[:space:]')" ]; then
+        echo -e "${RED}[BLOCKED] Blank line required between subject and body.${NC}"
+        echo -e "  ${YELLOW}Line 2 is not empty: '$SECOND_LINE'${NC}"
+        VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+fi
+
+# -----------------------------------------------------------------------
+# Rule 5: Body lines ≤ 72 characters
+# -----------------------------------------------------------------------
+LINE_NUM=0
+while IFS= read -r line; do
+    LINE_NUM=$((LINE_NUM + 1))
+    LINE_LEN=$(echo -n "$line" | wc -c)
+    if [ "$LINE_LEN" -gt 72 ]; then
+        echo -e "${RED}[BLOCKED] Body line $LINE_NUM too long: ${LINE_LEN}/72 chars.${NC}"
+        echo -e "  ${YELLOW}$line${NC}"
+        VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+done < <(tail -n +3 "$MSG_FILE")
+
+# -----------------------------------------------------------------------
+# Result
+# -----------------------------------------------------------------------
+if [ "$VIOLATIONS" -gt 0 ]; then
+    echo ""
+    echo -e "${RED}Commit blocked: $VIOLATIONS format violation(s).${NC}"
+    echo -e "Expected format:"
+    echo -e "  ${GREEN}type(scope): subject          ← ≤ 50 chars, no trailing .!?;${NC}"
+    echo -e "  ${GREEN}                                ← blank line${NC}"
+    echo -e "  ${GREEN}Body paragraph...              ← ≤ 72 chars/line${NC}"
+    echo ""
+    echo "Bypass (emergency only): git commit --no-verify"
+    exit 1
+fi
+
+exit 0

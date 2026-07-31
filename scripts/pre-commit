@@ -65,7 +65,9 @@ fi
 # Matches lines like:   FORBIDDEN_COLLECTION = "E2MM3WIC"
 # or bare keys used as: coll = "E2MM3WIC" / key = "E2MM3WIC"
 # Skips lines where the key is the env var name itself.
-KEY_VAL_HITS=$(echo "$STAGED" | grep -nP '^\+\s*(?!ZOTERO_|export ZOTERO_)\w+\s*=\s*["'"'"']?[A-Z0-9]{8}["'"'"']?' || true)
+KEY_VAL_HITS=$(echo "$STAGED" \
+    | grep -nE '^\+\s*\w+\s*=\s*["'"'"']?[A-Z0-9]{8}["'"'"']?' \
+    | grep -vE 'ZOTERO_' || true)
 if [ -n "$KEY_VAL_HITS" ]; then
     echo -e "${RED}[BLOCKED] Hardcoded Zotero key value detected (8-char uppercase):${NC}"
     echo "$KEY_VAL_HITS" | while read -r line; do
