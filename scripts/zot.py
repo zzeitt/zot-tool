@@ -9,6 +9,7 @@ import html
 import tempfile
 import platform
 from pyzotero import zotero
+from pyzotero._utils import build_url
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1139,13 +1140,14 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
 
 def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_user, webdav_pass,
-                        content_type="text/html", archive_filename=None):
-    """打包为 ZIP，PUT 到 WebDAV，创建 Zotero attachment item
+                        content_type="text/html", archive_filename=None, existing_key=None):
+    """打包为 ZIP，PUT 到 WebDAV，创建或更新 Zotero attachment item
 
     Args:
         tmp_file_path: 原始文件路径（.html 或 .pdf 等）
         content_type: MIME 类型，默认 text/html
         archive_filename: 存档在 ZIP 内的文件名，默认取 basename
+        existing_key: 现有 attachment key，提供时做 in-place 更新而非新建
     """
     import hashlib, zipfile
 
@@ -1161,25 +1163,55 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
         md5 = hashlib.md5(f.read()).hexdigest()
     mtime = int(os.path.getmtime(tmp_file_path) * 1000)
 
-    # 3. 创建 Zotero attachment item
+    # 3. 创建或更新 Zotero attachment item
     # filename 和 contentType 必须是解压后的原始文件属性
     # WebDAV 上存的是 <itemKey>.zip，但 Zotero 客户端解压后按 filename 识别
-    try:
-        attach = zot.create_items([{
-            "itemType": "attachment",
-            "parentItem": parent_item_key,
-            "linkMode": "imported_file",
-            "title": internal_name,
-            "filename": internal_name,
-            "contentType": content_type,
-            "md5": md5,
-            "mtime": mtime
-        }])
-        attach_key = attach["successful"]["0"]["key"]
-        print(f"📎 Created attachment item: {attach_key}")
-    except Exception as e:
-        print(f"⚠️  Failed to create attachment item: {e}")
-        return None
+    if existing_key:
+        # In-place 更新：保留 attachment key，只更新文件内容和元数据
+        # 使用 raw PATCH 只发送需要变更的字段，避免 update_item() 的全量校验
+        # 拒绝 lastRead 等只读字段
+        try:
+            items = zot.item(existing_key)
+            item = items[0] if isinstance(items, list) else items
+            version = item['data'].get('version', 0)
+            resp = zot.client.patch(
+                url=build_url(
+                    zot.endpoint,
+                    f"/{zot.library_type}/{zot.library_id}/items/{existing_key}",
+                ),
+                headers={"If-Unmodified-Since-Version": str(version)},
+                json={
+                    "md5": md5,
+                    "mtime": mtime,
+                    "filename": internal_name,
+                    "title": internal_name,
+                    "contentType": content_type,
+                },
+            )
+            resp.raise_for_status()
+            attach_key = existing_key
+            print(f"📎 Updated attachment item: {attach_key}")
+        except Exception as e:
+            print(f"⚠️  Failed to update attachment item: {e}")
+            return None
+    else:
+        # 新建 attachment item
+        try:
+            attach = zot.create_items([{
+                "itemType": "attachment",
+                "parentItem": parent_item_key,
+                "linkMode": "imported_file",
+                "title": internal_name,
+                "filename": internal_name,
+                "contentType": content_type,
+                "md5": md5,
+                "mtime": mtime
+            }])
+            attach_key = attach["successful"]["0"]["key"]
+            print(f"📎 Created attachment item: {attach_key}")
+        except Exception as e:
+            print(f"⚠️  Failed to create attachment item: {e}")
+            return None
 
     # 4. PUT ZIP 到 WebDAV
     zip_url = f"{webdav_url}{attach_key}.zip"
@@ -1423,12 +1455,16 @@ def detach_attachment(child_key):
 
 
 def reattach_attachment(attach_key, file_path, archive_filename=None):
-    """替换指定 attachment：删旧 → 挂新（保留 parent 关联）"""
+    """替换指定 attachment 的文件内容，保留 attachment key（in-place 更新）
+
+    Zotero 客户端 sync 时会检测到 mtime/hash 变化，作为版本更新处理，
+    而非创建全新的 attachment item。
+    """
     if not os.path.exists(file_path):
         print(f"❌ File not found: {file_path}")
         return
 
-    # 1. 拿旧 attachment 的 parent key
+    # 1. 拿旧 attachment 的 parent key 并验证
     try:
         items = zot.item(attach_key)
         item = items[0] if isinstance(items, list) else items
@@ -1444,30 +1480,12 @@ def reattach_attachment(attach_key, file_path, archive_filename=None):
             print(f"❌ Cannot find parent item for attachment {attach_key}")
             return
 
-        # 2. 删旧 attachment
-        zot.delete_item(item)
-        print(f"🗑️  Removed old: {old_title} ({attach_key})")
+        print(f"📎 Updating attachment: {old_title} ({attach_key})")
     except Exception as e:
-        print(f"❌ Failed to delete old attachment: {e}")
+        print(f"❌ Failed to fetch old attachment: {e}")
         return
 
-    # 3. WebDAV 清理旧文件
-    webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
-    webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
-    webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
-    if all([webdav_url, webdav_user, webdav_pass]):
-        for ext in ['.zip', '.prop']:
-            try:
-                subprocess.run(
-                    ["curl", "-s", "-X", "DELETE", "-u",
-                     f"{webdav_user}:{webdav_pass}",
-                     f"{webdav_url}{attach_key}{ext}"],
-                    capture_output=True, text=True, timeout=30
-                )
-            except Exception:
-                pass
-
-    # 4. 挂新文件（复用 save_file_attachment）
+    # 2. Content type 推断
     ext_map = {
         ".html": "text/html", ".htm": "text/html",
         ".pdf": "application/pdf",
@@ -1478,8 +1496,26 @@ def reattach_attachment(attach_key, file_path, archive_filename=None):
     }
     _, ext = os.path.splitext(file_path)
     content_type = ext_map.get(ext.lower(), "application/octet-stream")
-    save_file_attachment(file_path, parent_key, content_type,
-                         archive_filename=archive_filename)
+
+    # 3. In-place 更新：保留 attachment key，覆盖 WebDAV 文件
+    webdav_url = os.environ.get("ZOTERO_WEBDAV_URL", "").rstrip("/") + "/"
+    webdav_user = os.environ.get("ZOTERO_WEBDAV_USER", "")
+    webdav_pass = os.environ.get("ZOTERO_WEBDAV_PASS", "")
+    if not all([webdav_url, webdav_user, webdav_pass]):
+        print("❌ WebDAV not configured (ZOTERO_WEBDAV_URL/USER/PASS)")
+        return
+
+    _upload_to_webdav(
+        tmp_file_path=file_path,
+        parent_item_key=parent_key,
+        url=None,
+        webdav_url=webdav_url,
+        webdav_user=webdav_user,
+        webdav_pass=webdav_pass,
+        content_type=content_type,
+        archive_filename=archive_filename,
+        existing_key=attach_key
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2300,7 +2336,7 @@ Commands:
   attach <item-key> <file> [name] Upload local file as attachment via WebDAV
   attachments <item-key>         List all children (attachments + notes)
   detach <child-key>             Delete a specific child (attachment or note)
-  reattach <att-key> <file> [name] Replace an attachment with a new file
+  reattach <att-key> <file> [name] Update attachment file in-place (preserves key)
   delete <item-key>              Delete an item from library
   cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
   help                           Show this help
@@ -2517,8 +2553,8 @@ if __name__ == "__main__":
         archive_filename = sys.argv[4] if len(sys.argv) > 4 else None
         if not attach_key or not file_path:
             print("Usage: zot reattach <attachment-key> <file-path> [archive-filename]")
-            print("  Replace an existing attachment with a new file.")
-            print("  Equivalent to: zot detach <key> && zot attach <parent> <file>")
+            print("  Update an existing attachment file in-place (preserves item key).")
+            print("  Zotero client detects the mtime/hash change as a version update.")
             print("  Find attachment keys with: zot attachments <parent-key>")
         else:
             reattach_attachment(attach_key, file_path, archive_filename=archive_filename)

@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.10.0
+version: 1.11.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -46,7 +46,7 @@ zot cleanup-empty-collections                   # 删除所有空的子 collecti
 zot attach <item-key> <file> [name]             # 添加附件（上传到 WebDAV）
 zot attachments <item-key>                       # 列出所有子条目（attachment + note）
 zot detach <child-key>                           # 删除指定子条目（attachment 或 note）
-zot reattach <att-key> <file> [name]             # 替换指定附件（删旧 + 挂新）
+zot reattach <att-key> <file> [name]             # 原地更新附件文件内容（保留 key，Zotero 客户端感知版本变化
 ```
 
 **工作流**：先用 `zot attachments <parent-key>` 查看所有子条目（含 note），再选择性 `detach` 删除或 `reattach` 替换附件。note 清理现在也可以通过 `attachments` 查看 → `detach <note-key>` 完成。
@@ -242,6 +242,13 @@ alias zot="python3 scripts/zot.py"
 
 ## 版本历史
 
+### v1.11.0 — 附件原地更新（In-place Update）
+
+`reattach` 不再 "删旧 + 建新"，改为原地更新文件内容并保留 attachment key：
+- `_upload_to_webdav` 新增 `existing_key` 参数——传入时 PATCH 现有 item 的 md5/mtime/filename，复用原有 key 上传新的 ZIP 和 .prop
+- Zotero 客户端 sync 时检测到 mtime/hash 变化，作为文件更新处理而非全新 item
+- WebDAV 上旧 ZIP/.prop 被新 PUT 自然覆盖，无需手动清理
+
 ### v1.10.0 — Tag 增删改查
 
 新增四个 tag 管理命令，补全 tag CRUD：
@@ -258,7 +265,7 @@ alias zot="python3 scripts/zot.py"
 新增三个子条目管理命令，支持细粒度控制（不再 "一刀切删除全部附件"）：
 - `zot attachments <parent-key>` — 列出父条目下**所有子条目**（attachment + note），含类型标记、note 内容预览
 - `zot detach <child-key>` — 删除指定子条目（attachment 或 note 均可），attachment 自动清理 WebDAV
-- `zot reattach <att-key> <file> [name]` — 替换指定附件：删旧 attachment → 清理 WebDAV → 挂新文件
+- `zot reattach <att-key> <file> [name]` — 替换指定附件（v1.11.0 起改为原地更新，保留 key）
 
 工作流：先用 `attachments` 查看所有子条目 → 选择性 `detach` 删除（含 note）或用 `reattach` 替换附件。
 解决了旧 note 无法清理导致重复累积的问题。
