@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyzotero pytest
+
+      - name: Unit tests (no API needed)
+        run: python -m pytest tests/test_unit.py -v
+
+      - name: Integration tests
+        env:
+          ZOTERO_API_KEY: ${{ secrets.ZOTERO_API_KEY }}
+          ZOTERO_TEST_LIBRARY_ID: ${{ secrets.ZOTERO_TEST_LIBRARY_ID }}
+          ZOTERO_TEST_LIBRARY_TYPE: ${{ vars.ZOTERO_TEST_LIBRARY_TYPE || 'group' }}
+        run: |
+          if [ -z "$ZOTERO_API_KEY" ] || [ -z "$ZOTERO_TEST_LIBRARY_ID" ]; then
+            echo "::notice::Secrets not fully configured — skipping integration tests"
+            echo "Required: ZOTERO_API_KEY + ZOTERO_TEST_LIBRARY_ID"
+            echo "Configure at: https://github.com/${{ github.repository }}/settings/secrets/actions"
+            exit 0
+          fi
+          python -m pytest tests/ --ignore=tests/test_unit.py -v

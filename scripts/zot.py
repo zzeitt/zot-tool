@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Zotero CLI with collection/tag search and 🙊Personal exclusion"""
+import argparse
 import os
 import sys
 import re
@@ -48,7 +49,11 @@ if not MISC_COLLECTION:
     print("Error: ZOTERO_MISC_COLLECTION not set")
     sys.exit(1)
 
-zot = zotero.Zotero(LIBRARY_ID, "user", API_KEY)
+LIBRARY_TYPE = os.environ.get("ZOTERO_LIBRARY_TYPE", "user")
+if LIBRARY_TYPE not in ("user", "group"):
+    print(f"Error: ZOTERO_LIBRARY_TYPE must be 'user' or 'group', got '{LIBRARY_TYPE}'")
+    sys.exit(1)
+zot = zotero.Zotero(LIBRARY_ID, LIBRARY_TYPE, API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +166,7 @@ def _delete_collection_raw(coll_key):
     """
     import requests as _requests
     r = _requests.get(
-        f"https://api.zotero.org/users/{LIBRARY_ID}/collections/{coll_key}",
+        f"https://api.zotero.org/{LIBRARY_TYPE}s/{LIBRARY_ID}/collections/{coll_key}",
         headers={"Authorization": f"Bearer {API_KEY}", "Zotero-API-Version": "3"},
     )
     if r.status_code != 200:
@@ -170,7 +175,7 @@ def _delete_collection_raw(coll_key):
     if not ver:
         return False, "no version found"
     r = _requests.delete(
-        f"https://api.zotero.org/users/{LIBRARY_ID}/collections/{coll_key}",
+        f"https://api.zotero.org/{LIBRARY_TYPE}s/{LIBRARY_ID}/collections/{coll_key}",
         headers={
             "Authorization": f"Bearer {API_KEY}",
             "Zotero-API-Version": "3",
@@ -279,27 +284,47 @@ def _fix_wechat_html(filepath):
     return changed
 
 
-# Cache forbidden items
+# Cache forbidden collections (root + all descendants) and items
+_forbidden_collection_keys = None
 _forbidden_item_keys = None
+
+
+def _get_forbidden_collection_keys():
+    """Return set of all collection keys under 🙊Personal (including root, recursive).
+
+    Results are cached indefinitely — call _invalidate_forbidden_cache() to refresh.
+    """
+    global _forbidden_collection_keys
+    if _forbidden_collection_keys is not None:
+        return _forbidden_collection_keys
+
+    def _get_sub_collections(parent_key):
+        subs = [parent_key]
+        for c in _all_collections():
+            if c['data'].get('parentCollection') == parent_key:
+                subs.extend(_get_sub_collections(c['key']))
+        return subs
+
+    _forbidden_collection_keys = set(_get_sub_collections(FORBIDDEN_COLLECTION))
+    return _forbidden_collection_keys
+
+
+def _invalidate_forbidden_cache():
+    """Invalidate forbidden caches (called after write operations that change collection membership)."""
+    global _forbidden_item_keys, _forbidden_collection_keys
+    _forbidden_item_keys = None
+    _forbidden_collection_keys = None
+
 
 def get_forbidden_items():
     """Get all item keys in 🙊Personal collection (recursively)"""
     global _forbidden_item_keys
     if _forbidden_item_keys is not None:
         return _forbidden_item_keys
-    
+
     forbidden = set()
-    
-    # Get all collections under 🙊Personal (recursive)
-    def get_sub_collections(parent_key):
-        subs = [parent_key]
-        for c in zot.collections():
-            if c['data'].get('parentCollection') == parent_key:
-                subs.extend(get_sub_collections(c['key']))
-        return subs
-    
-    forbidden_collections = get_sub_collections(FORBIDDEN_COLLECTION)
-    
+    forbidden_collections = _get_forbidden_collection_keys()
+
     # Get all items in these collections
     for coll_key in forbidden_collections:
         items = zot.collection_items(coll_key)
@@ -309,7 +334,7 @@ def get_forbidden_items():
             children = item.get('children', [])
             for child in children:
                 forbidden.add(child['key'])
-    
+
     _forbidden_item_keys = forbidden
     return forbidden
 
@@ -318,13 +343,13 @@ def is_allowed(item_key):
     return item_key not in get_forbidden_items()
 
 def get_collection_map():
-    """Build collection key->name mapping"""
-    collections = zot.collections()
+    """Build collection key->name mapping (uses _all_collections to avoid limit=100 truncation)"""
+    collections = _all_collections()
     return {c['key']: c['data'].get('name', 'Unknown') for c in collections}
 
 def get_item_collections(item_key):
-    """Get collection names for an item"""
-    collections = zot.collections()
+    """Get collection names for an item (uses _all_collections to avoid limit=100 truncation)"""
+    collections = _all_collections()
     item_collections = []
     for c in collections:
         coll_key = c['key']
@@ -334,18 +359,24 @@ def get_item_collections(item_key):
     return item_collections
 
 def search(query, limit=10, search_tags=False, search_collections=False):
-    """Search items in Zotero library"""
+    """Search items in Zotero library.
+
+    When searching by query text, results are ranked by Zotero's relevance
+    algorithm (title/creator match). When searching by collection, items
+    are in dateAdded descending order (newest first).
+    """
     forbidden = get_forbidden_items()
     
     results = []
     
     if search_collections:
-        # Search by collection name
-        collections = zot.collections()
+        # Search by collection name (use _all_collections to avoid limit=100 truncation)
+        # Word-boundary match: "pi" matches "Misc--pi/π" but NOT "pipeline"
+        collections = _all_collections()
         coll_map = get_collection_map()
         for c in collections:
             coll_name = c['data'].get('name', '')
-            if query.lower() in coll_name.lower():
+            if re.search(r'\b' + re.escape(query.lower()) + r'\b', coll_name.lower()):
                 items = zot.collection_items(c['key'])
                 for item in items:
                     if item['key'] not in forbidden:
@@ -410,33 +441,39 @@ def search(query, limit=10, search_tags=False, search_collections=False):
         print(f"{i}. [{item_type}] {title[:70]}")
         print(f"   🔑 {key} | 👤 {author}{tag_str}{coll_str}\n")
 
-def search_by_collection(collection_name, limit=10):
-    """Search items by collection name"""
+def search_by_collection(collection_name):
+    """Find collections by name (word-boundary match).
+
+    Shows matching collection keys and item counts. Uses \\b boundary
+    so "pi" matches "Misc--pi/π" but NOT "pipeline" in "Misc--CPU/pipeline".
+
+    For browsing items: use ``zot search`` or ``zot list``.
+    Uses _all_collections() to avoid the default limit=100 truncation.
+    """
     forbidden = get_forbidden_items()
-    collections = zot.collections()
-    
-    results = []
+    collections = _all_collections()
+
+    # Find matching collections (word-boundary match)
+    query_lower = collection_name.lower()
+    matched_colls = []
     for c in collections:
         name = c['data'].get('name', '')
-        if collection_name.lower() in name.lower():
-            items = zot.collection_items(c['key'])
-            for item in items:
-                if item['key'] not in forbidden:
-                    item['_matched_collection'] = name
-                    results.append(item)
-    
-    results = results[:limit]
+        if re.search(r'\b' + re.escape(query_lower) + r'\b', name.lower()):
+            matched_colls.append((c['key'], name))
+
+    if not matched_colls:
+        print(f"\n📁 Collection search: '{collection_name}'")
+        print("📚 No matching collections found.\n")
+        return
+
     print(f"\n📁 Collection search: '{collection_name}'")
-    print(f"📚 Found {len(results)} items (excluding 🙊Personal):\n")
-    
-    for i, item in enumerate(results, 1):
-        data = item.get('data', {})
-        title = data.get('title', 'No title')
-        item_type = data.get('itemType', 'unknown')
-        key = item['key']
-        coll = item.get('_matched_collection', '')
-        print(f"{i}. [{item_type}] {title[:60]}...")
-        print(f"   🔑 {key} | 📁 {coll}\n")
+    print(f"📁 Matched {len(matched_colls)} collection(s):\n")
+    for ck, name in matched_colls:
+        # Item count (respecting forbidden exclusion)
+        items = list(zot.collection_items(ck))
+        visible = [it for it in items if it['key'] not in forbidden]
+        print(f"   • {name}")
+        print(f"     🔑 {ck}  |  📦 {len(visible)} items\n")
 
 def search_by_tag(tag, limit=10):
     """Search items by tag"""
@@ -466,55 +503,11 @@ def search_by_tag(tag, limit=10):
         print(f"{i}. [{item_type}] {title[:60]}...")
         print(f"   🔑 {key} | 🏷️ {', '.join(tags)}\n")
 
-def search_emacs(limit=20):
-    """Quick search for emacs-related items"""
-    forbidden = get_forbidden_items()
-    all_items = zot.items(limit=100)
-    
-    results = []
-    emacs_keywords = ['emacs', 'elisp', 'org-mode', 'org mode', 'dired', 'spacemacs', 'doom emacs']
-    
-    for item in all_items:
-        if item['key'] in forbidden:
-            continue
-        data = item.get('data', {})
-        title = data.get('title', '').lower()
-        
-        # Check title
-        if any(kw in title for kw in emacs_keywords):
-            results.append(item)
-        # Check tags
-        else:
-            tags = [t.get('tag', '').lower() for t in data.get('tags', [])]
-            if any(kw in t for t in tags for kw in emacs_keywords):
-                results.append(item)
-        
-        # Check collection
-        if item not in results:
-            for c in zot.collections():
-                if 'emacs' in c['data'].get('name', '').lower():
-                    coll_items = zot.collection_items(c['key'])
-                    if any(i['key'] == item['key'] for i in coll_items):
-                        item['_matched_collection'] = c['data']['name']
-                        results.append(item)
-                        break
-        
-        if len(results) >= limit:
-            break
-    
-    print(f"\n🔍 Emacs-related items (excluding 🙊Personal):\n")
-    for i, item in enumerate(results, 1):
-        data = item.get('data', {})
-        title = data.get('title', 'No title')
-        item_type = data.get('itemType', 'unknown')
-        key = item['key']
-        coll = item.get('_matched_collection', '')
-        coll_str = f" | 📁 {coll}" if coll else ""
-        print(f"{i}. [{item_type}] {title[:65]}...")
-        print(f"   🔑 {key}{coll_str}\n")
-
 def list_items(limit=10):
-    """List recent items (excluding forbidden)"""
+    """List recent items in dateAdded descending order (newest first).
+
+    Uses Zotero API default sort which matches the client's "Date Added" column.
+    """
     forbidden = get_forbidden_items()
     all_items = zot.items(limit=50)
     
@@ -529,21 +522,21 @@ def list_items(limit=10):
         print(f"{i}. [{item_type}] {title[:60]}... (🔑 {key})")
 
 def list_collections():
-    """List all collections (excluding 🙊Personal)"""
-    collections = zot.collections()
-    forbidden_coll = FORBIDDEN_COLLECTION
-    
+    """List all collections (excluding 🙊Personal).
+
+    Uses _all_collections() to avoid the default limit=100 truncation.
+    """
+    collections = _all_collections()
+    forbidden_keys = _get_forbidden_collection_keys()
+
     print(f"\n📁 Collections (excluding 🙊Personal):\n")
     for c in collections:
-        if c['key'] == forbidden_coll:
-            continue
-        # Check if parent is forbidden
-        parent = c['data'].get('parentCollection')
-        if parent == forbidden_coll:
+        if c['key'] in forbidden_keys:
             continue
             
         name = c['data'].get('name', 'Unknown')
         key = c['key']
+        parent = c['data'].get('parentCollection')
         parent_str = f" (parent: {parent})" if parent else ""
         print(f"  • {name}{parent_str}")
         print(f"    Key: {key}\n")
@@ -944,7 +937,7 @@ def find_best_collection(title, description):
     for c in collections:
         name = c['data'].get('name', '')
         key = c['key']
-        if key == FORBIDDEN_COLLECTION:
+        if key in _get_forbidden_collection_keys():
             continue
         if key == MISC_COLLECTION:
             continue
@@ -2314,330 +2307,363 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         print(f"❌ Failed: {response.get('failed', {})}")
         return None
 
+# ── argparse CLI builder ──────────────────────────────────────────
+
+def _build_parser():
+    """Build the argparse parser tree.
+
+    Canonical form:  zot <noun> <verb> [args]
+    Aliases (search, archive, add, delete, tags, ...) are resolved by
+    _resolve_aliases() before argparse sees them.
+    """
+    p = argparse.ArgumentParser(
+        prog="zot",
+        description="Zotero library management CLI  —  zot <noun> <verb> [args]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Conventions:\n"
+               "  🚫 🙊Personal collection excluded\n"
+               "  📌 New items auto-tagged /unread\n"
+               "  🏷️  Tags: #keyword🤖, no spaces, max 3\n"
+               "  🔤 Sort: item search → relevance; item list/coll → dateAdded▼\n"
+               "  📁 Archive: HTML→monolith; PDF/EPUB→direct download",
+    )
+    subs = p.add_subparsers(dest="command", metavar="<command>")
+
+    # ── item ──────────────────────────────────────────────────
+    item = subs.add_parser("item", help="Item management")
+    item_s = item.add_subparsers(dest="action", metavar="<action>")
+
+    ia = item_s.add_parser("add", help="Create item")
+    ia.add_argument("item_type", help="Item type (webpage, book, ...)")
+    ia.add_argument("title")
+    ia.add_argument("url")
+    ia.add_argument("coll_key", help="Target collection key")
+    ia.add_argument("extra", nargs="?", help="Extra JSON fields")
+
+    ir = item_s.add_parser("remove", help="Delete item")
+    ir.add_argument("item_key")
+
+    il = item_s.add_parser("list", help="List recent items")
+    il.add_argument("limit", nargs="?", type=int, default=10)
+
+    is_ = item_s.add_parser("search", help="Full-text search")
+    is_.add_argument("query")
+    is_.add_argument("limit", nargs="?", type=int, default=10)
+
+    iar = item_s.add_parser("archive", help="Smart archive URL")
+    iar.add_argument("--no-offline", action="store_true", dest="no_offline",
+                     help="Skip offline HTML copy")
+    iar.add_argument("url")
+    iar.add_argument("rest", nargs="*", help="[title-hint] [#tag]...")
+
+    # ── tag ───────────────────────────────────────────────────
+    tag = subs.add_parser("tag", help="Tag management and search")
+    tag_s = tag.add_subparsers(dest="action", metavar="<action>")
+
+    ta = tag_s.add_parser("add", help="Add tags")
+    ta.add_argument("item_key")
+    ta.add_argument("tags", nargs="+", help="Tag(s) to add")
+
+    tr = tag_s.add_parser("remove", help="Remove tags")
+    tr.add_argument("item_key")
+    tr.add_argument("tags", nargs="+", help="Tag(s) to remove")
+
+    ts = tag_s.add_parser("set", help="Replace all tags (none = clear)")
+    ts.add_argument("item_key")
+    ts.add_argument("tags", nargs="*", default=[], help="New tags")
+
+    tl = tag_s.add_parser("list", help="List tags on an item")
+    tl.add_argument("item_key")
+
+    tse = tag_s.add_parser("search", help="Search by tag")
+    tse.add_argument("query", help="Tag to search for")
+    tse.add_argument("limit", nargs="?", type=int, default=10)
+
+    # ── coll ──────────────────────────────────────────────────
+    coll = subs.add_parser("coll", help="Collection management")
+    coll_s = coll.add_subparsers(dest="action", metavar="<action>")
+
+    coll_s.add_parser("list", help="List all collections")
+
+    cr = coll_s.add_parser("remove", help="Delete a collection")
+    cr.add_argument("coll_key")
+
+    cs = coll_s.add_parser("search", help="Find collections by name")
+    cs.add_argument("name")
+
+    # ── note ──────────────────────────────────────────────────
+    note = subs.add_parser("note", help="Note management")
+    note_s = note.add_subparsers(dest="action", metavar="<action>")
+
+    na = note_s.add_parser("add", help="Add LLM summary note (pipe supported)")
+    na.add_argument("item_key")
+    na.add_argument("content", nargs="?", help="Note content (reads stdin if omitted)")
+
+    ns = note_s.add_parser("set", help="Set note directly, no LLM (pipe supported)")
+    ns.add_argument("item_key")
+    ns.add_argument("content", nargs="?", help="Note content (reads stdin if omitted)")
+
+    # ── attachment ────────────────────────────────────────────
+    att = subs.add_parser("attachment", help="Attachment management")
+    att_s = att.add_subparsers(dest="action", metavar="<action>")
+
+    ata = att_s.add_parser("add", help="Upload attachment (needs WebDAV)")
+    ata.add_argument("item_key")
+    ata.add_argument("file_path")
+    ata.add_argument("name", nargs="?")
+
+    atr = att_s.add_parser("remove", help="Delete child item")
+    atr.add_argument("child_key")
+
+    atu = att_s.add_parser("update", help="Update attachment in-place")
+    atu.add_argument("att_key")
+    atu.add_argument("file_path")
+    atu.add_argument("name", nargs="?")
+
+    atl = att_s.add_parser("list", help="List child items")
+    atl.add_argument("parent_key")
+
+    # ── help ──────────────────────────────────────────────────
+    subs.add_parser("help", help="Show this help")
+
+    return p
+
+
+# ── alias resolution (before argparse) ────────────────────────
+
+_ALIAS_MAP = {
+    "search":      ["item", "search"],
+    "archive":     ["item", "archive"],
+    "add":         ["item", "add"],
+    "delete":      ["item", "remove"],
+    "list":        ["item", "list"],
+    "tags":        ["tag", "list"],
+    "collections": ["coll", "list"],
+    "collection":  ["coll"],
+    "addnote":     ["note", "add"],
+    "setnote":     ["note", "set"],
+    "attachments": ["attachment", "list"],
+    "detach":      ["attachment", "remove"],
+    "reattach":    ["attachment", "update"],
+    "attach":      ["attachment", "add"],
+}
+
+
+def _resolve_aliases(argv):
+    """Rewrite argv so argparse only sees canonical <noun> <verb> forms.
+
+    Handles:
+      - Static aliases (search → item search, tags → tag list, ...)
+      - attach <key> <file> → attachment add <key> <file> (backward compat)
+      - tag <query> → tag search <query> (backward compat)
+      - coll <name> → coll search <name> (backward compat)
+    """
+    if len(argv) < 2:
+        return argv
+
+    cmd = argv[1]
+    tail = argv[2:]
+
+    # Static aliases
+    if cmd in _ALIAS_MAP:
+        return [argv[0]] + _ALIAS_MAP[cmd] + tail
+
+    # tag <non-subcommand> → tag search <query> [limit]
+    if cmd == "tag" and tail:
+        sub = tail[0]
+        if sub not in ("add", "remove", "set", "list", "search",
+                       "-h", "--help"):
+            argv = [argv[0], "tag", "search"] + tail
+            return argv
+
+    # coll <non-subcommand> → coll search <name>
+    if cmd == "coll" and tail:
+        sub = tail[0]
+        if sub not in ("list", "remove", "search", "-h", "--help"):
+            argv = [argv[0], "coll", "search"] + tail
+            return argv
+
+    return argv
+
+
 def show_help():
-    print("""Usage: zot <command> [args]
+    """Print top-level help (for backwards compat — argparse handles --help)."""
+    _build_parser().print_help()
 
-Commands:
-  search <query> [limit]         Search items by title/content
-  tag <tag> [limit]              Search items by tag
-  tag add <key> <tag>...          Add tag(s) to an item (v1.10.0)
-  tag remove <key> <tag>...       Remove tag(s) from an item (v1.10.0)
-  tag set <key> <tag>...          Replace all tags on an item (v1.10.0)
-  tags <key>                      List all tags on an item (v1.10.0)
-  coll <collection> [limit]       Search items by collection name
-  emacs [limit]                  Search emacs-related items
-  list [limit]                   List recent items
-  collections                    List all collections
-  add <type> <title> <url> <coll> [extra]   Add item with /unread tag
-  archive <url> [title-hint] [#tag1]...  Smart archive with auto collection/tag (+ optional tag hints)
-  archive --no-offline <url>    Archive without saving offline copy
-  addnote <item-key> [content]   Add LLM-summarized note to existing item
-  setnote <item-key> [content]   Set raw note content directly (no LLM)
-  attach <item-key> <file> [name] Upload local file as attachment via WebDAV
-  attachments <item-key>         List all children (attachments + notes)
-  detach <child-key>             Delete a specific child (attachment or note)
-  reattach <att-key> <file> [name] Update attachment file in-place (preserves key)
-  delete <item-key>              Delete an item from library
-  cleanup-empty-collections      Delete all empty sub-collections (v1.8.0)
-  help                           Show this help
 
-Examples:
-  zot search "machine learning" 10
-  zot tag "important" 5
-  zot tags KC5ETPXM
-  zot tag add KC5ETPXM "#AI-ML🤖" "#工具🛠️"
-  zot tag remove KC5ETPXM "/unread"
-  zot tag set KC5ETPXM "/unread" "#新标签🤖"
-  zot coll "Cheat" 20
-  zot emacs 20
-  zot list 15
-  zot collections
-  zot add podcast "My Podcast" "https://..." LKRM6B4Y
-  zot archive "https://podcasts.apple.com/..."
-  zot attach KC5ETPXM /tmp/article.html article.html
-  zot attachments KC5ETPXM
-  zot detach A1B2C3D4
-  zot reattach A1B2C3D4 /tmp/updated.pdf updated.pdf
-  zot setnote KC5ETPXM "<p>raw html note</p>"
-  zot delete KC5ETPXM
-  zot cleanup-empty-collections
+# ── attach extension → content-type mapping ────────────────────
 
-🚫 Note: Items in 🙊Personal collection are always excluded.
-📌 Convention: All new items are auto-tagged with /unread.
-📌 Archive trigger (env): ZOTERO_ARCHIVE_TRIGGER (default: 【归档到Zotero】)
-📌 Offline copy: archive command auto-saves offline HTML via monolith
-""")
+_ATTACH_EXT_MAP = {
+    ".html": "text/html", ".htm": "text/html",
+    ".pdf": "application/pdf",
+    ".epub": "application/epub+zip",
+    ".zip": "application/zip",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+# ── dispatch helpers ───────────────────────────────────────────
+
+def _note_add(item_key, note_content):
+    """Shared logic for note add (LLM summarization)."""
+    if note_content is None:
+        note_content = sys.stdin.read()
+    if not note_content.strip():
+        print("Error: no note content")
+        return
+    note_content = note_content.strip()
+    summary = _llm_summarize(item_key, note_content, "笔记", "")
+    if summary:
+        note_to_write = summary
+    else:
+        print(f"[WARN] LLM summarization failed for item {item_key}; "
+              f"falling back to raw content (see stderr for details)", file=sys.stderr)
+        note_to_write = note_content
+    note_html = f'<h3>📝 内容提纲</h3>\n\n{note_to_write}'
+    zot.create_items([{'itemType': 'note', 'parentItem': item_key, 'note': note_html}])
+    print(f"✅ Added note to item {item_key}")
+
+
+def _note_set(item_key, note_content):
+    """Shared logic for note set (direct write, no LLM)."""
+    if note_content is None:
+        note_content = sys.stdin.read()
+    if not note_content.strip():
+        print("Error: no note content")
+        return
+    zot.create_items([{'itemType': 'note', 'parentItem': item_key,
+                        'note': note_content.strip()}])
+    print(f"✅ Set note on item {item_key}")
+
+
+def _attach_add(item_key, file_path, archive_filename=None):
+    """Shared logic for attachment add."""
+    _, ext = os.path.splitext(file_path)
+    content_type = _ATTACH_EXT_MAP.get(ext.lower(), "application/octet-stream")
+    save_file_attachment(file_path, item_key, content_type,
+                         archive_filename=archive_filename)
+
+
+def _item_remove(item_key):
+    """Shared logic for item remove/delete."""
+    items = zot.item(item_key)
+    item = items[0] if isinstance(items, list) else items
+    zot.delete_item(item)
+    print(f"✅ Deleted item: {item_key}")
+
+
+def _coll_remove(coll_key):
+    """Shared logic for coll remove."""
+    if not _is_collection_empty(coll_key):
+        items = list(zot.everything(zot.collection_items(coll_key)))
+        print(f"⚠️  Collection has {len(items)} item(s). Remove items first, "
+              f"or use --force to override.")
+        return
+    ok, msg = _delete_collection_raw(coll_key)
+    if ok:
+        _invalidate_collections_cache()
+        print(f"🗑️  Deleted collection: {coll_key}")
+    else:
+        print(f"❌ Failed: {msg}")
+
+
+# ── main ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        show_help()
+    # 1. Resolve aliases so argparse only sees canonical forms
+    sys.argv = _resolve_aliases(sys.argv)
+
+    # 2. Parse
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    # 3. Dispatch
+    cmd = args.command
+
+    if cmd is None or cmd == "help":
+        parser.print_help()
         sys.exit(0)
-    
-    cmd = sys.argv[1]
-    
-    if cmd == "search":
-        query = sys.argv[2] if len(sys.argv) > 2 else ""
-        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-        if not query:
-            print("Usage: zot search <query> [limit]")
-        else:
-            search(query, limit)
-    
-    elif cmd == "tag":
-        # zot tag add/remove/set <item-key> <tag>...   (v1.10.0 tag management)
-        # zot tag <query> [limit]                       (backward-compat search)
-        sub = sys.argv[2] if len(sys.argv) > 2 else ""
-        if sub in ("add", "remove", "set"):
-            item_key = sys.argv[3] if len(sys.argv) > 3 else ""
-            tag_args = sys.argv[4:]
-            if not item_key:
-                print(f"Usage: zot tag {sub} <item-key> <tag1> [tag2] ...")
-            elif sub == "add":
-                tags_add(item_key, *tag_args)
-            elif sub == "remove":
-                tags_remove(item_key, *tag_args)
-            elif sub == "set":
-                tags_set(item_key, *tag_args)
-        else:
-            # Backward-compatible: zot tag <query> [limit]
-            query = sub
-            limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-            if not query:
-                print("Usage: zot tag <tag> [limit]")
-                print("       zot tag add/remove/set <item-key> <tag1> [tag2] ...")
-            else:
-                search_by_tag(query, limit)
 
-    elif cmd == "tags":
-        # zot tags <item-key>
-        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not item_key:
-            print("Usage: zot tags <item-key>")
-            print("  List all tags on an item.")
-        else:
-            tags_list(item_key)
+    if args.action is None:
+        # User typed a noun without a verb — show that noun's help
+        for _cmd, _sub in [
+            ("item", "item"), ("tag", "tag"), ("coll", "coll"),
+            ("note", "note"), ("attachment", "attachment"),
+        ]:
+            if _cmd == cmd:
+                parser.parse_args([cmd, "--help"])
+                sys.exit(0)
+        parser.print_help()
+        sys.exit(0)
 
-    elif cmd == "coll" or cmd == "collection":
-        coll = sys.argv[2] if len(sys.argv) > 2 else ""
-        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-        if not coll:
-            print("Usage: zot coll <collection-name> [limit]")
-        else:
-            search_by_collection(coll, limit)
-    
-    elif cmd == "emacs":
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-        search_emacs(limit)
-    
-    elif cmd == "list":
-        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-        list_items(limit)
-    
-    elif cmd == "collections":
-        list_collections()
-
-    elif cmd == "add":
-        item_type = sys.argv[2] if len(sys.argv) > 2 else ""
-        title = sys.argv[3] if len(sys.argv) > 3 else ""
-        url = sys.argv[4] if len(sys.argv) > 4 else ""
-        coll_key = sys.argv[5] if len(sys.argv) > 5 else ""
-        extra = sys.argv[6] if len(sys.argv) > 6 else None
-        if not all([item_type, title, url, coll_key]):
-            print("Usage: zot add <item-type> \"<title>\" <url> <collection-key> [extra-json]")
-        else:
-            add_item(item_type, title, url, coll_key, extra)
-
-    elif cmd == "addnote":
-        # zot addnote <item-key> [note-content]
-        # Reads note from stdin if no content arg given
-        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        note_content = sys.argv[3] if len(sys.argv) > 3 else None
-        if not item_key:
-            print("Usage: zot addnote <item-key> [note-content]")
-            print("       echo '内容' | zot addnote <item-key>  (pipe mode)")
-        else:
-            if note_content is None:
-                note_content = sys.stdin.read()
-            if not note_content.strip():
-                print("Error: no note content")
-            else:
-                note_content = note_content.strip()
-                # 生成中文摘要（优先 LLM）
-                summary = _llm_summarize(item_key, note_content, "笔记", "")
-                if summary:
-                    note_to_write = summary
+    try:
+        if cmd == "item":
+            action = args.action
+            if action == "add":
+                add_item(args.item_type, args.title, args.url,
+                         args.coll_key, args.extra)
+            elif action == "remove":
+                _item_remove(args.item_key)
+            elif action == "list":
+                list_items(args.limit)
+            elif action == "search":
+                if not args.query:
+                    print("Usage: zot item search <query> [limit]")
                 else:
-                    print(f"[WARN] _llm_summarize returned None for item {item_key}; falling back to raw note content (LLM generation failed — check stderr above for details)", file=sys.stderr)
-                    note_to_write = note_content
-                note_html = f'<h3>📝 内容提纲</h3>\n\n{note_to_write}'
-                try:
-                    zot.create_items([{
-                        'itemType': 'note',
-                        'parentItem': item_key,
-                        'note': note_html
-                    }])
-                    print(f"✅ Added note to item {item_key}")
-                except Exception as e:
-                    print(f"❌ Failed: {e}")
+                    search(args.query, args.limit)
+            elif action == "archive":
+                # Parse rest into title_hint + #tags
+                title_hint = None
+                tag_hints = []
+                for a in args.rest:
+                    if a.startswith("#"):
+                        tag_hints.append(a)
+                    elif not title_hint:
+                        title_hint = a
+                archive_url(args.url, title_hint, tag_hints,
+                           save_offline=not args.no_offline)
 
-    elif cmd == "setnote":
-        # zot setnote <item-key> [note-content]
-        # Directly set note content WITHOUT LLM summarization.
-        # Reads note from stdin if no content arg given.
-        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        note_content = sys.argv[3] if len(sys.argv) > 3 else None
-        if not item_key:
-            print("Usage: zot setnote <item-key> [note-content]")
-            print("       echo '<p>HTML</p>' | zot setnote <item-key>  (pipe mode)")
-        else:
-            if note_content is None:
-                note_content = sys.stdin.read()
-            if not note_content.strip():
-                print("Error: no note content")
-            else:
-                try:
-                    zot.create_items([{
-                        'itemType': 'note',
-                        'parentItem': item_key,
-                        'note': note_content.strip()
-                    }])
-                    print(f"✅ Set note on item {item_key}")
-                except Exception as e:
-                    print(f"❌ Failed: {e}")
+        elif cmd == "tag":
+            action = args.action
+            if action == "add":
+                tags_add(args.item_key, *args.tags)
+            elif action == "remove":
+                tags_remove(args.item_key, *args.tags)
+            elif action == "set":
+                tags_set(args.item_key, *args.tags)
+            elif action == "list":
+                tags_list(args.item_key)
+            elif action == "search":
+                search_by_tag(args.query, args.limit)
 
-    elif cmd == "attach":
-        # zot attach <item-key> <file-path> [archive-filename]
-        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        file_path = sys.argv[3] if len(sys.argv) > 3 else ""
-        archive_filename = sys.argv[4] if len(sys.argv) > 4 else None
-        if not item_key or not file_path:
-            print("Usage: zot attach <item-key> <file-path> [archive-filename]")
-            print("  Upload a local file as a Zotero attachment via WebDAV.")
-            print("  Content type is inferred from file extension (default: application/octet-stream).")
-        else:
-            ext_map = {
-                ".html": "text/html", ".htm": "text/html",
-                ".pdf": "application/pdf",
-                ".epub": "application/epub+zip",
-                ".zip": "application/zip",
-                ".doc": "application/msword",
-                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            }
-            _, ext = os.path.splitext(file_path)
-            content_type = ext_map.get(ext.lower(), "application/octet-stream")
-            save_file_attachment(file_path, item_key, content_type, archive_filename=archive_filename)
+        elif cmd == "coll":
+            action = args.action
+            if action == "list":
+                list_collections()
+            elif action == "remove":
+                _coll_remove(args.coll_key)
+            elif action == "search":
+                search_by_collection(args.name)
 
-    elif cmd == "attachments":
-        # zot attachments <parent-item-key>
-        parent_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not parent_key:
-            print("Usage: zot attachments <parent-item-key>")
-            print("  List all attachment children of an item.")
-        else:
-            list_attachments(parent_key)
+        elif cmd == "note":
+            action = args.action
+            if action == "add":
+                _note_add(args.item_key, args.content)
+            elif action == "set":
+                _note_set(args.item_key, args.content)
 
-    elif cmd == "detach":
-        # zot detach <child-key>
-        child_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not child_key:
-            print("Usage: zot detach <child-key>")
-            print("  Delete a specific child item — attachment or note (not the parent).")
-            print("  Find child keys with: zot attachments <parent-key>")
-        else:
-            detach_attachment(child_key)
+        elif cmd == "attachment":
+            action = args.action
+            if action == "add":
+                _attach_add(args.item_key, args.file_path, args.name)
+            elif action == "remove":
+                detach_attachment(args.child_key)
+            elif action == "update":
+                reattach_attachment(args.att_key, args.file_path,
+                                   archive_filename=args.name)
+            elif action == "list":
+                list_attachments(args.parent_key)
 
-    elif cmd == "reattach":
-        # zot reattach <attachment-key> <file-path> [archive-filename]
-        attach_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        file_path = sys.argv[3] if len(sys.argv) > 3 else ""
-        archive_filename = sys.argv[4] if len(sys.argv) > 4 else None
-        if not attach_key or not file_path:
-            print("Usage: zot reattach <attachment-key> <file-path> [archive-filename]")
-            print("  Update an existing attachment file in-place (preserves item key).")
-            print("  Zotero client detects the mtime/hash change as a version update.")
-            print("  Find attachment keys with: zot attachments <parent-key>")
-        else:
-            reattach_attachment(attach_key, file_path, archive_filename=archive_filename)
-
-    elif cmd == "archive":
-        # 解析格式：zot archive [--no-offline] <url> [title-hint] [#tag1] [#tag2] ...
-        # - 非 # 开头的字符串（非 --no-offline）→ title_hint（取第一个）
-        # - # 开头的字符串 → tag_hints
-        url = ""
-        title_hint = None
-        tag_hints = []
-        save_offline = True
-
-        raw_args = sys.argv[2:]
-        i = 0
-        while i < len(raw_args):
-            arg = raw_args[i]
-            if arg == "--no-offline":
-                save_offline = False
-            elif arg.startswith("http://") or arg.startswith("https://"):
-                url = arg
-            elif arg.startswith("#"):
-                tag_hints.append(arg)
-            elif not title_hint:
-                # 非 URL、非 #、非 flag 的第一个字符串 → title_hint
-                title_hint = arg
-            # 忽略多余的 non-URL/non-# 字符串
-            i += 1
-
-        if not url:
-            print("Usage: zot archive [--no-offline] <url> [title-hint] [#tag1] [#tag2] ...")
-            print("Example: zot archive https://example.com \"Article Title\" #topic #ai")
-        else:
-            archive_url(url, title_hint, tag_hints, save_offline=save_offline)
-
-    elif cmd == "delete":
-        item_key = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not item_key:
-            print("Usage: zot delete <item-key>")
-        else:
-            try:
-                items = zot.item(item_key)
-                item = items[0] if isinstance(items, list) else items
-                zot.delete_item(item)
-                print(f"✅ Deleted item: {item_key}")
-            except Exception as e:
-                print(f"❌ Failed: {e}")
-
-    elif cmd == "cleanup-empty-collections":
-        # v1.8.0: 扫描所有子 collection（跳过根/Personal/Misc），
-        # 找出空 collection 并通过 raw API 删除
-        protect = {FORBIDDEN_COLLECTION, MISC_COLLECTION}
-        prefix_protect = ["🙊", "📢"]  # 顶层隐私 / 公开目录，不动
-        deleted = 0
-        skipped_protected = 0
-        skipped_with_items = 0
-        for c in _all_collections(force_refresh=True):
-            ck = c['key']
-            name = c['data'].get('name', '')
-            parent = c['data'].get('parentCollection')
-            if ck in protect or parent is None or parent in protect:
-                skipped_protected += 1
-                continue
-            if any(name.startswith(p) for p in prefix_protect):
-                skipped_protected += 1
-                continue
-            if not _is_collection_empty(ck):
-                skipped_with_items += 1
-                continue
-            ok, msg = _delete_collection_raw(ck)
-            if ok:
-                print(f"🗑️  Deleted empty collection: {name} ({ck})", flush=True)
-                deleted += 1
-            else:
-                print(f"❌ Failed to delete {name} ({ck}): {msg}", flush=True)
-        _invalidate_collections_cache()
-        print()
-        print(f"📊 Summary: deleted={deleted}, protected={skipped_protected}, "
-              f"non-empty={skipped_with_items}", flush=True)
-
-    elif cmd == "help":
-        show_help()
-
-    else:
-        print(f"Unknown command: {cmd}")
+    except Exception as e:
+        print(f"❌ Failed: {e}")
         sys.exit(1)

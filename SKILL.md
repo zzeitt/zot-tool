@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 1.11.0
+version: 2.0.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -14,52 +14,81 @@ Zotero 文献库命令行管理工具，支持高级搜索、标签过滤、Coll
 - Library Type: user
 - `ZOTERO_WEBDAV_URL/USER/PASS`：坚果云 WebDAV 端点及凭证（附件上传必需）
 
+### Windows 环境注意事项
+
+Windows 上使用 monolith 有若干已知问题，以下是规避方案。
+
+**monolith `-o` 参数 bug（v2.10.1）**
+
+monolith 2.10.1 在 Windows 上使用 `-o` 参数会 panic（`src\main.rs:291`，错误 `Os { code: 3, kind: NotFound }`）。这是 monolith 自身的 bug，与 Rust 标准库文件创建逻辑有关。
+
+**解决方案**：不传 `-o`，改用 stdout 重定向：
+
+```powershell
+monolith <url> > output.html
+```
+
+zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows `CreateProcess` 只自动搜索 `.exe` 扩展名。如果需要透明包装 monolith（不改 zot.py），编译一个 `.exe` wrapper 拦截 `-o` 参数并转为 stdout 重定向即可。关键点：
+
+- wrapper 必须是 PE `.exe` 格式（`.bat`/`.cmd` 不会被 `subprocess.run` 以 `shell=False` 发现）
+- monolith 的 stderr 输出是未内联资源的 URL 列表，**不能**重定向到输出文件（否则 HTML 顶部会有 URL 噪音）；应丢弃或单独记录
+
+**Python 3.14 兼容性**
+
+`import pyzotero` 在 Python 3.14 上可能因 `whenever` 时区库兼容性问题而挂起。若遇到此问题，可降级到 Python 3.12 或等待 pyzotero 上游修复。
+
 ## 核心命令
 
-### 搜索功能
-```bash
-zot emacs [limit]        # 搜索 emacs 相关内容
-zot search <query> [limit]   # 一般关键词搜索
-zot tag <tag> [limit]        # 按标签搜索
-zot coll <collection> [limit] # 按 Collection 搜索
-```
+### 搜索与浏览 —— 在文献库中查找和浏览条目
 
-### 浏览功能
-```bash
-zot list [limit]         # 列出最近条目
-zot collections          # 列出所有 Collections
-```
+| 命令 | 说明 | 场景 |
+|---|---|---|
+| `zot item search <query> [limit]` | 全文搜索，Zotero 相关性排序 | 按关键词查找文献 |
+| `zot tag <query> [limit]` | 按标签筛选条目 | 查找所有带 `/unread` 标签的未读条目 |
+| `zot coll <name>` | 按 Collection 名称查找（整词匹配，显示 key + 条目数） | 查找某个主题 Collection |
+| `zot coll list` | 列出所有 Collections | 了解库中有哪些分类 |
+| `zot coll remove <key>` | 删除指定 Collection（非空时警告） | 清理废弃 Collection |
+| `zot item list [limit]` | 最近添加的条目，**dateAdded 降序** | 查看最近归档了什么 |
 
-### 条目管理
-```bash
-zot add <type> "<title>" <url> <coll> [extra]   # 添加新条目（自动带上 /unread 标签）
-zot archive <url> ["title-hint"] [#tag1] [#tag2]   # 智能归档（自动识别 HTML/二进制文件）
-zot archive --no-offline <url> ["title-hint] [#tag1]  # 归档但不保存离线副本
-zot addnote <item-key> [content]                # 添加 LLM 生成摘要的 Note
-zot setnote <item-key> [content]                # 设置原始 Note 内容（不经过 LLM）
-zot delete <item-key>                           # 删除条目
-zot cleanup-empty-collections                   # 删除所有空的子 collection (v1.8.0)
-```
+> **Aliases**: `zot search` → `item search` | `zot collections` → `coll list` | `zot list` → `item list` | `zot tags <k>` → `tag list <k>`
+> **排序说明**：`item list` 和 `coll` 按 Zotero 默认的 dateAdded 降序排列。`item search` 由 Zotero 相关性算法排序。所有命令均已使用 `_all_collections()` 分页拉取全部 collection。
 
-### 附件管理 (v1.9.0)
-```bash
-zot attach <item-key> <file> [name]             # 添加附件（上传到 WebDAV）
-zot attachments <item-key>                       # 列出所有子条目（attachment + note）
-zot detach <child-key>                           # 删除指定子条目（attachment 或 note）
-zot reattach <att-key> <file> [name]             # 原地更新附件文件内容（保留 key，Zotero 客户端感知版本变化
-```
+### 条目管理 —— 创建、归档、删除条目
 
-**工作流**：先用 `zot attachments <parent-key>` 查看所有子条目（含 note），再选择性 `detach` 删除或 `reattach` 替换附件。note 清理现在也可以通过 `attachments` 查看 → `detach <note-key>` 完成。
+| 命令 | 说明 | 场景 |
+|---|---|---|
+| `zot item archive <url> [title] [#tag]...` | **最常用命令**：智能归档 URL | 归档网页文章、PDF 链接、播客等 |
+| `zot item archive --no-offline <url> [title]` | 同上，但跳过离线 HTML 保存 | 只需要条目元数据 |
+| `zot item add <type> <title> <url> <coll> [extra]` | 手动添加条目（自动打 `/unread`） | 非 URL 来源或特殊类型条目 |
+| `zot item remove <item-key>` | 删除条目及其所有子条目 | 重复条目、归档失败清理 |
+| `zot note add <item-key> [content]` | 给已有条目追加 LLM 摘要 Note | 归档后补充 AI 摘要 |
+| `zot note set <item-key> [content]` | 直接写原始 Note 内容（不调 LLM） | 手动写入自定义笔记 |
 
-### Tag 管理 (v1.10.0)
-```bash
-zot tags <item-key>                              # 列出某条目的所有 tags
-zot tag add <item-key> <tag1> [tag2] ...         # 添加 tag(s)（幂等，不重复添加）
-zot tag remove <item-key> <tag1> [tag2] ...      # 移除指定 tag(s)
-zot tag set <item-key> <tag1> [tag2] ...         # 替换全部 tags（不传 tag 则清空）
-```
+> **Aliases**: `zot archive` → `item archive` | `zot add` → `item add` | `zot delete` → `item remove` | `zot addnote` → `note add` | `zot setnote` → `note set`
 
-**与旧搜索命令的兼容**：`zot tag <query> [limit]`（第一个参数不是 add/remove/set 时）仍触发按 tag 搜索。
+### 标签管理 —— Tag 增删改查 (v1.10.0)
+
+| 命令 | 说明 | 场景 |
+|---|---|---|
+| `zot tag add <key> <tag>...` | 添加 tag(s)，已存在则跳过（幂等） | 给条目补充标签 |
+| `zot tag remove <key> <tag>...` | 移除指定 tag(s) | 条目读完后去掉 `/unread` |
+| `zot tag set <key> <tag>...` | 替换全部 tags（不传 tag = 清空） | 批量重整标签 |
+| `zot tag list <key>` | 列出某条目的所有 tags | 查看条目有哪些标签 |
+
+> **两种用法**：`zot tag add/remove/set/list ...` → Tag CRUD；`zot tag <query> [limit]` → 按 tag **搜索**（向后兼容）。Alias: `zot tags <k>` → `tag list <k>`。
+
+### 附件管理 —— 文件上传、查看、替换 (v1.9.0 / v1.11.0)
+
+| 命令 | 说明 | 场景 |
+|---|---|---|
+| `zot attachment add <key> <file> [name]` | 上传本地文件为 attachment | 手动补充离线文件 |
+| `zot attachment list <parent-key>` | 列出父条目下所有子条目（attachment + note） | 查看条目有哪些附件和笔记 |
+| `zot attachment remove <child-key>` | 删除指定子条目（attachment 自动清理 WebDAV） | 删除错误的附件或垃圾 note |
+| `zot attachment update <att-key> <file> [name]` | **原地更新**附件文件内容，保留 attachment key | 归档后离线 HTML 有问题，替换修复后的文件 |
+
+> **典型工作流**：`zot attachment list <parent-key>` → 找到 attachment key → `zot attachment update <att-key> fixed.html`。
+> **Aliases**: `zot attach` / `zot attachments` → `attachment list` | `zot detach` → `attachment remove` | `zot reattach` → `attachment update`
+> **向后兼容**：`zot attach <key> <file>` 仍可用（等同 `attachment add`）
 
 ## 归档工作流
 
@@ -103,10 +132,7 @@ zot tag set <item-key> <tag1> [tag2] ...         # 替换全部 tags（不传 ta
 4. `archive_url` 调用顺序：**域名硬映射 → 多信号评分 → create_misc_subcollection**
 5. 重构 `create_misc_subcollection` 用 `_domain_subcoll_name` + `_fallback_*` 双路径
 6. `_all_collections()`：v1.7.4 SKILL.md 承诺的分页 + 5 分钟缓存 helper 落地（`zot.everything(zot.collections())`）
-7. 新增 `cleanup-empty-collections` CLI 命令（v1.8.0）：扫描所有子 collection，跳过 🙊Personal/📢Public/Misc 根，**自动删除**空 coll（用 raw API 拿 version + If-Unmodified-Since-Version DELETE）
-
-**为什么 `cleanup-empty-collections` 必须存在**：
-v1.7.4 之前空 coll 永久累积（GLOBAL.md 已记 2026-07-06 踩坑），v1.8.0 域名硬映射修复后，**新建 coll 前会先查已存在**，空 coll 不会再被新建；但历史积累的 55 个空 coll 还得手动清。新命令把这件事变成 `zot cleanup-empty-collections` 一行。
+7. 在 v1.8.0 引入了空 collection 批量清理能力（后由 v1.12.0 `zot coll remove <key>` 作为统一的单 collection 删除命令替代）
 
 **典型场景（v1.8.0 验证）**：
 - 微信公众号 → 库内 `Misc--wechat` 命中 → 不再创建中文长名 coll ✓
@@ -241,6 +267,27 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.0.0 — argparse 迁移 + 命令大统一
+
+- **argparse 迁移**：全量替换手写 sys.argv 解析，`zot --help` / `zot item --help` 等各级 help 正常工作
+- **16 个旧命令统一为 5 个 noun**：`item` / `tag` / `coll` / `note` / `attachment`，每个 noun 下共享动词（add/remove/list/search 等）
+- **forbidden subcollection 修复**：`coll list`、`find_best_collection` 等现在递归屏蔽 `🙊Personal` 所有子孙 collection（之前只屏蔽根和一层子节点）
+- **`LIBRARY_TYPE` 环境变量**：支持 `user` / `group` 库类型（`_delete_collection_raw` 之前 hardcode `/users/`）
+- **`search_by_collection` 语义修正**：现在返回匹配的 collection 列表 + item count，而非 collection 内的 items
+- **word-boundary 匹配**：`coll search "pi"` 匹配 `Misc--pi/π` 但不匹配 `pipeline`
+- **`search_emacs` 命令移除**
+- **测试套件**：`tests/` 目录，pytest 集成 + 单元测试
+- **CI/CD**：`.github/workflows/test.yml`（push/PR/tag 自动测试） + `release.yml`（tag push 自动创建 GitHub Release）
+
+### v1.12.0 — 命令统一（共享动词设计）
+
+所有命令统一为 `zot <noun> <verb>` 结构，与 `tag add/remove/set/list` 保持一致：
+- **`item`** 新增：`item add` / `item remove` / `item list` / `item search` / `item archive`（旧 `add` `delete` `list` `search` `archive` 作为 alias 保留）
+- **`note`** 新增：`note add` / `note set`（旧 `addnote` `setnote` 作为 alias 保留）
+- **`attachment`** 新增：`attachment add` / `attachment remove` / `attachment update` / `attachment list`（旧 `attach` `attachments` `detach` `reattach` 作为 alias 保留，`zot attach <k> <f>` 向后兼容）
+- **`coll`** 扩展：`coll list` / `coll remove <key>`（旧 `collections` 作为 alias，`cleanup-empty-collections` 移除）
+- **`tag list`** 新增：等同于旧 `zot tags`
 
 ### v1.11.0 — 附件原地更新（In-place Update）
 
