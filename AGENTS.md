@@ -81,7 +81,7 @@ Context
   zot.update_item(); new zot tags <key> for read
 ```
 
-**Body 模板**（仅在需要解释 why/how 时使用）：
+**Body 模板**（必填 — hook 强制检查 3Cs，subject ≤ 60 chars）：
 
 ```
 Changes
