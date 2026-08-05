@@ -202,3 +202,38 @@ class TestExtForContentType:
 
     def test_unknown_type(self, zot):
         assert zot._ext_for_content_type("application/x-unknown") == "bin"
+
+
+class TestNoPlatformSystemCall:
+    """Regression: IS_WINDOWS must NOT use platform.system().
+
+    platform.system() spawns a subprocess (ver / WMI) on Windows and hangs
+    on Python 3.14. Use sys.platform ("win32"|"linux"|"darwin") instead.
+    """
+
+    def test_no_platform_import(self):
+        """zot.py must not import platform at module level."""
+        import os
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
+        src = open(os.path.join(scripts_dir, "zot.py"), encoding="utf-8").read()
+        # Allow platform in comments/strings only
+        lines = [l for l in src.split("\n")
+                 if not l.strip().startswith("#") and "platform" in l]
+        for line in lines:
+            assert "import platform" not in line, (
+                f"zot.py imports 'platform' — use sys.platform instead:\n  {line.strip()}"
+            )
+
+    def test_is_windows_uses_sys_platform(self):
+        """IS_WINDOWS must derive from sys.platform, not platform.system()."""
+        import os, re
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
+        src = open(os.path.join(scripts_dir, "zot.py"), encoding="utf-8").read()
+        # Check for the correct pattern
+        assert "sys.platform" in src, (
+            "IS_WINDOWS should use sys.platform (not platform.system())"
+        )
+        # platform.system() should never appear
+        assert "platform.system()" not in src, (
+            "platform.system() found in zot.py — hangs on Python 3.14/Windows"
+        )

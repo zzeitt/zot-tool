@@ -8,11 +8,10 @@ import json
 import subprocess
 import html
 import tempfile
-import platform
 from pyzotero import zotero
 from pyzotero._utils import build_url
 
-IS_WINDOWS = platform.system() == "Windows"
+IS_WINDOWS = sys.platform == "win32"
 
 def _get_temp_dir():
     """Get platform-appropriate temp directory"""
@@ -476,17 +475,17 @@ def search_by_collection(collection_name):
         print(f"     🔑 {ck}  |  📦 {len(visible)} items\n")
 
 def search_by_tag(tag, limit=10):
-    """Search items by tag"""
+    """Search items by tag using native Zotero API tag filter.
+
+    Uses zot.items(tag=...) which hits the server-side tag index,
+    avoiding a full library scan + client-side filter.
+    """
     forbidden = get_forbidden_items()
-    all_items = zot.items(limit=100)
+    all_items = zot.items(tag=tag, limit=200)
     
     results = []
     for item in all_items:
-        if item['key'] in forbidden:
-            continue
-        data = item.get('data', {})
-        tags = [t.get('tag', '').lower() for t in data.get('tags', [])]
-        if tag.lower() in tags:
+        if item['key'] not in forbidden:
             results.append(item)
         if len(results) >= limit:
             break
@@ -2445,7 +2444,6 @@ _ALIAS_MAP = {
     "attachments": ["attachment", "list"],
     "detach":      ["attachment", "remove"],
     "reattach":    ["attachment", "update"],
-    "attach":      ["attachment", "add"],
 }
 
 
@@ -2454,9 +2452,10 @@ def _resolve_aliases(argv):
 
     Handles:
       - Static aliases (search → item search, tags → tag list, ...)
-      - attach <key> <file> → attachment add <key> <file> (backward compat)
       - tag <query> → tag search <query> (backward compat)
       - coll <name> → coll search <name> (backward compat)
+      - attach <subcmd> → attachment <subcmd> (pass-through subcommand)
+      - attach <key> <file> → attachment add <key> <file> (backward compat)
     """
     if len(argv) < 2:
         return argv
@@ -2482,6 +2481,16 @@ def _resolve_aliases(argv):
         if sub not in ("list", "remove", "search", "-h", "--help"):
             argv = [argv[0], "coll", "search"] + tail
             return argv
+
+    # attach <non-subcommand> → attachment add <key> <file> [name]
+    if cmd == "attach":
+        if not tail:
+            return [argv[0], "attachment"]
+        sub = tail[0]
+        if sub in ("add", "remove", "update", "list", "-h", "--help"):
+            return [argv[0], "attachment"] + tail
+        else:
+            return [argv[0], "attachment", "add"] + tail
 
     return argv
 

@@ -51,11 +51,11 @@ if ! echo "$SUBJECT" | grep -qE "$PATTERN"; then
 fi
 
 # -----------------------------------------------------------------------
-# Rule 2: Subject length ≤ 50 characters
+# Rule 2: Subject length ≤ 60 characters
 # -----------------------------------------------------------------------
 SUBJ_LEN=$(echo -n "$SUBJECT" | wc -c)
-if [ "$SUBJ_LEN" -gt 50 ]; then
-    echo -e "${RED}[BLOCKED] Subject too long: ${SUBJ_LEN}/50 chars.${NC}"
+if [ "$SUBJ_LEN" -gt 60 ]; then
+    echo -e "${RED}[BLOCKED] Subject too long: ${SUBJ_LEN}/60 chars.${NC}"
     echo -e "  ${YELLOW}$SUBJECT${NC}"
     VIOLATIONS=$((VIOLATIONS + 1))
 fi
@@ -97,13 +97,34 @@ while IFS= read -r line; do
 done < <(tail -n +3 "$MSG_FILE")
 
 # -----------------------------------------------------------------------
+# Rule 6: 3Cs sections — Changes, Context, Considerations
+# -----------------------------------------------------------------------
+MISSING_3CS=""
+for section in "Changes" "Context" "Considerations"; do
+    if ! echo "$BODY" | grep -qE "^${section}$"; then
+        MISSING_3CS="$MISSING_3CS  $section"
+    fi
+done
+if [ -n "$MISSING_3CS" ]; then
+    echo -e "${RED}[BLOCKED] Missing 3Cs section(s):${MISSING_3CS}${NC}"
+    echo -e "  ${YELLOW}Body must contain:${NC}"
+    echo -e "    ${GREEN}Changes${NC}"
+    echo -e "    ${GREEN}-------${NC}"
+    echo -e "    ${GREEN}Context${NC}"
+    echo -e "    ${GREEN}-------${NC}"
+    echo -e "    ${GREEN}Considerations${NC}"
+    echo -e "    ${GREEN}--------------${NC}"
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+# -----------------------------------------------------------------------
 # Result
 # -----------------------------------------------------------------------
 if [ "$VIOLATIONS" -gt 0 ]; then
     echo ""
     echo -e "${RED}Commit blocked: $VIOLATIONS format violation(s).${NC}"
     echo -e "Expected format:"
-    echo -e "  ${GREEN}type(scope): subject          ← ≤ 50 chars, no trailing .!?;${NC}"
+    echo -e "  ${GREEN}type(scope): subject          ← ≤ 60 chars, no trailing .!?;${NC}"
     echo -e "  ${GREEN}                                ← blank line${NC}"
     echo -e "  ${GREEN}Body paragraph...              ← ≤ 72 chars/line${NC}"
     echo ""
