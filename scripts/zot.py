@@ -286,6 +286,12 @@ def _fix_wechat_html(filepath):
 # Cache forbidden collections (root + all descendants) and items
 _forbidden_collection_keys = None
 _forbidden_item_keys = None
+# Last saved offline file path — consumed by _create_content_note for LLM summarization
+_last_offline_file = None
+
+# Sentinel returned by _llm_summarize when the Claude/agent path is taken
+# (minis-model-use not available → pending task file written for agent to process)
+_LLM_PENDING = object()
 
 
 def _get_forbidden_collection_keys():
@@ -1116,6 +1122,8 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
+    global _last_offline_file
+    _last_offline_file = tmp_html
 
     # v1.8.1: fix WeChat MP articles whose content is hidden by JS-dependent styles
     try:
@@ -1250,8 +1258,8 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
         print(f"⚠️  WebDAV PROP upload warning: {e}")
         return None
 
-    # 6. 清理临时文件
-    for f in [tmp_file_path, zip_path]:
+    # 6. 清理临时 ZIP 文件（原始文件由调用方负责清理）
+    for f in [zip_path]:
         try:
             os.remove(f)
         except OSError:
@@ -1675,6 +1683,9 @@ def archive_binary_url(url, item_key, content_type, filename_hint=None, title_hi
     if not _download_binary(url, tmp_path):
         return None
 
+    global _last_offline_file
+    _last_offline_file = tmp_path
+
     return save_file_attachment(
         file_path=tmp_path,
         parent_item_key=item_key,
@@ -1827,7 +1838,30 @@ def _md_to_html_one_line(text):
     return text
 
 
-def _llm_summarize(title, description, item_type, url):
+def _write_pending_summary(title, source_text, item_type, url, parent_key):
+    """Write a pending note-summary task for the Claude/agent to process.
+
+    Called when minis-model-use is not available but we're in an agent
+    environment.  The agent picks up the task file, reads source_text,
+    generates an HTML note, and calls ``zot note set <key>``.
+    """
+    task = {
+        "title": title,
+        "source_text": source_text,
+        "item_type": item_type,
+        "url": url,
+        "parent_key": parent_key,
+    }
+    task_dir = os.path.join(_get_temp_dir(), "zot_pending")
+    os.makedirs(task_dir, exist_ok=True)
+    task_file = os.path.join(task_dir, f"note_{parent_key}.json")
+    with open(task_file, "w", encoding="utf-8") as f:
+        json.dump(task, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] _llm_summarize: wrote pending note task to {task_file}")
+    return task_file
+
+
+def _llm_summarize(title, description, item_type, url, offline_path=None, parent_key=None):
     """通过 minis-model-use CLI 调用配置的 LLM 生成中文摘要
 
     调用方式：
@@ -1839,11 +1873,49 @@ def _llm_summarize(title, description, item_type, url):
       - 无 description：基于标题+URL 推断的"预期内容指南"，避免 prompt 回声
 
     若未配置模型或调用失败，返回 None 并降级到规则生成。
-    """
-    has_desc = bool(description and description.strip())
 
-    if has_desc:
-        # Full mode: 5 段式 rich 摘要（参照 /summarize skill 的输出结构）
+    Args:
+        offline_path: 离线保存的 HTML 文件路径，若提供则读取正文内容替代 meta description
+        parent_key:   Zotero item key（仅 Claude/agent 路径需要，用于异步生成 note）
+    """
+    import shutil
+
+    # ── Source selection: offline HTML > curl metadata ──
+    source_text = ""
+    source_label = ""
+
+    # 1) Try offline file first (full article content)
+    if offline_path and os.path.exists(offline_path):
+        try:
+            with open(offline_path, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+            if offline_path.endswith((".html", ".htm")):
+                import re as _re
+                text = _re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=_re.DOTALL | _re.IGNORECASE)
+                text = _re.sub(r"<style[^>]*>.*?</style>", "", text, flags=_re.DOTALL | _re.IGNORECASE)
+                text = _re.sub(r"<[^>]+>", " ", text)
+                text = _re.sub(r"\s+", " ", text).strip()
+                source_text = text[:4000]
+            else:
+                source_text = raw[:2000]
+            if source_text:
+                source_label = "离线正文（前 4000 字）"
+                print(f"[INFO] _llm_summarize: read {len(source_text)} chars from offline file")
+        except Exception as e:
+            print(f"[WARN] _llm_summarize: failed to read offline file: {e}", file=sys.stderr)
+
+    # 2) Fallback: curl metadata
+    if not source_text:
+        if description and description.strip():
+            source_text = description[:2000]
+            source_label = "页面 meta description"
+        else:
+            source_text = ""
+            source_label = ""
+
+    has_source = bool(source_text)
+
+    if has_source:
         prompt = f"""你是中文内容摘要助手。请根据以下内容生成结构化中文摘要，用**纯 HTML 格式**输出（不是 markdown！）：
 
 <h3>📋 基本信息</h3>
@@ -1867,16 +1939,15 @@ def _llm_summarize(title, description, item_type, url):
 <h3>🔍 延伸方向</h3>
 <p>（2-3 个深入阅读方向，帮助读者决定是否要展开研究）</p>
 
----下面是待摘要的内容---
+---下面是待摘要的内容（来源：{source_label}）---
 **标题**：{title}
 **类型**：{item_type}
 **URL**：{url}
-**描述/摘要**：
-{description[:2000] if description else "(无详细描述)"}
+**内容**：
+{source_text}
 """
     else:
-        # Fallback mode: 无 meta description 时基于标题+URL 推断
-        # 避免完全跳过 LLM（v1.8.2 之前的行为是"desc 空就跳过 LLM 给两行 URL 垃圾 note"）
+        # No source at all — title/URL only
         prompt = f"""你是中文内容摘要助手。原始页面未提供 meta description，请基于标题、类型、URL 推断内容，生成"预期内容指南"。
 
 用**纯 HTML 格式**输出（不是 markdown！）：
@@ -1901,88 +1972,102 @@ def _llm_summarize(title, description, item_type, url):
 **URL**：{url}
 **描述/摘要**：（无 meta description 可用，请基于标题和 URL 推断）
 """
-    try:
-        # 获取可用的模型
-        list_res = subprocess.run(
-            ["minis-model-use", "list", "--compact"],
-            capture_output=True, text=True, timeout=10
-        )
-        if list_res.returncode != 0:
-            print(f"[WARN] _llm_summarize: minis-model-use list failed (rc={list_res.returncode}): {list_res.stderr[:200]}", file=sys.stderr)
-            return None
-        list_data = json.loads(list_res.stdout)
-        models = list_data.get("data", {}).get("models", [])
-        if not models:
-            print(f"[WARN] _llm_summarize: no models available from minis-model-use list", file=sys.stderr)
-            return None
-        # 优先选 M2.5（更快），fallback 到第一个
-        model_id = next(
-            (m.get("model_id") for m in models if "2.5" in m.get("model_id", "")),
-            models[0].get("model_id")
-        ) or "gpt-4o"
-
-        # 调用 LLM（minis-model-use run 需要 --input <path>）
-        input_obj = {
-            "messages": [{"role": "user", "content": prompt}]
-        }
-        tmp = os.path.join(_get_temp_dir(), f"zot_llm_{os.getpid()}.json")
-        with open(tmp, "w") as f:
-            json.dump(input_obj, f, ensure_ascii=False)
+    # ── Backend dispatch: minis-model-use vs Claude/agent ──
+    if shutil.which("minis-model-use"):
         try:
-            result = subprocess.run(
-                ["minis-model-use", "run",
-                 "--model", model_id,
-                 "--input", tmp],
-                capture_output=True, text=True, timeout=120
+            # 获取可用的模型
+            list_res = subprocess.run(
+                ["minis-model-use", "list", "--compact"],
+                capture_output=True, text=True, timeout=10
             )
-        finally:
-            try: os.remove(tmp)
-            except: pass
-        if result.returncode != 0 or not result.stdout.strip():
-            print(f"[WARN] _llm_summarize: minis-model-use run failed (rc={result.returncode}); stdout={result.stdout[:100]!r} stderr={result.stderr[:100]!r}", file=sys.stderr)
-            return None
-        res_data = json.loads(result.stdout)
-        if not res_data.get("ok"):
-            print(f"[WARN] _llm_summarize: minis-model-use run returned ok=False; response={str(res_data)[:200]}", file=sys.stderr)
-            return None
-        content = res_data.get("data", {}).get("output_text", "")
-        # Strip MiniMax think tags using the closing </think> XML tag as anchor.
-        # M2.5 format: <think>\n...\n<\/think>\n\nACTUAL_OUTPUT
-        # M2.7 format: <think>...\n<\/think>\n\nACTUAL_OUTPUT
-        # We split on the closing tag + newline(s) boundary, keeping everything after it.
-        # Using </think> as the delimiter avoids false-positives from bare \n\n in content.
-        think_close = "</think>"
-        if think_close in content:
-            idx = content.rfind(think_close)
-            after = content[idx + len(think_close):]
-            # skip trailing newlines/whitespace then split on first meaningful \n\n
-            after = after.lstrip("\n ")
-            if after.startswith("\n"):
-                content = after.lstrip("\n").strip()
+            if list_res.returncode != 0:
+                print(f"[WARN] _llm_summarize: minis-model-use list failed (rc={list_res.returncode}): {list_res.stderr[:200]}", file=sys.stderr)
+                return None
+            list_data = json.loads(list_res.stdout)
+            models = list_data.get("data", {}).get("models", [])
+            if not models:
+                print(f"[WARN] _llm_summarize: no models available from minis-model-use list", file=sys.stderr)
+                return None
+            # 优先选 M2.5（更快），fallback 到第一个
+            model_id = next(
+                (m.get("model_id") for m in models if "2.5" in m.get("model_id", "")),
+                models[0].get("model_id")
+            ) or "gpt-4o"
+
+            # 调用 LLM（minis-model-use run 需要 --input <path>）
+            input_obj = {
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            tmp = os.path.join(_get_temp_dir(), f"zot_llm_{os.getpid()}.json")
+            with open(tmp, "w") as f:
+                json.dump(input_obj, f, ensure_ascii=False)
+            try:
+                result = subprocess.run(
+                    ["minis-model-use", "run",
+                     "--model", model_id,
+                     "--input", tmp],
+                    capture_output=True, text=True, timeout=120
+                )
+            finally:
+                try: os.remove(tmp)
+                except: pass
+            if result.returncode != 0 or not result.stdout.strip():
+                print(f"[WARN] _llm_summarize: minis-model-use run failed (rc={result.returncode}); stdout={result.stdout[:100]!r} stderr={result.stderr[:100]!r}", file=sys.stderr)
+                return None
+            res_data = json.loads(result.stdout)
+            if not res_data.get("ok"):
+                print(f"[WARN] _llm_summarize: minis-model-use run returned ok=False; response={str(res_data)[:200]}", file=sys.stderr)
+                return None
+            content = res_data.get("data", {}).get("output_text", "")
+            # Strip MiniMax think tags using the closing </think> XML tag as anchor.
+            # M2.5 format: <think>\n...\n<\/think>\n\nACTUAL_OUTPUT
+            # M2.7 format: <think>...\n<\/think>\n\nACTUAL_OUTPUT
+            # We split on the closing tag + newline(s) boundary, keeping everything after it.
+            # Using </think> as the delimiter avoids false-positives from bare \n\n in content.
+            think_close = "</think>"
+            if think_close in content:
+                idx = content.rfind(think_close)
+                after = content[idx + len(think_close):]
+                # skip trailing newlines/whitespace then split on first meaningful \n\n
+                after = after.lstrip("\n ")
+                if after.startswith("\n"):
+                    content = after.lstrip("\n").strip()
+                else:
+                    content = after.strip()
             else:
-                content = after.strip()
-        else:
-            content = content.strip()
-        if not content:
-            print("[WARN] _llm_summarize: LLM returned empty content after stripping think tags", file=sys.stderr)
+                content = content.strip()
+            if not content:
+                print("[WARN] _llm_summarize: LLM returned empty content after stripping think tags", file=sys.stderr)
+                return None
+            # If LLM echoed the prompt back, discard
+            if "\u4e0b\u9762\u662f\u5f85\u6458\u8981\u7684\u5185\u5bb9" in content:
+                print("[WARN] _llm_summarize: LLM echoed prompt back; dropping output", file=sys.stderr)
+                return None
+            # If output is markdown (not HTML), convert to HTML
+            if not content.lstrip().startswith("<") and not content.lstrip().startswith("<h"):
+                content = _md_to_html(content)
+            return content
+        except Exception as e:
+            print(f"[WARN] _llm_summarize: unexpected exception {type(e).__name__}: {e}", file=sys.stderr)
             return None
-        # If LLM echoed the prompt back, discard
-        if "\u4e0b\u9762\u662f\u5f85\u6458\u8981\u7684\u5185\u5bb9" in content:
-            print("[WARN] _llm_summarize: LLM echoed prompt back; dropping output", file=sys.stderr)
-            return None
-        # If output is markdown (not HTML), convert to HTML
-        if not content.lstrip().startswith("<") and not content.lstrip().startswith("<h"):
-            content = _md_to_html(content)
-        return content
-    except Exception as e:
-        print(f"[WARN] _llm_summarize: unexpected exception {type(e).__name__}: {e}", file=sys.stderr)
+    elif parent_key and url:
+        # Claude / agent path: write pending task file so the agent
+        # can asynchronously read the content, generate an HTML note,
+        # and call `zot note set <key>`.
+        _write_pending_summary(title, source_text, item_type, url, parent_key)
+        return _LLM_PENDING
+    else:
+        print("[WARN] _llm_summarize: minis-model-use not found in PATH; skipping LLM summarization", file=sys.stderr)
         return None
 
 
-def _create_content_note(url, title, item_type, parent_key):
+def _create_content_note(url, title, item_type, parent_key, offline_path=None):
     """生成内容提纲 Note（中文）
 
     优先调用 LLM 生成高质量中文摘要；无 LLM 时使用规则降级生成。
+
+    Args:
+        offline_path: 离线保存的文件路径（HTML/PDF），LLM 可读取其内容生成更准确的摘要
     """
     url_lower = url.lower()
 
@@ -2005,9 +2090,12 @@ def _create_content_note(url, title, item_type, parent_key):
             hn_desc += f"\n\n热门评论：\n{comments_text}"
 
         # 尝试 LLM 生成
-        summary = _llm_summarize(title, hn_desc, "HN 热议帖子", url)
+        summary = _llm_summarize(title, hn_desc, "HN 热议帖子", url, offline_path=offline_path, parent_key=parent_key)
 
-        if summary:
+        if summary is _LLM_PENDING:
+            print("📝 HN note generation queued for Claude/agent")
+            return
+        elif summary:
             note_text = f'<h3>📝 HN 热议速览</h3>\n\n{summary}'
         else:
             # 降级：规则生成
@@ -2040,9 +2128,12 @@ def _create_content_note(url, title, item_type, parent_key):
 
     # v1.8.3：无论 desc 是否为空，都尝试调 LLM（之前 desc 为空时直接跳过 LLM
     # 输出"两行 URL"的垃圾 note）。_llm_summarize 内部已支持空 desc 模式。
-    summary = _llm_summarize(title, desc, item_type, url)
+    summary = _llm_summarize(title, desc, item_type, url, offline_path=offline_path, parent_key=parent_key)
 
-    if summary:
+    if summary is _LLM_PENDING:
+        print("📝 Note generation queued for Claude/agent")
+        return
+    elif summary:
         note_text = f'<h3>📝 {title[:60]}...</h3>\n\n{summary}'
     else:
         print(f"[WARN] _create_content_note: _llm_summarize returned None for {url!r}; falling back to rule-based generation (LLM failure — check stderr above for details)", file=sys.stderr)
@@ -2298,8 +2389,16 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         if save_offline:
             save_offline_copy(url, item_key, title_hint=title)
 
-        # 生成内容提纲 Note
-        _create_content_note(url, title, item_type, item_key)
+        # 生成内容提纲 Note（传递离线文件路径供 LLM 阅读附件内容）
+        offline_path = _last_offline_file if save_offline else None
+        _create_content_note(url, title, item_type, item_key, offline_path=offline_path)
+
+        # 离线文件已用于 LLM 摘要，清理 temp 文件
+        if offline_path and os.path.exists(offline_path):
+            try:
+                os.remove(offline_path)
+            except OSError:
+                pass
 
         return item_key
     else:

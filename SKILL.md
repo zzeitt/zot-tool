@@ -107,6 +107,61 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
    - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
 9. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
 
+### Note 生成：双后端分发（v2.1.0）
+
+`zot item archive` 完成后自动生成内容摘要 Note。后端分两种情况：
+
+| 后端 | 触发条件 | 行为 |
+|------|---------|------|
+| **minis-model-use** | CLI 在 PATH 中 | 直接调 LLM API，同步生成 HTML note 写入 Zotero |
+| **Claude/Agent** | minis-model-use 不可用 | 写 pending JSON 到 `$TEMP/zot_pending/note_{key}.json`，**由 AI 异步处理** |
+
+**Claude/Agent 路径处理流程**（AI 必做）：
+
+1. `zot item archive` 输出 `📝 Note generation queued for Claude/agent` 后，检查 `zot_pending/` 目录
+2. 读取每个 `note_*.json` 文件，获取 `title`、`source_text`、`item_type`、`url`、`parent_key`
+3. 根据内容生成结构化中文 HTML note（模板见下），调用 `zot note set <parent_key> "<html>"`
+4. 删除 pending JSON 文件，清理空目录
+
+**源内容优先级**（`_llm_summarize` 内部）：
+1. **离线 HTML 正文**（monolith 抓取的完整文章，去标签取前 4000 字）
+2. **curl meta description**（页面 `<meta name="description">`，前 2000 字）
+3. **标题 + URL only**（无任何内容时的推断模式）
+
+**Note HTML 模板**（AI 生成时参照）：
+
+```html
+<h3>📋 基本信息</h3>
+<p><strong>标题</strong>：{title}</p>
+<p><strong>类型</strong>：{item_type}</p>
+<p><strong>URL</strong>：{url}</p>
+
+<h3>🎯 核心结论</h3>
+<p>（2-4 句话高度概括核心主张）</p>
+
+<h3>📝 主要观点</h3>
+<ol>
+<li>…</li>
+</ol>
+
+<h3>💡 值得关注的信息</h3>
+<p>（1-3 条容易忽略的信号）</p>
+
+<h3>🔍 延伸方向</h3>
+<p>（2-3 个深入阅读方向）</p>
+```
+
+> **注意**：当 source_text 为空时（极少见），使用"预期内容指南"模式——基于标题+URL+平台类型推断，而非胡编内容。
+
+### 离线 HTML 正文提取（v2.1.0）
+
+`_llm_summarize` 现在优先读取 monolith 离线 HTML 作为摘要源：
+- 打开 `_last_offline_file`（由 `save_offline_copy` / `archive_binary_url` 设置）
+- 去除 `<script>` / `<style>` / HTML 标签，合并空白
+- 取前 4000 字符传给 LLM（覆盖绝大多数文章的核心段落）
+
+相比旧版只用 meta description（通常 ≤ 200 字符），离线正文能提供 20 倍以上的内容信号，让 LLM 摘要更准确。
+
 ### Cloudflare 反爬场景处理（v1.7.1+）
 - **问题**：部分网站（如 johndcook.com）用 Cloudflare 拦截 curl user-agent，导致 `fetch_url_metadata` 拿到 "Attention Required" 页面，description 为空
 - **检测**：v1.7.1 在 `fetch_url_metadata` 里检查 `Attention Required` / `cf-error-code` 等关键字，标记 `cf_blocked: true`
