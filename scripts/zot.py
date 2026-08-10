@@ -8,6 +8,7 @@ import json
 import subprocess
 import html
 import tempfile
+from urllib.parse import urlparse
 from pyzotero import zotero
 from pyzotero._utils import build_url
 
@@ -96,19 +97,33 @@ _COLLECTIONS_CACHE_TTL = 300  # seconds
 def _domain_subcoll_name(url):
     """从 URL 提取已知平台的子集合名。未命中返回 None。
 
+    使用 netloc 后缀匹配，支持子域名（如 news.ycombinator.com → ycombinator.com）。
+    要求 '.' 边界，避免 'notgithub.com' 误匹配 'github.com' 这类 substring bug。
+
     Examples:
         >>> _domain_subcoll_name("https://mp.weixin.qq.com/s/abc?scene=334")
         'wechat'
-        >>> _domain_subcoll_name("https://github.com/zzeitt/zot-tool")
-        'github'
+        >>> _domain_subcoll_name("https://news.ycombinator.com/item?id=12345")
+        'hn'
+        >>> _domain_subcoll_name("https://www.bilibili.com/video/BV1xx")
+        'bilibili'
         >>> _domain_subcoll_name("https://example.com/post/123")
+        None
+        >>> _domain_subcoll_name("https://notgithub.com/evil")  # substring 假阳性
         None
     """
     if not url:
         return None
-    url_lower = url.lower()
-    for dom, sub in DOMAIN_TO_SUBCOLL.items():
-        if dom in url_lower:
+    try:
+        netloc = urlparse(url.lower()).netloc
+    except (ValueError, AttributeError):
+        return None
+    if not netloc:
+        return None
+    # 按域名长度降序遍历，更具体的域名先匹配
+    # (e.g. "mp.weixin.qq.com" 应在 "weixin.qq.com" 之前命中)
+    for dom, sub in sorted(DOMAIN_TO_SUBCOLL.items(), key=lambda x: -len(x[0])):
+        if netloc == dom or netloc.endswith("." + dom):
             return sub
     return None
 

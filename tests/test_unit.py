@@ -52,6 +52,55 @@ class TestDomainSubcollName:
         assert zot._domain_subcoll_name("") is None
         assert zot._domain_subcoll_name(None) is None
 
+    @pytest.mark.parametrize("url,expected", [
+        # HN: news.* subdomains + the parent domain
+        ("https://news.ycombinator.com/item?id=12345", "hn"),
+        ("https://ycombinator.com/item?id=12345", "hn"),
+        # GitHub: gist, api, raw subdomains
+        ("https://gist.github.com/user/abc123", "github"),
+        ("https://api.github.com/repos/foo/bar", "github"),
+        # YouTube: m, music subdomains
+        ("https://m.youtube.com/watch?v=abc", "youtube"),
+        ("https://music.youtube.com/watch?v=abc", "youtube"),
+        # Wikipedia: en, zh subdomains
+        ("https://en.wikipedia.org/wiki/Python", "wikipedia"),
+        ("https://zh.wikipedia.org/wiki/Python", "wikipedia"),
+        # WeChat: only mp. + main (not subdomain of each other)
+        ("https://mp.weixin.qq.com/s/abc", "wechat"),
+        ("https://weixin.qq.com/abc", "wechat"),
+        # Bilibili: www subdomain
+        ("https://www.bilibili.com/video/BV1xx", "bilibili"),
+        # Stack Overflow: subdomain
+        ("https://subdomain.stackoverflow.com/q/123", "stackoverflow"),
+    ])
+    def test_subdomain_matching(self, zot, url, expected):
+        """Subdomains should match the parent domain in DOMAIN_TO_SUBCOLL."""
+        assert zot._domain_subcoll_name(url) == expected
+
+    @pytest.mark.parametrize("url", [
+        # substring 假阳性场景（修复前会误匹配）
+        "https://notgithub.com/evil",           # 不 endswith .github.com
+        "https://evil-github.com/x",            # 域名里含 "github.com" 但不是子域
+        "https://github.com.attacker.com/x",    # endswith .attacker.com 不 .github.com
+        "https://notwikipedia.org/page",        # substring 包含 wikipedia.org
+        "https://fakearxiv.org/abs/1234",       # 包含 arxiv.org 但不是 .arxiv.org
+        "https://badstackoverflow.com/q",       # 包含 stackoverflow.com 但不 .stackoverflow.com
+    ])
+    def test_substring_false_positives(self, zot, url):
+        """substring 假阳性场景必须返回 None（旧实现会误匹配）."""
+        assert zot._domain_subcoll_name(url) is None, \
+            f"Should not match: {url}"
+
+    def test_length_preference_more_specific_first(self, zot):
+        """More specific (longer) domain entries win on ties."""
+        # mp.weixin.qq.com (16 chars) vs weixin.qq.com (13 chars)
+        # mp.weixin.qq.com 是更具体的条目，应优先匹配
+        assert zot._domain_subcoll_name(
+            "https://mp.weixin.qq.com/s/abc") == "wechat"
+        # weixin.qq.com 自己单独匹配
+        assert zot._domain_subcoll_name(
+            "https://weixin.qq.com/abc") == "wechat"
+
 
 class TestWechatUrlDetection:
     """_is_wechat_url() detection."""
