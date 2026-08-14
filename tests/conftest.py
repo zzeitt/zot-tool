@@ -192,6 +192,39 @@ def zot_mod(test_env, setup_collections):
     return zot_module
 
 
+@pytest.fixture(scope="module")
+def zot():
+    """Import zot.py with dummy env vars (no API access).
+
+    For pure-logic tests (URL detection, emoji mapping, image compression).
+    zot.py's module-level code only needs these vars to exist; the Zotero
+    client is lazy and makes no calls until used.
+    """
+    scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    saved = {}
+    overrides = {
+        "ZOTERO_API_KEY": "dummy-key",
+        "ZOTERO_LIBRARY_ID": "000000",
+        "ZOTERO_FORBIDDEN_COLLECTION": "DUMMYFORBIDDEN",
+        "ZOTERO_MISC_COLLECTION": "DUMMYMISC",
+    }
+    for k, v in overrides.items():
+        saved[k] = os.environ.get(k)
+        os.environ[k] = v
+
+    import zot as zot_module
+    yield zot_module
+
+    for k, orig in saved.items():
+        if orig is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = orig
+
+
 @pytest.fixture(scope="session")
 def api_client(test_env, setup_collections):
     """Raw pyzotero client for API-level verification in tests."""
