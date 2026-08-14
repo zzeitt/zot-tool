@@ -11,6 +11,7 @@ import tempfile
 from urllib.parse import urlparse
 from pyzotero import zotero
 from pyzotero._utils import build_url
+import httpx
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -54,6 +55,10 @@ if LIBRARY_TYPE not in ("user", "group"):
     print(f"Error: ZOTERO_LIBRARY_TYPE must be 'user' or 'group', got '{LIBRARY_TYPE}'")
     sys.exit(1)
 zot = zotero.Zotero(LIBRARY_ID, LIBRARY_TYPE, API_KEY)
+# httpx 默认超时仅 5s，写大 note（内嵌 base64 图，可达 MB 级）会抛
+# WriteTimeout: The write operation timed out。放宽 write/read；connect/pool
+# 保持较短以便网络异常时快速失败。
+zot.client.timeout = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1154,6 +1159,175 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
         return _save_local_with_note(tmp_html, parent_item_key, url, filename)
 
 
+# ---------------------------------------------------------------------------
+# v2.1.0 — Image compression
+# ---------------------------------------------------------------------------
+# 两条路径共用同一压缩核心（_compress_image_bytes 压单图、_compress_images_in_html
+# 压 HTML 内嵌图），只有参数/入口不同：
+#   - 附件上传（防爆）：_prep_upload_file 单次压到 1920/q80，限制 WebDAV 体积。
+#   - note 写入（激进）：_fit_note_under_limit 阶梯压到 ≤ _NOTE_MAX_BYTES。
+
+_IMAGE_MAX_DIM = int(os.environ.get("ZOTERO_IMAGE_MAX_DIM", "1920"))
+_IMAGE_QUALITY = int(os.environ.get("ZOTERO_IMAGE_QUALITY", "80"))
+_HTML_EXTS = {".html", ".htm"}
+_RASTER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+
+def _compress_image_bytes(data, max_dim=None, quality=None, as_jpeg=False):
+    """压缩单张图片（bytes → bytes），无收益或失败时返回原始 bytes。
+
+    策略：最长边 > max_dim 时等比例缩放到 max_dim（LANCZOS）；
+    JPEG 按 quality 重编码；PNG/WebP 保留格式；动画 GIF/其他格式跳过。
+    as_jpeg=True 时无损格式（PNG/WebP 等）转 JPEG（有损）——note 体积预算需要。
+    Pillow 为软依赖——未安装或任何异常都静默回退原图，绝不阻断归档。
+    max_dim/quality 缺省回落到全局 _IMAGE_MAX_DIM/_IMAGE_QUALITY（附件路径行为不变）。
+    """
+    if max_dim is None:
+        max_dim = _IMAGE_MAX_DIM
+    if quality is None:
+        quality = _IMAGE_QUALITY
+    import io
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        fmt = img.format
+        if getattr(img, "n_frames", 1) > 1:
+            return data  # 动画图——绝不压成静态
+        w, h = img.size
+        longest = max(w, h)
+        if longest > max_dim:
+            scale = max_dim / longest
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+            img = img.resize((int(w * scale), int(h * scale)), resample)
+        out = io.BytesIO()
+        if as_jpeg:
+            # note 路径：统一转 JPEG（有损）——照片类 PNG 截图无损压不动
+            img.convert("RGB").save(out, "JPEG", quality=quality, optimize=True)
+        elif fmt == "JPEG":
+            img.convert("RGB").save(out, "JPEG", quality=quality, optimize=True)
+        elif fmt == "PNG":
+            img.save(out, "PNG", optimize=True)
+        elif fmt == "WEBP":
+            img.save(out, "WEBP", quality=quality)
+        else:
+            return data  # GIF/BMP/其他——跳过
+        compressed = out.getvalue()
+        return compressed if len(compressed) < len(data) else data
+    except Exception:
+        return data
+
+
+def _compress_images_in_html(html, max_dim=None, quality=None, as_jpeg=False):
+    """压缩 HTML 字符串内嵌的 base64 图片，返回 (new_html, changed)。纯函数。
+
+    只处理 ``src="data:image/...;base64,..."``：解码 → 压缩 → 重编码回 base64。
+    外部 URL 图不处理——附件由 monolith 内联、note 由 org 内联，均已是 base64。
+    无净收益或失败时返回原字符串。max_dim/quality/as_jpeg 透传给 _compress_image_bytes。
+    """
+    import base64 as b64
+
+    if "<img" not in html:
+        return html, False
+
+    changed = False
+
+    # org 导出会把 base64 按 76 字符换行(CRLF)，所以字符类里必须含 \s，
+    # 解码前再剥掉换行/空白——否则只匹配首行、解出截断的图、压缩成空操作。
+    def _replace(m):
+        nonlocal changed
+        data = b64.b64decode(re.sub(r'\s+', '', m.group(2)))
+        compressed = _compress_image_bytes(data, max_dim=max_dim, quality=quality, as_jpeg=as_jpeg)
+        if len(compressed) >= len(data):
+            return m.group(0)  # 无收益，保留原样
+        changed = True
+        # 输出格式确定：as_jpeg 恒为 jpeg；否则格式保留（JPEG/PNG/WebP 原样）
+        subtype = "jpeg" if as_jpeg else m.group(1).lower().replace("jpg", "jpeg")
+        return f'data:image/{subtype};base64,{b64.b64encode(compressed).decode("ascii")}'
+
+    html = re.sub(
+        r'data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)',
+        _replace, html
+    )
+
+    return html, changed
+
+
+# note 体积预算：Zotero 单条 note 上限约 375KB（超出返回 HTTP 413），留安全余量。
+# 只有 note 有这限制（WebDAV HTML 附件没有），所以阶梯压缩只用于 note 路径。
+_NOTE_MAX_BYTES = 350_000
+_NOTE_IMAGE_STEPS = (
+    (1280, 70),
+    (1024, 60),
+    (896, 60),
+    (768, 55),
+    (640, 50),
+)
+
+
+def _fit_note_under_limit(html):
+    """把 note 内嵌图压到 ≤ _NOTE_MAX_BYTES，并去掉 width/height 属性。
+
+    先无损（保格式）逐级缩放；照片类 PNG 无损压不动，再转 JPEG（有损）；
+    仍超限时去掉 <img>（图已在 HTML 附件里），硬保证 note 体积不超上限——
+    否则会被 Zotero 以 413 静默拒绝。
+
+    org 的 ``#+attr_html: :width 80%`` 导出为 ``width="80%"``，Zotero 提取内嵌图为
+    附件时会丢 ``%`` 变成 ``width="80"``（80px），导致图在 note 里极小；故统一去掉
+    width/height，让 Zotero 按自然尺寸渲染（配合 max-width:100% 自适应）。
+    """
+    compressed = None
+    for as_jpeg in (False, True):
+        for max_dim, quality in _NOTE_IMAGE_STEPS:
+            new_html, _ = _compress_images_in_html(html, max_dim=max_dim, quality=quality, as_jpeg=as_jpeg)
+            if len(new_html) <= _NOTE_MAX_BYTES:
+                compressed = new_html
+                break
+        if compressed is not None:
+            break
+    html = compressed if compressed is not None else re.sub(r'<img[^>]*>', ' [图片] ', html)
+    return re.sub(r'<img[^>]*>', lambda m: re.sub(r'\s(?:width|height)="[^"]*"', '', m.group(0)), html)
+
+
+def _prep_upload_file(src_path):
+    """预处理待上传附件，返回 (upload_path, cleanup_path)。
+
+    HTML（内嵌 base64 图）和单独图片文件（.jpg/.png/.webp 等）会被压缩；
+    其他二进制（PDF/EPUB/ZIP 等）跳过。cleanup_path 非 None 时表示生成了
+    临时文件，调用方需在上传完成后删除。压缩无收益或失败时返回原路径。
+    """
+    ext = os.path.splitext(src_path)[1].lower()
+
+    if ext in _HTML_EXTS:
+        try:
+            with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+                html = f.read()
+            new_html, changed = _compress_images_in_html(html)
+        except Exception:
+            return src_path, None
+        if not changed:
+            return src_path, None
+        fd, new_path = tempfile.mkstemp(suffix=".html", prefix="zot_compressed_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_html)
+        return new_path, new_path
+
+    if ext in _RASTER_EXTS:
+        try:
+            with open(src_path, "rb") as f:
+                data = f.read()
+            compressed = _compress_image_bytes(data)
+        except Exception:
+            return src_path, None
+        if len(compressed) >= len(data):
+            return src_path, None
+        fd, new_path = tempfile.mkstemp(suffix=ext, prefix="zot_compressed_")
+        with os.fdopen(fd, "wb") as f:
+            f.write(compressed)
+        return new_path, new_path
+
+    return src_path, None
+
+
 def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_user, webdav_pass,
                         content_type="text/html", archive_filename=None, existing_key=None):
     """打包为 ZIP，PUT 到 WebDAV，创建或更新 Zotero attachment item
@@ -1166,17 +1340,26 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
     """
     import hashlib, zipfile
 
+    # 0. 图片压缩预处理：HTML 内嵌图 / 独立图片文件先压缩，其他二进制跳过。
+    #    返回 (upload_path, cleanup_path)：上传用 upload_path；cleanup_path 非 None
+    #    时是压缩生成的临时文件，上传完成后需删除。压缩失败自动回退原始文件。
+    try:
+        upload_path, cleanup_path = _prep_upload_file(tmp_file_path)
+    except Exception as e:
+        print(f"⚠️  Image compression skipped: {e}")
+        upload_path, cleanup_path = tmp_file_path, None
+
     # 1. 打包为 ZIP（Zotero 附件存储格式）
     zip_path = tmp_file_path + ".zip"
     internal_name = archive_filename or os.path.basename(tmp_file_path)
     with zipfile.ZipFile(zip_path, "w") as zf:
-        zf.write(tmp_file_path, internal_name)
+        zf.write(upload_path, internal_name)
 
     # 2. 计算 md5 和 mtime（必须是解压后原始文件的属性）
     # Zotero 客户端下载 ZIP 后会解压，然后验证解压后文件的 md5
-    with open(tmp_file_path, "rb") as f:
+    with open(upload_path, "rb") as f:
         md5 = hashlib.md5(f.read()).hexdigest()
-    mtime = int(os.path.getmtime(tmp_file_path) * 1000)
+    mtime = int(os.path.getmtime(upload_path) * 1000)
 
     # 3. 创建或更新 Zotero attachment item
     # filename 和 contentType 必须是解压后的原始文件属性
@@ -1273,8 +1456,10 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
         print(f"⚠️  WebDAV PROP upload warning: {e}")
         return None
 
-    # 6. 清理临时 ZIP 文件（原始文件由调用方负责清理）
-    for f in [zip_path]:
+    # 6. 清理临时 ZIP 文件 + 压缩临时文件（原始文件由调用方负责清理）
+    for f in [zip_path, cleanup_path]:
+        if f is None:
+            continue
         try:
             os.remove(f)
         except OSError:
@@ -1429,7 +1614,10 @@ def list_attachments(parent_key):
 
 
 def detach_attachment(child_key):
-    """删除指定子条目（attachment 或 note），attachment 会自动清理 WebDAV"""
+    """删除指定子条目（attachment 或 note），attachment 会自动清理 WebDAV
+
+    软删除（进回收站）：delete_item 传单个 dict；勿传 list（会批量硬删/purge）。
+    """
     try:
         items = zot.item(child_key)
         item = items[0] if isinstance(items, list) else items
@@ -2627,6 +2815,31 @@ _ATTACH_EXT_MAP = {
 
 # ── dispatch helpers ───────────────────────────────────────────
 
+def _create_note(parent_key, note_html):
+    """创建子 note 并检查 API 返回的 failed 字典，返回是否成功。
+
+    pyzotero 的 create_items 只 raise HTTP 错误，不检查响应里的 failed 字段——
+    Zotero 对超限 note 会以 HTTP 200 + failed（如 413 "Note ... too long"）静默
+    拒绝，若不检查会误报成功（note 实际没写进去）。
+    """
+    resp = zot.create_items([{'itemType': 'note', 'parentItem': parent_key,
+                              'note': note_html}])
+    if not isinstance(resp, dict):
+        print(f"❌ Note write failed: unexpected response {resp!r}")
+        return False
+    failed = resp.get("failed")
+    if failed:
+        msgs = []
+        for entry in failed.values():
+            if isinstance(entry, dict):
+                msgs.append(str(entry.get("message") or entry))
+            else:
+                msgs.append(str(entry))
+        print(f"❌ Note rejected: {'; '.join(msgs)}")
+        return False
+    return True
+
+
 def _note_add(item_key, note_content):
     """Shared logic for note add (LLM summarization)."""
     if note_content is None:
@@ -2643,7 +2856,12 @@ def _note_add(item_key, note_content):
               f"falling back to raw content (see stderr for details)", file=sys.stderr)
         note_to_write = note_content
     note_html = f'<h3>📝 内容提纲</h3>\n\n{note_to_write}'
-    zot.create_items([{'itemType': 'note', 'parentItem': item_key, 'note': note_html}])
+    try:
+        note_html = _fit_note_under_limit(note_html)  # note 有体积上限，压到 ≤ 上限
+    except Exception:
+        pass
+    if not _create_note(item_key, note_html):
+        sys.exit(1)
     print(f"✅ Added note to item {item_key}")
 
 
@@ -2654,8 +2872,27 @@ def _note_set(item_key, note_content):
     if not note_content.strip():
         print("Error: no note content")
         return
-    zot.create_items([{'itemType': 'note', 'parentItem': item_key,
-                        'note': note_content.strip()}])
+    note_content = note_content.strip()
+    # 诊断：压缩前统计图片，便于排查「图片被删成 [图片] / 没压动」这类问题。
+    n_img = len(re.findall(r'<img\b', note_content, re.IGNORECASE))
+    n_b64 = note_content.count('data:image')
+    size_in = len(note_content)
+    try:
+        note_content = _fit_note_under_limit(note_content)  # note 有体积上限，压到 ≤ 上限
+    except Exception:
+        pass  # 压缩异常时回退原内容，绝不阻断 note 写入
+    size_out = len(note_content)
+    n_img_out = len(re.findall(r'<img\b', note_content, re.IGNORECASE))
+    if n_img == 0:
+        print(f"📐 note {item_key}: {size_in} 字节，无内嵌图片")
+    elif n_img_out == 0:
+        print(f"📐 note {item_key}: {size_in}→{size_out} 字节，{n_img} 张图(base64×{n_b64})压缩后仍超上限，已移除→[图片]")
+    elif size_out < size_in:
+        print(f"📐 note {item_key}: {size_in}→{size_out} 字节，{n_img} 张图已压缩保留")
+    else:
+        print(f"📐 note {item_key}: {size_in} 字节未变，{n_img} 张图(base64×{n_b64})未压缩")
+    if not _create_note(item_key, note_content):
+        sys.exit(1)
     print(f"✅ Set note on item {item_key}")
 
 
@@ -2668,7 +2905,11 @@ def _attach_add(item_key, file_path, archive_filename=None):
 
 
 def _item_remove(item_key):
-    """Shared logic for item remove/delete."""
+    """Shared logic for item remove/delete.
+
+    软删除（进回收站）：delete_item 传单个 dict 走 DELETE /items/{key}；
+    若误传 list 会走批量 DELETE（硬删/purge、不进回收站），务必只传单条。
+    """
     items = zot.item(item_key)
     item = items[0] if isinstance(items, list) else items
     zot.delete_item(item)
