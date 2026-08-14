@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.0.0
+version: 2.3.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
