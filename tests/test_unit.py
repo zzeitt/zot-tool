@@ -7,14 +7,6 @@ concept extraction, etc. Fast and safe to run without network.
 import pytest
 
 
-# We import zot as a module to access its pure functions.
-# These tests don't need any API fixtures — just the module.
-@pytest.fixture(scope="module")
-def zot(zot_mod):
-    """Re-export zot_mod as 'zot' for cleaner test code."""
-    return zot_mod
-
-
 class TestDomainSubcollName:
     """_domain_subcoll_name() — URL → short name mapping."""
 
