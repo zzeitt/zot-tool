@@ -1,4 +1,4 @@
-"""Note tests — setnote (direct), attachments listing, detach.
+"""Note tests — _note_set (direct), attachments listing, detach.
 
 What's NOT tested here (requires external tools):
   - addnote — uses minis-model-use for LLM summarization
@@ -25,12 +25,12 @@ def parent_item(zot_mod, api_client, misc_key, tracked_items):
 
 
 class TestSetNote:
-    """zot setnote <key> [content] — directly set note content (no LLM)."""
+    """zot note set <key> [content] — directly set note content (no LLM)."""
 
     def test_setnote_creates_note_child(self, zot_mod, api_client, parent_item):
-        """setnote creates a note child item with the given HTML content."""
+        """_note_set creates a note child item with the given HTML content."""
         note_html = "<p>Test note content — <strong>bold</strong> and <em>italic</em>.</p>"
-        zot_mod.setnote(parent_item, note_html)
+        zot_mod._note_set(parent_item, note_html)
 
         # Verify via API: find note children
         children = api_client.children(parent_item)
@@ -45,9 +45,9 @@ class TestSetNote:
         )
 
     def test_setnote_multiple_notes(self, zot_mod, api_client, parent_item):
-        """Multiple setnote calls create multiple note children."""
-        zot_mod.setnote(parent_item, "<p>First note</p>")
-        zot_mod.setnote(parent_item, "<p>Second note</p>")
+        """Multiple _note_set calls create multiple note children."""
+        zot_mod._note_set(parent_item, "<p>First note</p>")
+        zot_mod._note_set(parent_item, "<p>Second note</p>")
 
         children = api_client.children(parent_item)
         notes = [c for c in children
@@ -57,8 +57,8 @@ class TestSetNote:
         )
 
     def test_setnote_no_content_error(self, zot_mod, capsys):
-        """setnote with no content prints an error (no crash)."""
-        zot_mod.setnote("NONEXISTENT99", "")
+        """_note_set with no content prints an error (no crash)."""
+        zot_mod._note_set("NONEXISTENT99", "")
         captured = capsys.readouterr()
         assert "Error" in captured.out or "no note" in captured.out.lower()
 
@@ -69,7 +69,7 @@ class TestAttachmentsListing:
     def test_list_attachments(self, zot_mod, api_client, parent_item, capsys):
         """attachments() lists all child items of a parent."""
         # First add a note so there's something to list
-        zot_mod.setnote(parent_item, "<p>Test note for listing</p>")
+        zot_mod._note_set(parent_item, "<p>Test note for listing</p>")
 
         zot_mod.list_attachments(parent_item)
         captured = capsys.readouterr()
@@ -106,7 +106,7 @@ class TestDetach:
     def test_detach_note(self, zot_mod, api_client, parent_item):
         """Detaching a note child removes it."""
         # Create a note
-        zot_mod.setnote(parent_item, "<p>Note to detach</p>")
+        zot_mod._note_set(parent_item, "<p>Note to detach</p>")
         children = api_client.children(parent_item)
         notes = [c for c in children
                  if c.get("data", {}).get("itemType") == "note"]
