@@ -92,6 +92,18 @@ DOMAIN_TO_SUBCOLL = {
     "open.spotify.com": "spotify",
     # 知识/百科
     "wikipedia.org": "wikipedia",
+    # Google 系（on-device AI / ML 官方博客集中地）
+    "developers.googleblog.com": "google",
+    "blog.google": "google",
+    "ai.google.dev": "google",
+    "cloud.google.com": "google",
+    "developers.google.com": "google",
+    "research.google": "google",
+    "deepmind.google": "google",
+    # Microsoft DevBlogs（Raymond Chen 专栏等）
+    "devblogs.microsoft.com": "microsoft",
+    "learn.microsoft.com": "microsoft",
+    "blogs.microsoft.com": "microsoft",
 }
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
@@ -1124,13 +1136,24 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
     print(f"💾 Saving offline copy with monolith...")
     tmp_html = os.path.join(_get_temp_dir(), filename)
+    # Google 域名外挂几百个 .woff2 字体文件，不加 -F 会在 120s 内超时
+    monolith_args = ["monolith", "-o", tmp_html]
+    if any(gdom in url for gdom in ("googleblog.com", "blog.google", "ai.google.dev",
+                                     "cloud.google.com", "developers.google.com",
+                                     "research.google", "deepmind.google")):
+        monolith_args.append("-F")   # --no-fonts
+    monolith_args.append(url)
     try:
         result = subprocess.run(
-            ["monolith", "-o", tmp_html, url],
-            capture_output=True, text=True, timeout=120
+            monolith_args,
+            capture_output=True, text=True, timeout=240  # Google 域名给更多时间
         )
         if result.returncode != 0:
-            print(f"⚠️  monolith failed: {result.stderr}")
+            # Google 域名 + -F 仍失败 → 给出明确提示
+            if any(gdom in url for gdom in ("googleblog.com", "blog.google")):
+                print(f"⚠️  monolith failed (Google 域名): {result.stderr[:200]}")
+            else:
+                print(f"⚠️  monolith failed: {result.stderr}")
             return None
     except Exception as e:
         print(f"⚠️  monolith error: {e}")
