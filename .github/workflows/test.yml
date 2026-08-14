@@ -19,10 +19,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pyzotero pytest
+        run: pip install pyzotero pytest pillow
 
       - name: Unit tests (no API needed)
-        run: python -m pytest tests/test_unit.py -v
+        run: python -m pytest tests/test_unit.py tests/test_image_compress.py -v
 
       - name: Integration tests
         env:
@@ -36,4 +36,4 @@ jobs:
             echo "Configure at: https://github.com/${{ github.repository }}/settings/secrets/actions"
             exit 0
           fi
-          python -m pytest tests/ --ignore=tests/test_unit.py -v
+          python -m pytest tests/ --ignore=tests/test_unit.py --ignore=tests/test_image_compress.py -v

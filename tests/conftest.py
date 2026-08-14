@@ -32,7 +32,7 @@ import pytest
 # The test suite auto-creates prerequisite collections (Forbidden + Misc)
 # and cleans up all test-created items on teardown. No manual config needed.
 
-TEST_LIBRARY_ID = os.environ["ZOTERO_TEST_LIBRARY_ID"]
+TEST_LIBRARY_ID = os.environ.get("ZOTERO_TEST_LIBRARY_ID")
 TEST_LIBRARY_TYPE = os.environ.get("ZOTERO_TEST_LIBRARY_TYPE", "group")
 # We create these in the test library if they don't exist
 FORBIDDEN_COLL_NAME = os.environ.get("ZOTERO_TEST_FORBIDDEN_NAME", "Test-Forbidden")
@@ -57,7 +57,8 @@ def test_env():
     }
     for k, v in overrides.items():
         saved[k] = os.environ.get(k)
-        os.environ[k] = v
+        if v is not None:
+            os.environ[k] = v
 
     yield overrides
 
