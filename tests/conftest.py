@@ -323,11 +323,24 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 <li>sha: {sha}</li>
 <li>passed: {passed} / failed: {failed} / errors: {errors} / skipped: {skipped}</li>
 </ul>"""
-        zot.create_items([{
+        resp = zot.create_items([{
             "itemType": "note",
             "note": note_html,
             "collections": [coll_key],
         }])
+        # pyzotero create_items only raises HTTP errors, not the "failed"
+        # field — a silently rejected note (HTTP 200 + failed) would otherwise
+        # print success. Mirror zot.py's _create_note check.
+        if not isinstance(resp, dict):
+            print(f"\n[trace] Warning: unexpected note response {resp!r}")
+            return
+        if resp.get("failed"):
+            msgs = []
+            for entry in resp["failed"].values():
+                msgs.append(str(entry.get("message") or entry)
+                             if isinstance(entry, dict) else str(entry))
+            print(f"\n[trace] Warning: note rejected: {'; '.join(msgs)}")
+            return
         print(f"\n[trace] Left run note in '{CI_TRACE_COLLECTION}': "
               f"{passed}/{total} passed ({status})")
     except Exception as e:
