@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 jobs:
-  tag-and-release:
+  tag:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
@@ -15,58 +15,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Determine version bump
-        id: bump
+      - name: Read version from SKILL.md
+        id: version
         run: |
-          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
-
-          # Check PR title for Conventional Commits prefix
-          TITLE="${{ github.event.pull_request.title }}"
-          echo "PR title: $TITLE"
-
-          if echo "$LABELS" | grep -qi '"major"'; then
-            BUMP="major"
-          elif echo "$TITLE" | grep -qE '^\w+\(.*\)!:'; then
-            # Conventional Commits breaking change (!)
-            BUMP="major"
-          elif echo "$TITLE" | grep -qE '^feat'; then
-            BUMP="minor"
+          VER=$(grep -m1 '^version:' SKILL.md | sed -E 's/^version:[[:space:]]*//')
+          echo "SKILL.md version: ${VER}"
+          if [ -z "${VER}" ]; then
+            echo "::notice::SKILL.md has no version field — skipping tag"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify "refs/tags/v${VER}" >/dev/null 2>&1; then
+            echo "::notice::Tag v${VER} already exists — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            BUMP="patch"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
           fi
-
-          echo "bump=$BUMP" >> $GITHUB_OUTPUT
-          echo "Version bump: $BUMP"
-
-      - name: Compute next tag
-        id: tag
-        run: |
-          git fetch --tags
-
-          # Get latest version tag, default to v0.0.0
-          LATEST=$(git tag -l 'v*' --sort=-v:refname | head -1)
-          if [ -z "$LATEST" ]; then
-            LATEST="v0.0.0"
-          fi
-          echo "Latest tag: $LATEST"
-
-          V="${LATEST#v}"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$V"
-          BUMP="${{ steps.bump.outputs.bump }}"
-
-          case "$BUMP" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-
-          NEXT="v${MAJOR}.${MINOR}.${PATCH}"
-          echo "next=$NEXT" >> $GITHUB_OUTPUT
-          echo "Next tag: $NEXT"
 
       - name: Create tag
+        if: steps.version.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.tag.outputs.next }}" -m "Release ${{ steps.tag.outputs.next }}"
-          git push origin "${{ steps.tag.outputs.next }}"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
