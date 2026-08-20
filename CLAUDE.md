@@ -113,7 +113,8 @@ Monolith-saved WeChat articles have JS-dependent hidden content. This function s
 
 ## Version history (recent, from SKILL.md)
 
-- **v2.3.0** — current; version unification (single-source auto-release), Google/Microsoft domain mapping, monolith `-F`, httpx timeout, integration test fixes
+- **v2.3.1** — current; fix 2 stale integration test assertions; auto-release creates GitHub Release
+- **v2.3.0** — version unification (single-source auto-release), Google/Microsoft domain mapping, monolith `-F`, httpx timeout, integration test fixes
 - **v2.2.0** — compress note/attachment images; API-free unit tests
 - **v2.1.1** — netloc suffix matching for `DOMAIN_TO_SUBCOLL`
 - **v2.1.0** — offline HTML source + agent LLM path
