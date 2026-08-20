@@ -113,7 +113,12 @@ Monolith-saved WeChat articles have JS-dependent hidden content. This function s
 
 ## Version history (recent, from SKILL.md)
 
-- **v2.0.0** — current; argparse migration, `<noun> <verb>` unification, forbidden subcollection fix, test suite + CI
+- **v2.3.0** — current; version unification (single-source auto-release), Google/Microsoft domain mapping, monolith `-F`, httpx timeout, integration test fixes
+- **v2.2.0** — compress note/attachment images; API-free unit tests
+- **v2.1.1** — netloc suffix matching for `DOMAIN_TO_SUBCOLL`
+- **v2.1.0** — offline HTML source + agent LLM path
+- **v2.0.1** — `sys.platform` over `platform.system()` (fix platform hang)
+- **v2.0.0** — argparse migration, `<noun> <verb>` unification, forbidden subcollection fix, test suite + CI
 - **v1.8.5** — previous stable
 - **v1.8.3** — LLM summarization for items with empty description
 - **v1.8.2** — Fixed v1.8.1 data-loss bug (was replacing base64 inlined images with external URLs)

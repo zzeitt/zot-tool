@@ -323,6 +323,30 @@ alias zot="python3 scripts/zot.py"
 
 ## 版本历史
 
+### v2.3.0 — 版本号统一
+
+- **Google/Microsoft 域名映射**：`DOMAIN_TO_SUBCOLL` 增加两家域名
+- **monolith `-F`**：处理字体重页面；httpx 写超时
+- **集成测试修复**：`setnote`→`_note_set`、移除 `search_by_collection` 的 `limit`、CI 加 `requests` 依赖
+- **auto-release 单一来源**：tag 由 `SKILL.md` frontmatter `version:` 驱动，不再按 PR 标题推断 bump
+
+### v2.2.0 — 图片压缩
+
+- **note/attachment 内嵌图片压缩**：抽 `_compress_html` 纯函数，note 路径复用压缩，避免写超时
+- **单元测试 API-free**：`test_unit.py` 不再依赖 Zotero API
+
+### v2.1.1 — DOMAIN_TO_SUBCOLL netloc 后缀匹配
+
+- 域名匹配改用 netloc 后缀，修复子域名误判
+
+### v2.1.0 — 离线 HTML 源 + agent LLM 路径
+
+- 新增离线 HTML 源与 agent LLM 路径
+
+### v2.0.1 — 平台判断修复
+
+- `sys.platform` 替代 `platform.system()`，修复部分平台 hang
+
 ### v2.0.0 — argparse 迁移 + 命令大统一
 
 - **argparse 迁移**：全量替换手写 sys.argv 解析，`zot --help` / `zot item --help` 等各级 help 正常工作
