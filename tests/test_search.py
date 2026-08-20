@@ -101,20 +101,21 @@ class TestSearch:
 
 
 class TestCollectionBrowse:
-    """Browse items by collection."""
+    """Browse collections by name."""
 
     def test_search_by_collection(self, zot_mod, populated_library, capsys):
-        """search_by_collection() finds items in a collection by name."""
+        """search_by_collection() finds collections matching a name."""
         zot_mod.search_by_collection("test-search")
         captured = capsys.readouterr()
-        # Should find our 3 items
-        assert "Alpha" in captured.out or "Found" in captured.out
+        # Should list our sub-collection and its item count
+        assert "Misc--test-search" in captured.out
+        assert "Matched" in captured.out
 
     def test_coll_nonexistent(self, zot_mod, capsys):
-        """Searching a non-existent collection returns 0 results."""
+        """Searching a non-existent collection reports no matches."""
         zot_mod.search_by_collection("nonexistent-coll-xyz")
         captured = capsys.readouterr()
-        assert "Found 0 items" in captured.out
+        assert "No matching collections" in captured.out
 
 
 class TestListItems:
