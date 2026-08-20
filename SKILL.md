@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.3.0
+version: 2.3.1
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -322,6 +322,11 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.3.1 — patch 修复
+
+- **集成测试断言修复**：`search_by_collection` 语义已变，修正 2 个遗留断言
+- **auto-release 建 Release**：打 tag 后同一步创建 GitHub Release，绕开 GITHUB_TOKEN 递归限制
 
 ### v2.3.0 — 版本号统一
 
