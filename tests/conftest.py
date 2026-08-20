@@ -13,6 +13,8 @@ Test isolation:
 
 import os
 import sys
+from datetime import datetime, timezone
+
 import pytest
 
 
@@ -266,3 +268,68 @@ def misc_key(setup_collections):
 def forbidden_key(setup_collections):
     """Return the Test-Forbidden collection key."""
     return setup_collections[0]
+
+
+# ---------------------------------------------------------------------------
+# Durable trace note — proves integration tests hit the real Zotero library
+# ---------------------------------------------------------------------------
+# The suite is otherwise self-cleaning (everything created is deleted on
+# teardown), which makes it hard to confirm the tests really reached the API.
+# This hook leaves ONE persistent note per run in a dedicated collection so
+# there's an audit trail. It only fires when ZOTERO_TEST_LIBRARY_ID +
+# ZOTERO_API_KEY are present (the CI "Integration tests" step, or a local
+# full-suite run) — unit runs (test_unit.py / test_image_compress.py) skip it.
+
+CI_TRACE_COLLECTION = "CI-Test-Runs"
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Leave a durable trace note recording the integration run result."""
+    if not os.environ.get("ZOTERO_TEST_LIBRARY_ID") \
+            or not os.environ.get("ZOTERO_API_KEY"):
+        return  # unit run or no API configured — nothing to trace
+
+    passed = len(terminalreporter.stats.get("passed", []))
+    failed = len(terminalreporter.stats.get("failed", []))
+    errors = len(terminalreporter.stats.get("error", []))
+    skipped = len(terminalreporter.stats.get("skipped", []))
+    total = passed + failed + errors + skipped
+
+    try:
+        from pyzotero import zotero
+
+        zot = zotero.Zotero(
+            TEST_LIBRARY_ID, TEST_LIBRARY_TYPE, os.environ["ZOTERO_API_KEY"])
+
+        # Find or create the persistent collection (never cleaned up)
+        coll_key = None
+        for c in zot.everything(zot.collections()):
+            if c["data"].get("name") == CI_TRACE_COLLECTION:
+                coll_key = c["key"]
+                break
+        if not coll_key:
+            resp = zot.create_collections([{"name": CI_TRACE_COLLECTION}])
+            coll_key = resp["successful"]["0"]["key"]
+
+        now = datetime.now(timezone.utc).isoformat()
+        run_id = os.environ.get("GITHUB_RUN_ID", "local")
+        sha = os.environ.get("GITHUB_SHA", "n/a")
+        status = "OK" if exitstatus == 0 else f"FAILED (exit {exitstatus})"
+
+        note_html = f"""<p>CI integration run — {passed}/{total} passed ({status})</p>
+<ul>
+<li>time: {now}</li>
+<li>run: {run_id}</li>
+<li>sha: {sha}</li>
+<li>passed: {passed} / failed: {failed} / errors: {errors} / skipped: {skipped}</li>
+</ul>"""
+        zot.create_items([{
+            "itemType": "note",
+            "note": note_html,
+            "collections": [coll_key],
+        }])
+        print(f"\n[trace] Left run note in '{CI_TRACE_COLLECTION}': "
+              f"{passed}/{total} passed ({status})")
+    except Exception as e:
+        # Never fail the run because of the trace itself
+        print(f"\n[trace] Warning: could not leave trace note: {e}")
