@@ -104,6 +104,9 @@ DOMAIN_TO_SUBCOLL = {
     "devblogs.microsoft.com": "microsoft",
     "learn.microsoft.com": "microsoft",
     "blogs.microsoft.com": "microsoft",
+    # 个人数学博客（Joel David Hamkins "Infinitely More" 等付费 Substack 系）
+    # 2026-08-25 验证：infinitelymore.xyz 多信号评分误匹配《Handbook of Floating-Point Arithmetic》
+    "infinitelymore.xyz": "infinitelymore",
 }
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉

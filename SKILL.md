@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.3.1
+version: 2.3.2
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -177,11 +177,12 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 **根因**：v1.7.2 已把 `weixin.qq.com → wechat` 的域名硬映射**接到 create_misc_subcollection 的命名逻辑**，但**没接到 find_best_collection 的匹配流程**。域名命中只能"创建"已有 coll，不能"匹配"已有 coll。
 
 **v1.8.0 修复**：
-1. 新增模块级 `DOMAIN_TO_SUBCOLL` 字典，覆盖 17 个已知平台：
+1. 新增模块级 `DOMAIN_TO_SUBCOLL` 字典，覆盖 17+ 个已知平台：
    - 中文：`mp.weixin.qq.com→wechat` / `chaspark.com→chaspark` / `bilibili.com→bilibili` / `xiaohongshu.com→xhs` / `zhihu.com→zhihu` / `juejin.cn→juejin`
    - 开发者：`github.com→github` / `arxiv.org→arxiv` / `ycombinator.com→hn` / `stackoverflow.com→stackoverflow` / `medium.com→medium` / `substack.com→substack`
    - 音视频：`youtube.com→youtube` / `podcasts.apple.com→podcast` / `open.spotify.com→spotify`
    - 百科：`wikipedia.org→wikipedia`
+   - 个人博客（v2.3.2 新增）：`infinitelymore.xyz→infinitelymore`（Joel David Hamkins 的 Substack 频道，避免被多信号评分误匹配到《Handbook of Floating-Point Arithmetic》）
 2. 新增 `_domain_subcoll_name(url)` 提取器
 3. 新增 `_find_existing_domain_collection(url)`：**先**在库内查 `Misc--<sub>` 是否已存在，**命中则直接返回** coll_key（绕过多信号评分）
 4. `archive_url` 调用顺序：**域名硬映射 → 多信号评分 → create_misc_subcollection**
@@ -255,7 +256,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 - `_fallback_sub_name_from_title(name_hint)` — title 文本取前 2 个有意义 token
 
 **新策略**——多信号优先级：
-1. **已知平台域名**（最高优先）：调用 `_domain_subcoll_name(url)`，覆盖 `weixin.qq.com→wechat` / `chaspark.com→chaspark` / `github.com→github` / `arxiv.org→arxiv` / `bilibili.com→bilibili` / `xhs→xhs` / `zhihu→zhihu` / `juejin→juejin` / `hn→hn` / `stackoverflow→stackoverflow` / `medium→medium` / `substack→substack` / `youtube→youtube` / `podcast→podcast` / `spotify→spotify` / `wikipedia→wikipedia` 等
+1. **已知平台域名**（最高优先）：调用 `_domain_subcoll_name(url)`，覆盖 `weixin.qq.com→wechat` / `chaspark.com→chaspark` / `github.com→github` / `arxiv.org→arxiv` / `bilibili.com→bilibili` / `xhs→xhs` / `zhihu→zhihu` / `juejin→juejin` / `hn→hn` / `stackoverflow→stackoverflow` / `medium→medium` / `substack→substack` / `youtube→youtube` / `podcast→podcast` / `spotify→spotify` / `wikipedia→wikipedia` / `infinitelymore.xyz→infinitelymore` 等
 2. **URL 主域第一段**（未知域名兜底）
 3. **title 词**（非 URL 时）：如 `perceptron-explained-from-scratch` → `perceptron/scratch`
 4. **用户提供的 #tag**（可选）：如 `#感知机` → `感知机`
@@ -322,6 +323,10 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.3.2 — patch 修复
+
+- **`infinitelymore.xyz → infinitelymore` 域名映射**：Joel David Hamkins 的 Substack 频道（集合论/数学哲学付费 newsletter）此前走多信号评分时会被误匹配到《Handbook of Floating-Point Arithmetic》（2026-08-25 验证）；加进 `DOMAIN_TO_SUBCOLL` 后走硬映射 → 命中或创建 `Misc--infinitelymore`，避免误判。
 
 ### v2.3.1 — patch 修复
 
