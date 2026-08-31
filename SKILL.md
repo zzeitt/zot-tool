@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.3.2
+version: 2.3.3
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -183,6 +183,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
    - 音视频：`youtube.com→youtube` / `podcasts.apple.com→podcast` / `open.spotify.com→spotify`
    - 百科：`wikipedia.org→wikipedia`
    - 个人博客（v2.3.2 新增）：`infinitelymore.xyz→infinitelymore`（Joel David Hamkins 的 Substack 频道，避免被多信号评分误匹配到《Handbook of Floating-Point Arithmetic》）
+   - **科技高管署名博客**：`gatesnotes.com→gatesnotes`（Bill Gates 个人博客，2026-08-31 验证：Cloudflare 反爬 403 导致 fetch_url_metadata 拿到 "Access Denied" → fallback 退化成 `Misc--www` 垃圾命名）
 2. 新增 `_domain_subcoll_name(url)` 提取器
 3. 新增 `_find_existing_domain_collection(url)`：**先**在库内查 `Misc--<sub>` 是否已存在，**命中则直接返回** coll_key（绕过多信号评分）
 4. `archive_url` 调用顺序：**域名硬映射 → 多信号评分 → create_misc_subcollection**
@@ -323,6 +324,10 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.3.3 — patch 修复
+
+- **`gatesnotes.com → gatesnotes` 域名映射**：Bill Gates 个人博客（2026-08-31 验证）。`gatesnotes.com` 走 Cloudflare 反爬，curl/Python 全部 403，`fetch_url_metadata` 拿到 "Access Denied" 作为标题、description 为空 → 多信号评分无信号命中 → `create_misc_subcollection` 退化 fallback `Misc--www` 垃圾命名。加进 `DOMAIN_TO_SUBCOLL` 后未来命中 `Misc--gatesnotes`（已预创建，key `6MVGEDXC`）。
 
 ### v2.3.2 — patch 修复
 
