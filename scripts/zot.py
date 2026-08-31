@@ -107,6 +107,11 @@ DOMAIN_TO_SUBCOLL = {
     # 个人数学博客（Joel David Hamkins "Infinitely More" 等付费 Substack 系）
     # 2026-08-25 验证：infinitelymore.xyz 多信号评分误匹配《Handbook of Floating-Point Arithmetic》
     "infinitelymore.xyz": "infinitelymore",
+    # 个人技术博客（barrd.dev — Dave 的 Bristol 个人站，git/devops/Laravel 文章）
+    # 2026-08-31 验证：barrd.dev 描述 "Git worktree ... without stashing or constant checkouts"
+    # 多信号评分误匹配到 Turing《On Computable Numbers, with an Applicatoin to the Entscheidungsproblem》
+    # （"without"/"decision" 与 coll name 的 "Applicatoin" 偶然高分）。加硬映射 → 走 Misc--barrd。
+    "barrd.dev": "barrd",
     # Bill Gates 署名个人博客（gatesnotes.com — 主页 / 年信 / AI 治理 essay 等）
     # 2026-08-31 验证：gatesnotes 反爬 Cloudflare 403, fetch_url_metadata 拿到 "Access Denied",
     # 多信号评分误判 → 退化成 fallback "www" 命名. 加进硬映射 → 命中/创建 Misc--gatesnotes.

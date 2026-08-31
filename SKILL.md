@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.3.3
+version: 2.3.4
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -324,6 +324,10 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.3.4 — patch 修复
+
+- **`barrd.dev → barrd` 域名映射**：Dave 的 Bristol 个人技术博客（2026-08-31 验证）。barrd.dev 描述 "Git worktree ... without stashing or constant checkouts" 被多信号评分误匹配到 Turing《On Computable Numbers, with an Applicatoin to the Entscheidungsproblem》（`without`/`decision` 与 coll name 偶然高分）。加进 `DOMAIN_TO_SUBCOLL` 后未来命中或创建 `Misc--barrd`。
 
 ### v2.3.3 — patch 修复
 
