@@ -116,6 +116,10 @@ DOMAIN_TO_SUBCOLL = {
     # 2026-08-31 验证：gatesnotes 反爬 Cloudflare 403, fetch_url_metadata 拿到 "Access Denied",
     # 多信号评分误判 → 退化成 fallback "www" 命名. 加进硬映射 → 命中/创建 Misc--gatesnotes.
     "gatesnotes.com": "gatesnotes",
+    # Alan Zucconi 个人博客（alanzucconi.com — 数学/图形/Unity 教学深文 + 配套视频纪录片）
+    # 2026-08-31 验证：xorshift-generators 长文被多信号评分误匹配到 Misc--《The Mystery of the Prime Numbers》,
+    # 创建出完全无关的母题集合. 加进硬映射 → 命中/创建 Misc--alanzucconi.
+    "alanzucconi.com": "alanzucconi",
 }
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
