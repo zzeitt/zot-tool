@@ -11,7 +11,12 @@ import tempfile
 from urllib.parse import urlparse
 from pyzotero import zotero
 from pyzotero._utils import build_url
-import httpx
+try:
+    import httpx
+except ImportError:
+    # pyzotero ≥1.15 把 HTTP 依赖从 httpx 更名为 httpx2；两者 API 兼容，
+    # 统一以 httpx 名使用（zot.client.timeout 赋值等）。
+    import httpx2 as httpx
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -678,6 +683,8 @@ def fetch_url_metadata(url):
         item_type = "webpage"
         if re.search(r'podcast|episode|播客', title + description, re.I):
             item_type = "podcast"
+        if "arxiv.org/abs/" in url or "arxiv.org/pdf/" in url:
+            item_type = "preprint"
         return {"title": title, "description": description, "itemType": item_type}
     except Exception as e:
         return {"title": url, "description": "", "itemType": "webpage", "error": str(e)}
@@ -1090,6 +1097,12 @@ def _detect_binary_url(url):
     for dom in binary_domains:
         if dom in url_lower and ("get.php" in url_lower or "/download" in url_lower):
             return True, "application/pdf", None
+
+    # 4. arXiv: 摘要页（/abs/）与 /pdf/ 均视为 PDF，下载二进制版本
+    if "arxiv.org/abs/" in url_lower or "arxiv.org/pdf/" in url_lower:
+        m = re.search(r'arxiv\.org/(?:abs|pdf)/([^/?]+)', url_lower)
+        arxiv_id = m.group(1) if m else "arxiv"
+        return True, "application/pdf", f"{arxiv_id}.pdf"
 
     return False, None, None
 
@@ -1907,6 +1920,14 @@ def _ext_for_content_type(ct):
     return mapping.get(ct, "bin")
 
 
+def _arxiv_pdf_url(url):
+    """将 arXiv 摘要页 URL 重写为 PDF 下载 URL；非 arXiv URL 原样返回"""
+    m = re.search(r'arxiv\.org/abs/([^/?]+)', url)
+    if m:
+        return f"https://arxiv.org/pdf/{m.group(1)}"
+    return url
+
+
 def archive_binary_url(url, item_key, content_type, filename_hint=None, title_hint=None):
     """下载二进制文件（PDF/EPUB 等）并保存为 Zotero 附件
 
@@ -1922,7 +1943,7 @@ def archive_binary_url(url, item_key, content_type, filename_hint=None, title_hi
     fname = f"{filename_hint or slug}.{default_ext}"
     tmp_path = os.path.join(_get_temp_dir(), fname)
 
-    if not _download_binary(url, tmp_path):
+    if not _download_binary(_arxiv_pdf_url(url), tmp_path):
         return None
 
     global _last_offline_file
@@ -2127,11 +2148,12 @@ def _llm_summarize(title, description, item_type, url, offline_path=None, parent
     source_label = ""
 
     # 1) Try offline file first (full article content)
+    # 仅 HTML 离线副本可作为正文源；二进制附件（PDF 等）跳过，退回 meta description
     if offline_path and os.path.exists(offline_path):
         try:
-            with open(offline_path, "r", encoding="utf-8", errors="replace") as f:
-                raw = f.read()
             if offline_path.endswith((".html", ".htm")):
+                with open(offline_path, "r", encoding="utf-8", errors="replace") as f:
+                    raw = f.read()
                 import re as _re
                 text = _re.sub(r"<script[^>]*>.*?</script>", "", raw, flags=_re.DOTALL | _re.IGNORECASE)
                 text = _re.sub(r"<style[^>]*>.*?</style>", "", text, flags=_re.DOTALL | _re.IGNORECASE)
@@ -2139,7 +2161,7 @@ def _llm_summarize(title, description, item_type, url, offline_path=None, parent
                 text = _re.sub(r"\s+", " ", text).strip()
                 source_text = text[:4000]
             else:
-                source_text = raw[:2000]
+                print("[INFO] _llm_summarize: offline file is binary, skipping as source")
             if source_text:
                 source_label = "离线正文（前 4000 字）"
                 print(f"[INFO] _llm_summarize: read {len(source_text)} chars from offline file")
@@ -2616,6 +2638,8 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     }
     if item_type == "podcast" and meta.get("seriesTitle"):
         item['seriesTitle'] = meta['seriesTitle']
+    if item_type == "preprint":
+        item['repository'] = 'arXiv'
 
     response = zot.create_items([item])
     if response.get('successful'):
