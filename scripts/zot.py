@@ -11,7 +11,12 @@ import tempfile
 from urllib.parse import urlparse
 from pyzotero import zotero
 from pyzotero._utils import build_url
-import httpx
+try:
+    import httpx
+except ImportError:
+    # pyzotero ≥1.15 把 HTTP 依赖从 httpx 更名为 httpx2；两者 API 兼容，
+    # 统一以 httpx 名使用（zot.client.timeout 赋值等）。
+    import httpx2 as httpx
 
 IS_WINDOWS = sys.platform == "win32"
 
