@@ -82,10 +82,6 @@ DOMAIN_TO_SUBCOLL = {
     "xiaohongshu.com": "xhs",            # 小红书
     "zhihu.com": "zhihu",
     "juejin.cn": "juejin",
-    # gtdstudy.com — GTD/个人管理中文资料站
-    # 2026-09-08 验证：PDF《卓越的日常性》（Chambliss "The Mundanity of Excellence" 中文整理译稿）
-    # 无 HTML 描述 → 多信号评分无信号 → 退化 fallback 成 Misc--www 垃圾命名。加硬映射 → Misc--gtdstudy。
-    "gtdstudy.com": "gtdstudy",
     # 开发者平台
     "github.com": "github",
     "arxiv.org": "arxiv",
