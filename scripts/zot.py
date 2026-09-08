@@ -82,6 +82,10 @@ DOMAIN_TO_SUBCOLL = {
     "xiaohongshu.com": "xhs",            # 小红书
     "zhihu.com": "zhihu",
     "juejin.cn": "juejin",
+    # gtdstudy.com — GTD/个人管理中文资料站
+    # 2026-09-08 验证：PDF《卓越的日常性》（Chambliss "The Mundanity of Excellence" 中文整理译稿）
+    # 无 HTML 描述 → 多信号评分无信号 → 退化 fallback 成 Misc--www 垃圾命名。加硬映射 → Misc--gtdstudy。
+    "gtdstudy.com": "gtdstudy",
     # 开发者平台
     "github.com": "github",
     "arxiv.org": "arxiv",
@@ -634,8 +638,70 @@ def add_item(item_type, title, url, coll_key, extra_json=None):
 
 # ========== 归档工作流 ==========
 
+def _arxiv_abs_url(url):
+    """将 arXiv /pdf/ 下载链接改写为 /abs/ 摘要页，作为元数据抓取源。
+
+    PDF 是二进制，没有 <title>/<meta> 可提取；摘要页提供标题 + 完整摘要。
+    与 _arxiv_pdf_url()（abs → pdf，供下载附件用）方向相反。
+    非 arXiv URL 原样返回。
+    """
+    m = re.search(r'arxiv\.org/pdf/([^/?]+)', url)
+    if m:
+        return f"https://arxiv.org/abs/{m.group(1)}"
+    return url
+
+
+# 学术预印本站点：netloc 后缀 → Zotero preprint item 的 repository 字段值
+_PREPRINT_DOMAINS = (
+    ("arxiv.org", "arXiv"),
+    ("biorxiv.org", "bioRxiv"),
+    ("medrxiv.org", "medRxiv"),
+    ("chemrxiv.org", "ChemRxiv"),
+    ("researchsquare.com", "Research Square"),
+    ("ssrn.com", "SSRN"),
+)
+
+
+def _preprint_from_url(url):
+    """学术预印本 URL → repository 名（arXiv/bioRxiv/...）；非预印本返回 None。
+
+    使用 netloc 后缀匹配（同 DOMAIN_TO_SUBCOLL 的 _domain_subcoll_name），
+    避免 'fakearxiv.org' 这类 substring 假阳性把普通网页误判成论文。
+
+    Returns:
+        repository 字符串（如 'arXiv'），或 None
+    """
+    if not url:
+        return None
+    try:
+        netloc = urlparse(url.lower()).netloc.split(":")[0]
+    except (ValueError, AttributeError):
+        return None
+    if not netloc:
+        return None
+    for dom, repo in _PREPRINT_DOMAINS:
+        if netloc == dom or netloc.endswith("." + dom):
+            return repo
+    return None
+
+
 def fetch_url_metadata(url):
-    """获取 URL 的标题和描述，支持常见平台特殊处理"""
+    """获取 URL 的标题和描述，支持常见平台特殊处理
+
+    itemType 判定原则（v2.4.0）：**先按 URL 判定**，再抓取内容。
+    - 学术预印本 URL（arxiv.org/biorxiv.org/...）→ 直接判定 preprint
+    - 这样即使抓取失败（二进制 PDF、反爬、超时），也不会回退成 webpage
+      —— 修复 arxiv.org/pdf/* 等二进制论文链接被归档为 webpage 的问题。
+    """
+    # ---- 预印本 URL：按 URL 判定 itemType（不依赖抓取成功）----
+    preprint_repo = _preprint_from_url(url)
+    if preprint_repo:
+        item_type = "preprint"
+        extra_fields = {"repository": preprint_repo}
+    else:
+        item_type = "webpage"
+        extra_fields = {}
+
     # Apple Podcasts: 用 iTunes API
     if "podcasts.apple.com" in url:
         m = re.search(r'i=(\d+)', url)
@@ -661,33 +727,50 @@ def fetch_url_metadata(url):
             except Exception as e:
                 print(f"Apple Podcasts API error: {e}")
 
-    # 通用网页抓取
+    # arXiv PDF 是二进制：元数据抓取源改写为摘要页，附件下载仍用原 URL（PDF）
+    fetch_url = _arxiv_abs_url(url)
+
+    # 通用网页抓取（bytes 模式，二进制内容不再抛 UnicodeDecodeError）
     try:
         result = subprocess.run(
-            ["curl", "-s", "-L", "-A", "Mozilla/5.0", "--max-time", "15", url],
-            capture_output=True, text=True, timeout=20
+            ["curl", "-s", "-L", "-A", "Mozilla/5.0", "--max-time", "15", fetch_url],
+            capture_output=True, timeout=20
         )
-        html = result.stdout
+        html = result.stdout.decode("utf-8", errors="replace")
+        if result.returncode != 0 or not html.strip():
+            return {"title": url, "description": "", "itemType": item_type,
+                    "error": f"curl failed rc={result.returncode}", **extra_fields}
+
+        # 非 HTML（二进制 PDF 等）不做文本解析，标题保持 URL，itemType 保持 URL 判定值
+        if "<title" not in html and "<meta" not in html and "<html" not in html.lower():
+            return {"title": url, "description": "", "itemType": item_type,
+                    "error": "not an HTML page", **extra_fields}
+
         title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
         title = title_match.group(1).strip() if title_match else url
-        desc_match = re.search(
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
-            html, re.IGNORECASE
-        )
-        if not desc_match:
+        # arXiv abs 页 <title> 形如 "[2608.20711] AsmEvo: ..." → 去掉 "[id] " 前缀
+        if re.search(r'arxiv\.org/abs/', fetch_url):
+            title = re.sub(r'^\[\d{4}\.\d{4,5}\]\s*', '', title)
+
+        # 描述优先级：citation_abstract（学术页全量摘要）> description > og:description
+        description = ""
+        for meta_name in ("citation_abstract", "description", "og:description"):
             desc_match = re.search(
-                r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<meta[^>]+(?:name|property)=["\']' + re.escape(meta_name) +
+                r'["\'][^>]+content=["\']([^"\']+)["\']',
                 html, re.IGNORECASE
             )
-        description = desc_match.group(1).strip()[:500] if desc_match else ""
-        item_type = "webpage"
-        if re.search(r'podcast|episode|播客', title + description, re.I):
+            if desc_match:
+                description = desc_match.group(1).strip()[:3000]
+                break
+
+        # 预印本已在 URL 阶段判定；仅 webpage 允许按内容升级为 podcast
+        if item_type == "webpage" and re.search(r'podcast|episode|播客', title + description, re.I):
             item_type = "podcast"
-        if "arxiv.org/abs/" in url or "arxiv.org/pdf/" in url:
-            item_type = "preprint"
-        return {"title": title, "description": description, "itemType": item_type}
+        return {"title": title, "description": description, "itemType": item_type, **extra_fields}
     except Exception as e:
-        return {"title": url, "description": "", "itemType": "webpage", "error": str(e)}
+        return {"title": url, "description": "", "itemType": item_type,
+                "error": str(e), **extra_fields}
 
 
 # 缓存已有 tags（模块级，首次调用时加载）
@@ -1051,6 +1134,8 @@ def _fallback_sub_name_from_url(url):
     domain_match = re.search(r'://([^/]+)', url.lower())
     if domain_match:
         domain = domain_match.group(1)
+        if domain.startswith("www."):
+            domain = domain[4:]  # www.example.com → example（避免 Misc--www）
         parts = domain.replace(".", " ").split()
         return parts[0] if parts else "web"
     return "web"
@@ -2408,6 +2493,7 @@ def _create_content_note(url, title, item_type, parent_key, offline_path=None):
             type_map = {
                 "podcast": ("播客", "本集核心话题"),
                 "video": ("视频", "本期核心内容"),
+                "preprint": ("论文", "论文核心贡献"),
                 "arxiv": ("论文", "论文核心贡献"),
                 "book": ("书籍", "本书核心主题"),
                 "github": ("项目", "项目亮点"),
@@ -2462,6 +2548,7 @@ def _build_minimal_fallback_note(title, url, item_type):
     type_label_map = {
         "podcast": "🎙️ 播客",
         "video": "📺 视频",
+        "preprint": "📄 论文",
         "arxiv": "📄 论文",
         "book": "📖 书籍",
         "github": "🛠️ GitHub 项目",
@@ -2639,7 +2726,7 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     if item_type == "podcast" and meta.get("seriesTitle"):
         item['seriesTitle'] = meta['seriesTitle']
     if item_type == "preprint":
-        item['repository'] = 'arXiv'
+        item['repository'] = meta.get("repository", "arXiv")
 
     response = zot.create_items([item])
     if response.get('successful'):
