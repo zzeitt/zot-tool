@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.3.5
+version: 2.4.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -325,6 +325,16 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.4.0 — arXiv/预印本 itemType 修复
+
+- **`arxiv.org/pdf/*` 等二进制论文链接不再归档成 `webpage`**（2026-09-08 验证：`fetch_url_metadata` 的 arxiv→preprint 判断在 curl 抓取**之后**，curl 拿到 PDF 二进制 → `text=True` 解码抛 `UnicodeDecodeError` → 走 except 返回 `webpage`，判断永远到不了）。
+- **itemType 先按 URL 判定**：新增 `_preprint_from_url(url)`，用 netloc 后缀匹配（同 `DOMAIN_TO_SUBCOLL`，避免 `fakearxiv.org` 假阳性）识别 arxiv/biorxiv/medrxiv/chemrxiv/Research Square/SSRN → `preprint`。抓取失败、反爬、二进制内容都不会回退成 `webpage`。
+- **curl 改 bytes 模式抓取**：解码加 `errors="replace"`，二进制 PDF 不再崩溃；非 HTML 内容守卫跳过文本解析。
+- **arXiv PDF 元数据源改写为摘要页**：新增 `_arxiv_abs_url()`（与 `_arxiv_pdf_url` 方向相反），`/pdf/<id>` 抓取前改写为 `/abs/<id>` → 拿到真实标题 + 完整摘要（`citation_abstract` 优先），并剥离 `<title>` 里 `[2608.20711] ` 编号前缀。
+- **repository 不再硬编码 arXiv**：`archive_url` 从 `meta["repository"]` 取值，支持多预印本平台。
+- **Note 降级映射补 `preprint`**：`type_map` / `type_label_map` 增加 `preprint → 📄 论文`。
+- **修复存量误分类**：`BEPI8IPB`（本会话归档）+ `Misc--arxiv` 内 2 条历史 `webpage`（RZKWE33I、FVIVXGUC）已批量 PATCH 为 `preprint` + `repository=arXiv`。
 
 ### v2.3.5 — patch 修复
 

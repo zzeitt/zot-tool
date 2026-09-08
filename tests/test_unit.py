@@ -245,6 +245,63 @@ class TestExtForContentType:
         assert zot._ext_for_content_type("application/x-unknown") == "bin"
 
 
+class TestPreprintFromUrl:
+    """_preprint_from_url() — 学术预印本 URL → repository 判定。
+
+    回归（v2.4.0）：arxiv.org/pdf/* 等二进制论文链接被归档成 webpage。
+    itemType 必须按 URL 判定，抓取失败也不能回退成 webpage。
+    """
+
+    @pytest.mark.parametrize("url,expected", [
+        ("https://arxiv.org/abs/2608.20711", "arXiv"),
+        ("https://arxiv.org/pdf/2608.20711", "arXiv"),
+        ("https://www.arxiv.org/abs/2301.00001", "arXiv"),
+        ("https://export.arxiv.org/pdf/2301.00001", "arXiv"),
+        ("https://www.biorxiv.org/content/10.1101/2023.01.01.522000v1", "bioRxiv"),
+        ("https://www.medrxiv.org/content/10.1101/2023.01.01.522000v1", "medRxiv"),
+        ("https://chemrxiv.org/engage/chemrxiv/article-details/abc", "ChemRxiv"),
+        ("https://www.ssrn.com/abstract=1234567", "SSRN"),
+    ])
+    def test_preprint_domains(self, zot, url, expected):
+        assert zot._preprint_from_url(url) == expected
+
+    @pytest.mark.parametrize("url", [
+        # substring 假阳性场景（必须 None，修复前会误判）
+        "https://arxiv.org.evil.com/phish",   # endswith .evil.com，不是 .arxiv.org
+        "https://fakearxiv.org/abs/1234",     # 包含 "arxiv.org" 但不是 arxiv.org 子域
+        "https://notbiorxiv.org/page",        # substring 包含 biorxiv.org
+        "https://example.com/paper.pdf",      # 普通网页/文档
+        "",
+        None,
+    ])
+    def test_non_preprint(self, zot, url):
+        assert zot._preprint_from_url(url) is None, f"Should not match: {url}"
+
+
+class TestArxivAbsUrl:
+    """_arxiv_abs_url() — arxiv /pdf/ 下载链接 → /abs/ 摘要页（元数据抓取源）。
+
+    PDF 是二进制，没有 <title>/<meta>；归档前把元数据源改写为摘要页。
+    附件下载仍走原 /pdf/ URL（见 _arxiv_pdf_url），两者方向相反。
+    """
+
+    def test_pdf_to_abs(self, zot):
+        assert zot._arxiv_abs_url(
+            "https://arxiv.org/pdf/2608.20711") == "https://arxiv.org/abs/2608.20711"
+
+    def test_pdf_with_query_string(self, zot):
+        assert zot._arxiv_abs_url(
+            "https://arxiv.org/pdf/2608.20711?download=true") == "https://arxiv.org/abs/2608.20711"
+
+    def test_abs_unchanged(self, zot):
+        url = "https://arxiv.org/abs/2608.20711"
+        assert zot._arxiv_abs_url(url) == url
+
+    def test_non_arxiv_unchanged(self, zot):
+        url = "https://example.com/paper.pdf"
+        assert zot._arxiv_abs_url(url) == url
+
+
 class TestNoPlatformSystemCall:
     """Regression: IS_WINDOWS must NOT use platform.system().
 
