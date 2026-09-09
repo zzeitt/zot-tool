@@ -1055,12 +1055,11 @@ def _extract_text_keywords(text):
     return keywords
 
 
-def find_best_collection(title, description):
-    """匹配最合适的 collection，无匹配则返回 None
+def _legacy_find_best_collection(title, description):
+    """原版实现 — 保留供 test_classify.py 行为对比。
 
-    v1.8.0: 改用 _all_collections() (分页 + 缓存) 替代裸 zot.collections()。
-            早返回逻辑保持不变 —— description 为空时依然返回 None,domain
-            硬映射已由 archive_url 在调用本函数前先尝试。
+    find_best_collection() 自 v2.5.0 (PR 1) 起委托给 zot_classify.classify()。
+    此函数保留旧实现，以便测试可对比两者行为。
     """
     text = (title + " " + description).lower()
 
@@ -1089,6 +1088,20 @@ def find_best_collection(title, description):
             best_match = (key, name)
 
     return best_match
+
+
+def find_best_collection(title, description):
+    """匹配最合适的 collection，无匹配则返回 None
+
+    v1.8.0: 改用 _all_collections() (分页 + 缓存) 替代裸 zot.collections()。
+            早返回逻辑保持不变 —— description 为空时依然返回 None,domain
+            硬映射已由 archive_url 在调用本函数前先尝试。
+    v2.5.0: 重构 — 委托给 zot_classify.classify() 多信号评分引擎（PR 1）。
+            行为完全不变（PR 1 contract），后续 PR 引入多信号 + 置信度闸门。
+    """
+    import zot_classify
+    decision = zot_classify.classify_from_title_desc(title, description)
+    return decision.chosen
 
 
 def create_misc_subcollection(name_hint, url=None):
