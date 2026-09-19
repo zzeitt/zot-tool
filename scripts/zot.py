@@ -125,6 +125,12 @@ DOMAIN_TO_SUBCOLL = {
     # 2026-08-31 验证：xorshift-generators 长文被多信号评分误匹配到 Misc--《The Mystery of the Prime Numbers》,
     # 创建出完全无关的母题集合. 加进硬映射 → 命中/创建 Misc--alanzucconi.
     "alanzucconi.com": "alanzucconi",
+    # Daniel Lemire 个人技术博客（lemire.me — 计算机科学/性能/SIMD/JSON 系列评测文章）
+    # 2026-09-20 验证：how-did-apple-silicon-get-50-faster-in-three-years 多信号评分
+    # 严重误判匹配到《How to Win Friends and Influence People》（人名/people 巧合）。
+    # Lemire 是 Quebec U. 教授 + benchmark 系列知名作者（Geekbench/JSON parse 评测等），
+    # 跟 alanzucconi / barrd 同类。加硬映射 → 命中/创建 Misc--lemire.
+    "lemire.me": "lemire",
 }
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
@@ -1252,6 +1258,10 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
                                      "cloud.google.com", "developers.google.com",
                                      "research.google", "deepmind.google")):
         monolith_args.append("-F")   # --no-fonts
+    # 2026-09-20: 已知 Cloudflare-fronted WordPress 个人博客 (fonts-heavy) 也加 -F
+    # lemire.me 验证: 不加 -F 在 240s 内超时 (挂载 Google Fonts)
+    if any(ldom in url for ldom in ("lemire.me",)):
+        monolith_args.append("-F")
     monolith_args.append(url)
     try:
         result = subprocess.run(
@@ -2687,10 +2697,23 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     # 场景: WeChat 文章 description 为空 → find_best_collection 早返回 None
     #       旧代码会 fall through 到 create_misc_subcollection 创建中文长名 coll
     #       修复: 已知平台域名直接命中已有 Misc--<sub> coll
+    #
+    # 2026-09-20 修正: 当 _domain_subcoll_name() 命中但 Misc--<sub> 还不存在时，
+    #   旧代码会 fall through 到 find_best_collection 多信号评分，
+    #   导致严重误判（lemire.me CPU 文章被误匹配到 "How to Win Friends..." coll）。
+    #   新流程：硬映射命中 → 强制走 create_misc_subcollection 创建 Misc--<sub>，
+    #   完全跳过评分。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
+    domain_sub = _domain_subcoll_name(url)
     domain_match = _find_existing_domain_collection(url)
     if domain_match:
         coll_key, coll_name = domain_match
         print(f"📁 Domain-mapped collection: {coll_name} (from URL domain)")
+    elif domain_sub:
+        # 硬映射命中但 coll 还不存在 → 直接创建并跳过评分
+        target_name = f"Misc--{domain_sub}"
+        coll_key = create_misc_subcollection(target_name, url=url)
+        coll_name = target_name
+        print(f"📁 Domain-mapped new collection: {coll_name}")
     else:
         matched = find_best_collection(title, description)
         if matched:

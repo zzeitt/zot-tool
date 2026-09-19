@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.4.0
+version: 2.4.1
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -185,6 +185,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
    - 个人博客（v2.3.2 新增）：`infinitelymore.xyz→infinitelymore`（Joel David Hamkins 的 Substack 频道，避免被多信号评分误匹配到《Handbook of Floating-Point Arithmetic》）
    - **科技高管署名博客**：`gatesnotes.com→gatesnotes`（Bill Gates 个人博客，2026-08-31 验证：Cloudflare 反爬 403 导致 fetch_url_metadata 拿到 "Access Denied" → fallback 退化成 `Misc--www` 垃圾命名）
    - **数学/图形深文个人博客（v2.3.5 新增）**：`alanzucconi.com→alanzucconi`（Alan Zucconi 博客，2026-08-31 验证：`xorshift-generators` 51K 字长文被多信号评分误匹配到 `Misc--《The Mystery of the Prime Numbers》`，加进硬映射 → 命中/创建 `Misc--alanzucconi`，已预创建 key `A24ZFB7Q`）
+   - **CPU 基准评测个人博客（v2.4.1 新增）**：`lemire.me→lemire`（Daniel Lemire 个人博客，2026-09-20 验证：`how-did-apple-silicon-get-50-faster` 多信号评分严重误判匹配到《How to Win Friends and Influence People》，与 alanzucconi/barrd/gatesnotes 同类 → 加进硬映射 → 命中/创建 `Misc--lemire`）
 2. 新增 `_domain_subcoll_name(url)` 提取器
 3. 新增 `_find_existing_domain_collection(url)`：**先**在库内查 `Misc--<sub>` 是否已存在，**命中则直接返回** coll_key（绕过多信号评分）
 4. `archive_url` 调用顺序：**域名硬映射 → 多信号评分 → create_misc_subcollection**
@@ -258,7 +259,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 - `_fallback_sub_name_from_title(name_hint)` — title 文本取前 2 个有意义 token
 
 **新策略**——多信号优先级：
-1. **已知平台域名**（最高优先）：调用 `_domain_subcoll_name(url)`，覆盖 `weixin.qq.com→wechat` / `chaspark.com→chaspark` / `github.com→github` / `arxiv.org→arxiv` / `bilibili.com→bilibili` / `xhs→xhs` / `zhihu→zhihu` / `juejin→juejin` / `hn→hn` / `stackoverflow→stackoverflow` / `medium→medium` / `substack→substack` / `youtube→youtube` / `podcast→podcast` / `spotify→spotify` / `wikipedia→wikipedia` / `infinitelymore.xyz→infinitelymore` / `gatesnotes.com→gatesnotes` / `alanzucconi.com→alanzucconi` 等
+1. **已知平台域名**（最高优先）：调用 `_domain_subcoll_name(url)`，覆盖 `weixin.qq.com→wechat` / `chaspark.com→chaspark` / `github.com→github` / `arxiv.org→arxiv` / `bilibili.com→bilibili` / `xhs→xhs` / `zhihu→zhihu` / `juejin→juejin` / `hn→hn` / `stackoverflow→stackoverflow` / `medium→medium` / `substack→substack` / `youtube→youtube` / `podcast→podcast` / `spotify→spotify` / `wikipedia→wikipedia` / `infinitelymore.xyz→infinitelymore` / `gatesnotes.com→gatesnotes` / `alanzucconi.com→alanzucconi` / `lemire.me→lemire` 等
 2. **URL 主域第一段**（未知域名兜底）
 3. **title 词**（非 URL 时）：如 `perceptron-explained-from-scratch` → `perceptron/scratch`
 4. **用户提供的 #tag**（可选）：如 `#感知机` → `感知机`
@@ -325,6 +326,13 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.4.1 — `lemire.me` 硬映射 + collection flow 修正 + monolith `-F`
+
+- **`lemire.me → lemire` 域名映射**：Daniel Lemire 个人 CPU 基准评测博客（2026-09-20 验证：`how-did-apple-silicon-get-50-faster-in-three-years` 多信号评分严重误判匹配到《How to Win Friends and Influence People》coll —— "people" 关键字巧合）。与 alanzucconi/barrd/gatesnotes 同类个人博客 → 加进硬映射 → 命中/创建 `Misc--lemire`。
+- **archive_url collection flow 修正**（关键 bugfix）：v1.8.0 的设计是"硬映射命中 `Misc--<sub>` 已存在 → 直接返回；不命中 → fall through 到多信号评分"。这导致 lemire.me 第一次归档时（`Misc--lemire` 还不存在）走评分分支 → 误判。**新流程**：`_domain_subcoll_name(url)` 命中 → 强制走 `create_misc_subcollection` 创建 `Misc--<sub>`，**完全跳过评分**。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
+- **monolith `-F` 标志扩展到 lemire.me**：Cloudflare-fronted WordPress + Google Fonts 挂载导致 240s 超时，加 `-F` 跳字体后 3.3MB/数十秒完成。
+- **archive 时自动按域名添加 `-F`**：现在 Google 系 + lemire.me 共 7 个域名默认 `--no-fonts`。
 
 ### v2.4.0 — arXiv/预印本 itemType 修复
 
