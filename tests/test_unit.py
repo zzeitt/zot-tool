@@ -698,3 +698,98 @@ class TestNoPlatformSystemCall:
         assert "platform.system()" not in src, (
             "platform.system() found in zot.py — hangs on Python 3.14/Windows"
         )
+
+
+class TestCiTraceNote:
+    """The CI trace note must identify the revision it validated.
+
+    A note that only says "51/51 passed" cannot be traced back to a patch,
+    which is the whole point of leaving it in the library.
+    """
+
+    # Spelled as repeated letters rather than digits so the pre-commit key
+    # scanner does not read the placeholder as a real Zotero key.
+    _FAKE_SHA = "deadbeef" * 5
+
+    @staticmethod
+    def _ident(**over):
+        ident = {
+            "version": "9.9.9", "commit": "abcdef1234", "subject": "feat: x",
+            "branch": "main", "pr": "", "sha": "0123456789abcdef",
+            "dirty": False, "diff_hash": "",
+        }
+        ident.update(over)
+        return ident
+
+    def test_note_records_provenance(self):
+        from tests.conftest import build_trace_note
+        note = build_trace_note(self._ident(), (51, 0, 0, 0, 51), "OK",
+                                "2026-01-01T00:00:00+00:00", "123")
+        for fragment in ("version: 9.9.9", "abcdef1234", "feat: x",
+                         "sha: 0123456789abcdef", "run: 123",
+                         "51/51 passed (OK)", "v9.9.9", "@ abcdef1234"):
+            assert fragment in note, f"missing {fragment!r} in note"
+
+    def test_note_names_pr_when_present(self):
+        from tests.conftest import build_trace_note
+        note = build_trace_note(self._ident(pr="31", branch="feat/x"),
+                                (1, 0, 0, 0, 1), "OK", "t", "1")
+        assert "PR #31" in note
+        assert "feat/x" in note
+
+    def test_note_flags_dirty_tree(self):
+        """A local dirty run must not let the commit masquerade as tested."""
+        from tests.conftest import build_trace_note
+        note = build_trace_note(self._ident(dirty=True, diff_hash="deadbeef"),
+                                (1, 0, 0, 0, 1), "OK", "t", "local")
+        assert "DIRTY" in note
+        assert "deadbeef" in note
+
+    def test_note_omits_dirty_marker_when_clean(self):
+        from tests.conftest import build_trace_note
+        note = build_trace_note(self._ident(), (1, 0, 0, 0, 1), "OK", "t", "1")
+        assert "DIRTY" not in note
+
+    def test_note_handles_unknown_version(self):
+        from tests.conftest import build_trace_note
+        note = build_trace_note(self._ident(version="unknown", commit="n/a"),
+                                (1, 0, 0, 0, 1), "FAILED (exit 1)", "t", "1")
+        assert "1/1 passed (FAILED (exit 1))" in note
+        assert "version: unknown" in note
+
+    def test_skill_version_matches_frontmatter(self):
+        """The note's version must come from SKILL.md — the release source."""
+        import os
+        from tests.conftest import skill_version
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as fh:
+            front = "".join(fh.readline() for _ in range(40))
+        expected = None
+        for line in front.splitlines():
+            if line.startswith("version:"):
+                expected = line.split(":", 1)[1].strip()
+                break
+        assert expected, "SKILL.md has no version: line"
+        assert skill_version() == expected
+
+    def test_run_identity_reads_github_env(self, monkeypatch):
+        from tests.conftest import run_identity
+        monkeypatch.setenv("GITHUB_SHA", self._FAKE_SHA)
+        monkeypatch.setenv("GITHUB_REF", "refs/pull/31/merge")
+        monkeypatch.setenv("GITHUB_HEAD_REF", "feat/x")
+        monkeypatch.setenv("GITHUB_REF_NAME", "31/merge")
+        ident = run_identity()
+        assert ident["pr"] == "31"
+        assert ident["sha"] == self._FAKE_SHA
+        assert ident["branch"] == "feat/x", "PR branch must win over the merge ref"
+        assert ident["version"] != "unknown"
+        assert ident["commit"] != "n/a"
+
+    def test_run_identity_non_pr_ref(self, monkeypatch):
+        from tests.conftest import run_identity
+        monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+        monkeypatch.setenv("GITHUB_REF_NAME", "main")
+        monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+        ident = run_identity()
+        assert ident["pr"] == ""
+        assert ident["branch"] == "main"

@@ -11,7 +11,10 @@ Test isolation:
   - Empty collections left for future test runs
 """
 
+import hashlib
 import os
+import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -287,6 +290,111 @@ def forbidden_key(setup_collections):
 
 CI_TRACE_COLLECTION = "CI-Test-Runs"
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _git(*args):
+    """Run git in the repo root; "" when git or the repo is unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", _REPO_ROOT] + list(args),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def skill_version():
+    """Version under test. SKILL.md frontmatter is the single source of truth.
+
+    The auto-release workflow tags releases from this same line, so reading it
+    back is what ties a trace note to a released version rather than to a sha
+    the reader has to resolve by hand.
+    """
+    try:
+        with open(os.path.join(_REPO_ROOT, "SKILL.md"), encoding="utf-8") as fh:
+            for _ in range(40):
+                line = fh.readline()
+                if not line:
+                    break
+                if line.startswith("version:"):
+                    return line.split(":", 1)[1].strip() or "unknown"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def run_identity():
+    """Describe exactly which revision was tested.
+
+    Without this a trace note only says "51/51 passed" and there is no way to
+    tell which patch that verdict belongs to.
+    """
+    env = os.environ
+
+    # On a pull_request event GITHUB_SHA is the synthetic merge commit and
+    # GITHUB_REF is refs/pull/<N>/merge; HEAD^2 is the real PR tip — the code
+    # actually under test. Locally neither exists, so fall back to HEAD.
+    pr = ""
+    match = re.match(r"refs/pull/(\d+)/", env.get("GITHUB_REF", ""))
+    if match:
+        pr = match.group(1)
+
+    sha = env.get("GITHUB_SHA") or _git("rev-parse", "HEAD") or "n/a"
+    commit = _git("rev-parse", "HEAD^2") if pr else ""
+    if not commit:
+        commit = _git("rev-parse", "HEAD") or sha
+
+    branch = (env.get("GITHUB_HEAD_REF") or env.get("GITHUB_REF_NAME")
+              or _git("rev-parse", "--abbrev-ref", "HEAD") or "n/a")
+
+    # A local run on a dirty tree tests code no commit contains; say so rather
+    # than letting the commit hash masquerade as the tested revision.
+    dirty = bool(_git("status", "--porcelain"))
+    diff = _git("diff", "HEAD") if dirty else ""
+
+    return {
+        "version": skill_version(),
+        "commit": commit[:10] if commit != "n/a" else "n/a",
+        "subject": _git("log", "-1", "--format=%s", commit) or "n/a",
+        "branch": branch,
+        "pr": pr,
+        "sha": sha,
+        "dirty": dirty,
+        "diff_hash": hashlib.sha1(diff.encode("utf-8")).hexdigest()[:8]
+                     if diff else "",
+    }
+
+
+def build_trace_note(ident, counts, status, now, run_id):
+    """Render the trace note body. Pure — no API, no environment."""
+    passed, failed, errors, skipped, total = counts
+    headline = (f"CI integration run — {passed}/{total} passed ({status})")
+    if ident["version"] != "unknown":
+        headline += f" — v{ident['version']}"
+    if ident["commit"] != "n/a":
+        headline += f" @ {ident['commit']}"
+    if ident["dirty"]:
+        headline += " (dirty tree)"
+
+    lines = [
+        f"<li>version: {ident['version']}</li>",
+        f"<li>commit: {ident['commit']} — {ident['subject']}</li>",
+        f"<li>branch: {ident['branch']}"
+        + (f" · PR #{ident['pr']}" if ident["pr"] else "") + "</li>",
+        f"<li>sha: {ident['sha']}</li>",
+        f"<li>run: {run_id}</li>",
+        f"<li>time: {now}</li>",
+        f"<li>passed: {passed} / failed: {failed} / errors: {errors}"
+        f" / skipped: {skipped}</li>",
+    ]
+    if ident["dirty"]:
+        lines.append(
+            "<li>tree: DIRTY — uncommitted changes were tested; the commit "
+            f"above is the base only (diff {ident['diff_hash']})</li>")
+    return f"<p>{headline}</p>\n<ul>\n" + "\n".join(lines) + "\n</ul>"
+
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Leave a durable trace note recording the integration run result."""
@@ -318,16 +426,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
         now = datetime.now(timezone.utc).isoformat()
         run_id = os.environ.get("GITHUB_RUN_ID", "local")
-        sha = os.environ.get("GITHUB_SHA", "n/a")
         status = "OK" if exitstatus == 0 else f"FAILED (exit {exitstatus})"
 
-        note_html = f"""<p>CI integration run — {passed}/{total} passed ({status})</p>
-<ul>
-<li>time: {now}</li>
-<li>run: {run_id}</li>
-<li>sha: {sha}</li>
-<li>passed: {passed} / failed: {failed} / errors: {errors} / skipped: {skipped}</li>
-</ul>"""
+        ident = run_identity()
+        note_html = build_trace_note(
+            ident, (passed, failed, errors, skipped, total), status, now, run_id)
         resp = zot.create_items([{
             "itemType": "note",
             "note": note_html,
@@ -346,8 +449,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
                              if isinstance(entry, dict) else str(entry))
             print(f"\n[trace] Warning: note rejected: {'; '.join(msgs)}")
             return
+        where = f"v{ident['version']} @ {ident['commit']}"
+        if ident["dirty"]:
+            where += " (dirty)"
         print(f"\n[trace] Left run note in '{CI_TRACE_COLLECTION}': "
-              f"{passed}/{total} passed ({status})")
+              f"{passed}/{total} passed ({status}) — {where}")
     except Exception as e:
         # Never fail the run because of the trace itself
         print(f"\n[trace] Warning: could not leave trace note: {e}")
