@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.4.1
+version: 2.4.2
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -326,6 +326,11 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.4.2 — `fs.blog` 硬映射
+
+- **`fs.blog → fs-blog` 域名映射**：Farnam Street — Shane Parrish 署名的心智模型/学习/决策博客（2026-09-21 验证：`/learning/` 「Accelerated Learning」描述里 `learning` / `knowledge` / `brain` 关键词触发多信号评分高分匹配到 `Misc--machine/learning` (X3V2CSDP) — 文章真实主题是「通用学习法/心智模型/决策」，与 machine learning 教科书严重不符。加进硬映射 → 命中/创建 `Misc--fs-blog`）。
+- 跟 gatesnotes / alanzucconi / barrd / lemire 同类独立个人博客。
 
 ### v2.4.1 — `lemire.me` 硬映射 + collection flow 修正 + monolith `-F`
 

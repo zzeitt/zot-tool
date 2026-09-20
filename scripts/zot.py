@@ -131,6 +131,11 @@ DOMAIN_TO_SUBCOLL = {
     # Lemire 是 Quebec U. 教授 + benchmark 系列知名作者（Geekbench/JSON parse 评测等），
     # 跟 alanzucconi / barrd 同类。加硬映射 → 命中/创建 Misc--lemire.
     "lemire.me": "lemire",
+    # Farnam Street — Shane Parrish 署名心智模型/学习/决策博客（fs.blog）
+    # 2026-09-21 验证：fs.blog/learning/ "Accelerated Learning" 描述里的 "learning"
+    # 关键词触发多信号评分高分匹配到 Misc--machine/learning (X3V2CSDP), 与文章真实主题
+    # (通用学习法/心智模型/决策) 严重不符。加硬映射 → 命中/创建 Misc--fs-blog。
+    "fs.blog": "fs-blog",
 }
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
