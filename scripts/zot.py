@@ -33,6 +33,21 @@ def _get_offline_dir():
         return os.environ.get("ZOTERO_OFFLINE_DIR", default_dir)
     return os.environ.get("ZOTERO_OFFLINE_DIR", "/tmp/zotero-offline")
 
+def _get_vocab_dir():
+    """Get the library-derived data directory.
+
+    Deliberately OUTSIDE the repository. This directory holds data derived
+    from the user's own Zotero library (tag names + frequencies, domain
+    overrides) that must never be committed to the public repo.
+    """
+    default_dir = os.path.join(_get_temp_dir(), "zot_vocab")
+    return os.environ.get("ZOTERO_VOCAB_DIR", default_dir)
+
+def _get_domain_map_path():
+    """Path to the local domain-override overlay (untracked, outside the repo)."""
+    return os.environ.get("ZOTERO_DOMAIN_MAP",
+                          os.path.join(_get_vocab_dir(), "domain_overrides.json"))
+
 LIBRARY_ID = os.environ.get("ZOTERO_LIBRARY_ID")
 API_KEY = os.environ.get("ZOTERO_API_KEY")
 FORBIDDEN_COLLECTION = os.environ.get("ZOTERO_FORBIDDEN_COLLECTION")
@@ -109,37 +124,77 @@ DOMAIN_TO_SUBCOLL = {
     "devblogs.microsoft.com": "microsoft",
     "learn.microsoft.com": "microsoft",
     "blogs.microsoft.com": "microsoft",
-    # 个人数学博客（Joel David Hamkins "Infinitely More" 等付费 Substack 系）
-    # 2026-08-25 验证：infinitelymore.xyz 多信号评分误匹配《Handbook of Floating-Point Arithmetic》
-    "infinitelymore.xyz": "infinitelymore",
-    # 个人技术博客（barrd.dev — Dave 的 Bristol 个人站，git/devops/Laravel 文章）
-    # 2026-08-31 验证：barrd.dev 描述 "Git worktree ... without stashing or constant checkouts"
-    # 多信号评分误匹配到 Turing《On Computable Numbers, with an Applicatoin to the Entscheidungsproblem》
-    # （"without"/"decision" 与 coll name 的 "Applicatoin" 偶然高分）。加硬映射 → 走 Misc--barrd。
-    "barrd.dev": "barrd",
-    # Bill Gates 署名个人博客（gatesnotes.com — 主页 / 年信 / AI 治理 essay 等）
-    # 2026-08-31 验证：gatesnotes 反爬 Cloudflare 403, fetch_url_metadata 拿到 "Access Denied",
-    # 多信号评分误判 → 退化成 fallback "www" 命名. 加进硬映射 → 命中/创建 Misc--gatesnotes.
-    "gatesnotes.com": "gatesnotes",
-    # Alan Zucconi 个人博客（alanzucconi.com — 数学/图形/Unity 教学深文 + 配套视频纪录片）
-    # 2026-08-31 验证：xorshift-generators 长文被多信号评分误匹配到 Misc--《The Mystery of the Prime Numbers》,
-    # 创建出完全无关的母题集合. 加进硬映射 → 命中/创建 Misc--alanzucconi.
-    "alanzucconi.com": "alanzucconi",
-    # Daniel Lemire 个人技术博客（lemire.me — 计算机科学/性能/SIMD/JSON 系列评测文章）
-    # 2026-09-20 验证：how-did-apple-silicon-get-50-faster-in-three-years 多信号评分
-    # 严重误判匹配到《How to Win Friends and Influence People》（人名/people 巧合）。
-    # Lemire 是 Quebec U. 教授 + benchmark 系列知名作者（Geekbench/JSON parse 评测等），
-    # 跟 alanzucconi / barrd 同类。加硬映射 → 命中/创建 Misc--lemire.
-    "lemire.me": "lemire",
 }
+# NOTE: personal blogs the maintainer follows are deliberately NOT listed here.
+# They are library-specific reading-interest data, so they live in an untracked
+# local overlay instead — see _load_domain_overrides(). Add your own there.
+
+# monolith 在这些域名上会挂载成百上千个 .woff2 字体文件，必须加 -F (--no-fonts)。
+# 库特定的字体重灾区（如某些 Cloudflare-fronted WordPress 个人博客）同样走 overlay。
+_FONT_HEAVY_DOMAINS = (
+    "googleblog.com", "blog.google", "ai.google.dev",
+    "cloud.google.com", "developers.google.com",
+    "research.google", "deepmind.google",
+)
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
 _collections_cache = {"data": None, "ts": 0.0}
 _COLLECTIONS_CACHE_TTL = 300  # seconds
 
+# 5 分钟 TTL 缓存域名 overlay（本地文件很小，但 archive 路径会查它两次）
+_domain_overlay_cache = {"data": None, "ts": 0.0}
+_DOMAIN_OVERLAY_TTL = 300  # seconds
+
+
+def _load_domain_overrides(force_refresh=False):
+    """读取本地域名 overlay：``{"map": {...}, "no_fonts": [...]}``
+
+    overlay 承载**库特定**的域名知识——用户关注的个人博客、以及在字体重灾区
+    需要跳过字体的域名。这类数据属于「阅读兴趣」信号，不能进公共源码树，
+    因此外置到未被跟踪的本地文件（``ZOTERO_DOMAIN_MAP``，默认在
+    ``ZOTERO_VOCAB_DIR`` 下）。
+
+    文件缺失 / 无权限 / 格式损坏 → 一律退化成空 overlay，**归档绝不因此失败**。
+    """
+    import time as _time
+    now = _time.time()
+    if (not force_refresh and _domain_overlay_cache["data"] is not None
+            and (now - _domain_overlay_cache["ts"]) < _DOMAIN_OVERLAY_TTL):
+        return _domain_overlay_cache["data"]
+
+    overlay = {"map": {}, "no_fonts": []}
+    try:
+        with open(_get_domain_map_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            mapping = raw.get("map")
+            if isinstance(mapping, dict):
+                overlay["map"] = {str(k).lower(): str(v)
+                                  for k, v in mapping.items() if k and v}
+            no_fonts = raw.get("no_fonts")
+            if isinstance(no_fonts, list):
+                overlay["no_fonts"] = [str(d).lower() for d in no_fonts if d]
+    except (OSError, ValueError):
+        pass  # 无 overlay → 只用内置表
+
+    _domain_overlay_cache["data"] = overlay
+    _domain_overlay_cache["ts"] = now
+    return overlay
+
+
+def _domain_wants_no_fonts(url):
+    """该 URL 的域名是否需要 monolith ``-F``（跳过 webfonts）"""
+    low = (url or "").lower()
+    if any(d in low for d in _FONT_HEAVY_DOMAINS):
+        return True
+    return any(d in low for d in _load_domain_overrides()["no_fonts"])
+
 
 def _domain_subcoll_name(url):
     """从 URL 提取已知平台的子集合名。未命中返回 None。
+
+    先查本地 overlay（``_load_domain_overrides()["map"]``），再查内置
+    ``DOMAIN_TO_SUBCOLL``。overlay 优先，便于用户覆盖任何域名。
 
     使用 netloc 后缀匹配，支持子域名（如 news.ycombinator.com → ycombinator.com）。
     要求 '.' 边界，避免 'notgithub.com' 误匹配 'github.com' 这类 substring bug。
@@ -166,7 +221,9 @@ def _domain_subcoll_name(url):
         return None
     # 按域名长度降序遍历，更具体的域名先匹配
     # (e.g. "mp.weixin.qq.com" 应在 "weixin.qq.com" 之前命中)
-    for dom, sub in sorted(DOMAIN_TO_SUBCOLL.items(), key=lambda x: -len(x[0])):
+    overlay = dict(DOMAIN_TO_SUBCOLL)
+    overlay.update(_load_domain_overrides()["map"])  # overlay 覆盖内置
+    for dom, sub in sorted(overlay.items(), key=lambda x: -len(x[0])):
         if netloc == dom or netloc.endswith("." + dom):
             return sub
     return None
@@ -1252,24 +1309,19 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
     print(f"💾 Saving offline copy with monolith...")
     tmp_html = os.path.join(_get_temp_dir(), filename)
-    # Google 域名外挂几百个 .woff2 字体文件，不加 -F 会在 120s 内超时
+    # 字体重页面外挂几百个 .woff2，不加 -F 会在 120-240s 内超时。
+    # 内置 Google 系 + 本地 overlay 里的字体重灾域名（见 _domain_wants_no_fonts）。
     monolith_args = ["monolith", "-o", tmp_html]
-    if any(gdom in url for gdom in ("googleblog.com", "blog.google", "ai.google.dev",
-                                     "cloud.google.com", "developers.google.com",
-                                     "research.google", "deepmind.google")):
+    if _domain_wants_no_fonts(url):
         monolith_args.append("-F")   # --no-fonts
-    # 2026-09-20: 已知 Cloudflare-fronted WordPress 个人博客 (fonts-heavy) 也加 -F
-    # lemire.me 验证: 不加 -F 在 240s 内超时 (挂载 Google Fonts)
-    if any(ldom in url for ldom in ("lemire.me",)):
-        monolith_args.append("-F")
     monolith_args.append(url)
     try:
         result = subprocess.run(
             monolith_args,
-            capture_output=True, text=True, timeout=240  # Google 域名给更多时间
+            capture_output=True, text=True, timeout=240  # 字体重页面给更多时间
         )
         if result.returncode != 0:
-            # Google 域名 + -F 仍失败 → 给出明确提示
+            # 内置 Google 域名 + -F 仍失败 → 给出明确提示
             if any(gdom in url for gdom in ("googleblog.com", "blog.google")):
                 print(f"⚠️  monolith failed (Google 域名): {result.stderr[:200]}")
             else:
@@ -2699,8 +2751,8 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     #       修复: 已知平台域名直接命中已有 Misc--<sub> coll
     #
     # 2026-09-20 修正: 当 _domain_subcoll_name() 命中但 Misc--<sub> 还不存在时，
-    #   旧代码会 fall through 到 find_best_collection 多信号评分，
-    #   导致严重误判（lemire.me CPU 文章被误匹配到 "How to Win Friends..." coll）。
+    #   旧代码会 fall through 到 find_best_collection 多信号评分，导致严重误判
+    #   （长尾标题撞上 coll 名里的偶然同名词）。
     #   新流程：硬映射命中 → 强制走 create_misc_subcollection 创建 Misc--<sub>，
     #   完全跳过评分。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
     domain_sub = _domain_subcoll_name(url)

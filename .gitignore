@@ -1,3 +1,16 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# --- Defense in depth: library-derived data must never be committed ---------
+# These files hold data derived from the user's own Zotero library (tag names,
+# tag frequencies, personal blog domains). They are meant to live OUTSIDE the
+# repo (ZOTERO_VOCAB_DIR defaults to %TEMP%/zot_vocab), but ignoring them here
+# stops a misconfigured ZOTERO_VOCAB_DIR from leaking them into git.
+zot_vocab/
+tags.json
+pairs.json
+domain_overrides.json
+
+# Local search index — tooling scratch, not project content
+.memsearch/

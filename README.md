@@ -100,13 +100,13 @@ zot attachment add KC5ETPXM paper.pdf
 zot attachment update A1B2C3D4 fixed.html
 
 # 查看子条目
-zot attachment list KC5ETPXM
+zot attachment list ABCD1234
 
 # 删子条目
 zot attachment remove A1B2C3D4
 
 # 删条目
-zot item remove KC5ETPXM
+zot item remove ABCD1234
 ```
 
 ## 环境变量

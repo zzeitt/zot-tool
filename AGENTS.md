@@ -19,7 +19,7 @@ alias zot="python3 scripts/zot.py"
 # Examples
 zot item search "machine learning"
 zot item archive "https://example.com"
-zot tag add KC5ETPXM "#AI🤖"
+zot tag add ABCD1234 "/demo📦" "#demo-alpha"
 zot coll list
 zot tag "/unread"
 ```

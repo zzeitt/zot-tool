@@ -163,7 +163,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 相比旧版只用 meta description（通常 ≤ 200 字符），离线正文能提供 20 倍以上的内容信号，让 LLM 摘要更准确。
 
 ### Cloudflare 反爬场景处理（v1.7.1+）
-- **问题**：部分网站（如 johndcook.com）用 Cloudflare 拦截 curl user-agent，导致 `fetch_url_metadata` 拿到 "Attention Required" 页面，description 为空
+- **问题**：部分网站（尤其个人博客类）用 Cloudflare 拦截 curl user-agent，导致 `fetch_url_metadata` 拿到 "Attention Required" 页面，description 为空
 - **检测**：v1.7.1 在 `fetch_url_metadata` 里检查 `Attention Required` / `cf-error-code` 等关键字，标记 `cf_blocked: true`
 - **fallback**：archive_url 输出 `⚠️ CLOUDFLARE_BLOCKED` 标记。AI 看到后：
   1. 用 `browser_use navigate` + `execute_js` 拿 body text
@@ -172,7 +172,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 
 ### 已知平台域名硬映射（v1.8.0 关键修复）
 **问题（2026-07-07 微信公众号事件）**：
-库内**已存在** `Misc--wechat` (6TXTXUMC)，但 v1.7.4 archive 微信公众号 URL 时，description 为空 → `find_best_collection` 早返回 None → 落到 `create_misc_subcollection` 的 URL-slug/title 分支 → 创建了中文长名 coll `Misc--一文看懂ai推理芯片和训练芯片的区别`（需要事后清理）。
+库内**已存在** `Misc--wechat`（key `<coll-key>`），但 v1.7.4 archive 微信公众号 URL 时，description 为空 → `find_best_collection` 早返回 None → 落到 `create_misc_subcollection` 的 URL-slug/title 分支 → 创建了中文长名 coll `Misc--<文章标题全文>`（需要事后清理）。
 
 **根因**：v1.7.2 已把 `weixin.qq.com → wechat` 的域名硬映射**接到 create_misc_subcollection 的命名逻辑**，但**没接到 find_best_collection 的匹配流程**。域名命中只能"创建"已有 coll，不能"匹配"已有 coll。
 
@@ -182,10 +182,8 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
    - 开发者：`github.com→github` / `arxiv.org→arxiv` / `ycombinator.com→hn` / `stackoverflow.com→stackoverflow` / `medium.com→medium` / `substack.com→substack`
    - 音视频：`youtube.com→youtube` / `podcasts.apple.com→podcast` / `open.spotify.com→spotify`
    - 百科：`wikipedia.org→wikipedia`
-   - 个人博客（v2.3.2 新增）：`infinitelymore.xyz→infinitelymore`（Joel David Hamkins 的 Substack 频道，避免被多信号评分误匹配到《Handbook of Floating-Point Arithmetic》）
-   - **科技高管署名博客**：`gatesnotes.com→gatesnotes`（Bill Gates 个人博客，2026-08-31 验证：Cloudflare 反爬 403 导致 fetch_url_metadata 拿到 "Access Denied" → fallback 退化成 `Misc--www` 垃圾命名）
-   - **数学/图形深文个人博客（v2.3.5 新增）**：`alanzucconi.com→alanzucconi`（Alan Zucconi 博客，2026-08-31 验证：`xorshift-generators` 51K 字长文被多信号评分误匹配到 `Misc--《The Mystery of the Prime Numbers》`，加进硬映射 → 命中/创建 `Misc--alanzucconi`，已预创建 key `A24ZFB7Q`）
-   - **CPU 基准评测个人博客（v2.4.1 新增）**：`lemire.me→lemire`（Daniel Lemire 个人博客，2026-09-20 验证：`how-did-apple-silicon-get-50-faster` 多信号评分严重误判匹配到《How to Win Friends and Influence People》，与 alanzucconi/barrd/gatesnotes 同类 → 加进硬映射 → 命中/创建 `Misc--lemire`）
+   - **个人博客 → 不在源码里，走本地 overlay**（v2.5.0 起）：用户关注的个人博客域名属于「阅读兴趣」信号，不是通用平台知识，因此**不写进源码**。改为放进未跟踪的本地文件 `domain_overrides.json`（路径见 §环境要求），`_load_domain_overrides()` 读取、`_domain_subcoll_name()` **优先**用它，并可直接覆盖任何内置域名。
+   - overlay 的 `no_fonts` 列表同理：某些字体重灾域名（Cloudflare-fronted WordPress 等）需要 monolith `-F`，也一律放 overlay。
 2. 新增 `_domain_subcoll_name(url)` 提取器
 3. 新增 `_find_existing_domain_collection(url)`：**先**在库内查 `Misc--<sub>` 是否已存在，**命中则直接返回** coll_key（绕过多信号评分）
 4. `archive_url` 调用顺序：**域名硬映射 → 多信号评分 → create_misc_subcollection**
@@ -246,20 +244,20 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 
 **典型场景**：
 - 微信公众号 → **域名硬映射** → 库内 `Misc--wechat` 命中（v1.8.0）✓
-- Quanta 神经科学文章 → 多信号评分命中 `Misc--neuroscience`（content 已含 brain/memory/neural 等词）
-- John D. Cook "A crank formula for π" → 多信号评分命中 `Misc--pi/π`（content 已含 π/transcendental 等词）
-- 全新主题文章（如 Rust 入门）→ 无任何 coll 匹配 → 新建 `Misc--rust/xxx`（保留你主动建 coll 的习惯）
+- 神经科学文章 → 多信号评分命中 `Misc--<topic>`（该 coll 的 content 已含 brain/memory/neural 等词）
+- 数学文章 → 多信号评分命中 `Misc--<topic>`（content 已含 π/transcendental 等词）
+- 全新主题文章 → 无任何 coll 匹配 → 新建 `Misc--<topic>`（保留你主动建 coll 的习惯）
 
 ### Subcollection 命名策略（v1.7.2 重构 + v1.8.0 与 DOMAIN_TO_SUBCOLL 统一）
-**问题**：旧实现 `create_misc_subcollection(title + " " + description)` 只取标题前 2 个词，对"标题党"文章（如 "The Smallest Brain You Can Build" 关于 perceptron）会错配成 `Misc--smallest/brain`。
+**问题**：旧实现 `create_misc_subcollection(title + " " + description)` 只取标题前 2 个词，对"标题党"文章（如标题里最抓眼的形容词 + 名词，与真正主题无关）会错配成 `Misc--smallest/brain` 这类名字。
 
 **v1.8.0 重构**：`create_misc_subcollection` 拆出三个独立函数，命名逻辑只走一个权威路径：
-- `_domain_subcoll_name(url)` — 已知平台域名硬映射（17 个平台，与匹配流程共享同一张表）
+- `_domain_subcoll_name(url)` — 域名硬映射（内置通用平台表 + 本地 overlay，与匹配流程共享同一张表）
 - `_fallback_sub_name_from_url(url)` — 未知域名时取主域第一段
 - `_fallback_sub_name_from_title(name_hint)` — title 文本取前 2 个有意义 token
 
 **新策略**——多信号优先级：
-1. **已知平台域名**（最高优先）：调用 `_domain_subcoll_name(url)`，覆盖 `weixin.qq.com→wechat` / `chaspark.com→chaspark` / `github.com→github` / `arxiv.org→arxiv` / `bilibili.com→bilibili` / `xhs→xhs` / `zhihu→zhihu` / `juejin→juejin` / `hn→hn` / `stackoverflow→stackoverflow` / `medium→medium` / `substack→substack` / `youtube→youtube` / `podcast→podcast` / `spotify→spotify` / `wikipedia→wikipedia` / `infinitelymore.xyz→infinitelymore` / `gatesnotes.com→gatesnotes` / `alanzucconi.com→alanzucconi` / `lemire.me→lemire` 等
+1. **已知平台域名**（最高优先）：调用 `_domain_subcoll_name(url)`，覆盖微信公众号 / 茶思屋 / B 站 / 小红书 / 知乎 / 掘金 / GitHub / arXiv / HN / StackOverflow / Medium / Substack / YouTube / Apple Podcasts / Spotify / Wikipedia / Google 系 / Microsoft 系，以及**用户在 overlay 里自加的任何域名**（含个人博客）
 2. **URL 主域第一段**（未知域名兜底）
 3. **title 词**（非 URL 时）：如 `perceptron-explained-from-scratch` → `perceptron/scratch`
 4. **用户提供的 #tag**（可选）：如 `#感知机` → `感知机`
@@ -269,9 +267,9 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 **典型场景**：
 - `mp.weixin.qq.com/s/abc123` → 域名硬映射 → `Misc--wechat` ✓
 - `chaspark.com/xxx` → 域名硬映射 → `Misc--chaspark` ✓
-- `ranpara.net/posts/perceptron-explained-from-scratch/` + `#感知机` → 未知域名 + URL slug → `Misc--perceptron/scratch`
-- `johndcook.com/blog/2026/06/06/from-kepler-to-bessel/` + `#math` → 未知域名 + URL slug → `Misc--kepler/bessel`
-- `github.com/zzeitt/zot-tool` → 域名硬映射 → `Misc--github` ✓
+- `example.com/posts/perceptron-explained-from-scratch/` + `#感知机` → 未知域名 + URL slug → `Misc--perceptron/scratch`
+- `example.com/blog/2026/06/06/from-kepler-to-bessel/` + `#math` → 未知域名 + URL slug → `Misc--kepler/bessel`
+- `github.com/<owner>/zot-tool` → 域名硬映射 → `Misc--github` ✓
 
 ### 二进制文件识别规则
 - URL path 以 `.pdf`/`.epub`/`.mobi`/`.docx` 等扩展名结尾
@@ -342,23 +340,23 @@ alias zot="python3 scripts/zot.py"
 - **arXiv PDF 元数据源改写为摘要页**：新增 `_arxiv_abs_url()`（与 `_arxiv_pdf_url` 方向相反），`/pdf/<id>` 抓取前改写为 `/abs/<id>` → 拿到真实标题 + 完整摘要（`citation_abstract` 优先），并剥离 `<title>` 里 `[2608.20711] ` 编号前缀。
 - **repository 不再硬编码 arXiv**：`archive_url` 从 `meta["repository"]` 取值，支持多预印本平台。
 - **Note 降级映射补 `preprint`**：`type_map` / `type_label_map` 增加 `preprint → 📄 论文`。
-- **修复存量误分类**：`BEPI8IPB`（本会话归档）+ `Misc--arxiv` 内 2 条历史 `webpage`（RZKWE33I、FVIVXGUC）已批量 PATCH 为 `preprint` + `repository=arXiv`。
+- **修复存量误分类**：`<item-key>`（本会话归档）+ `Misc--arxiv` 内 2 条历史 `webpage`（<item-key-1>、<item-key-2>）已批量 PATCH 为 `preprint` + `repository=arXiv`。
 
 ### v2.3.5 — patch 修复
 
-- **`alanzucconi.com → alanzucconi` 域名映射**：Alan Zucconi 个人数学/图形/Unity 教学博客（2026-08-31 验证：`xorshift-generators` 51K 字长文被多信号评分误匹配到 `Misc--《The Mystery of the Prime Numbers》`。加进 `DOMAIN_TO_SUBCOLL` 后未来命中或创建 `Misc--alanzucconi`，已预创建 key `A24ZFB7Q`（item `7F4A6PRZ`））。
+- **个人博客域名映射（数学/图形教学类）**：新增 1 条个人博客 → `Misc--<blog>` 映射（2026-08-31 验证：一篇长文被多信号评分误匹配到某个书名 coll）。加进 `DOMAIN_TO_SUBCOLL` 后未来命中或创建 `Misc--<blog>`，并预创建了该 coll。**v2.5.0 起该映射已移入本地 overlay。**
 
 ### v2.3.4 — patch 修复
 
-- **`barrd.dev → barrd` 域名映射**：Dave 的 Bristol 个人技术博客（2026-08-31 验证）。barrd.dev 描述 "Git worktree ... without stashing or constant checkouts" 被多信号评分误匹配到 Turing《On Computable Numbers, with an Applicatoin to the Entscheidungsproblem》（`without`/`decision` 与 coll name 偶然高分）。加进 `DOMAIN_TO_SUBCOLL` 后未来命中或创建 `Misc--barrd`。
+- **个人博客域名映射（devops 类）**：新增 1 条个人技术博客 → `Misc--<blog>` 映射（2026-08-31 验证：文章描述里的常见词与某个 coll 名偶然高分，导致误匹配）。加进 `DOMAIN_TO_SUBCOLL` 后未来命中或创建 `Misc--<blog>`。**v2.5.0 起该映射已移入本地 overlay。**
 
 ### v2.3.3 — patch 修复
 
-- **`gatesnotes.com → gatesnotes` 域名映射**：Bill Gates 个人博客（2026-08-31 验证）。`gatesnotes.com` 走 Cloudflare 反爬，curl/Python 全部 403，`fetch_url_metadata` 拿到 "Access Denied" 作为标题、description 为空 → 多信号评分无信号命中 → `create_misc_subcollection` 退化 fallback `Misc--www` 垃圾命名。加进 `DOMAIN_TO_SUBCOLL` 后未来命中 `Misc--gatesnotes`（已预创建，key `6MVGEDXC`）。
+- **个人博客域名映射（Cloudflare 拦截类）**：新增 1 条个人博客 → `Misc--<blog>` 映射（2026-08-31 验证）。该站走 Cloudflare 反爬，curl/Python 全部 403，`fetch_url_metadata` 拿到 "Access Denied" 作为标题、description 为空 → 多信号评分无信号命中 → `create_misc_subcollection` 退化 fallback 出 `Misc--<主域>` 这类垃圾命名。加进 `DOMAIN_TO_SUBCOLL` 后命中/创建 `Misc--<blog>`，并预创建了该 coll。**v2.5.0 起该映射已移入本地 overlay。**
 
 ### v2.3.2 — patch 修复
 
-- **`infinitelymore.xyz → infinitelymore` 域名映射**：Joel David Hamkins 的 Substack 频道（集合论/数学哲学付费 newsletter）此前走多信号评分时会被误匹配到《Handbook of Floating-Point Arithmetic》（2026-08-25 验证）；加进 `DOMAIN_TO_SUBCOLL` 后走硬映射 → 命中或创建 `Misc--infinitelymore`，避免误判。
+- **个人博客域名映射（Substack newsletter 类）**：新增 1 条个人博客 → `Misc--<blog>` 映射（2026-08-25 验证：此前走多信号评分时会被误匹配到某个书名 coll）。加进 `DOMAIN_TO_SUBCOLL` 后走硬映射 → 命中或创建 `Misc--<blog>`，避免误判。**v2.5.0 起该映射已移入本地 overlay。**
 
 ### v2.3.1 — patch 修复
 
