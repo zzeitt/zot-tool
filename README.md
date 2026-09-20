@@ -22,6 +22,11 @@ zot
 │   ├── remove  <key> <tag>...                        移除标签
 │   ├── set     <key> [tag]...                        替换全部标签
 │   ├── list    <key>                                 列出条目标签
+│   ├── vocab   [--refresh] [--all] [--min-count N]   打印词表（派生的高频 tag 表）
+│   │           [--root R] [--orphans] [--dupes]      --orphans = merge 工作清单
+│   │           [--json] [--cache-path]
+│   ├── suggest <title> [desc] [--json]               预览会打哪些 tag（不写库）
+│   ├── merge   <old> <new> [--dry-run] [--limit N]   全库合并 tag
 │   └── <query> [n]                                   按标签搜索（向后兼容）
 ├── coll
 │   ├── list                                          列出所有 Collection
@@ -88,13 +93,22 @@ zot tag "/unread"
 zot coll "machine-learning"
 
 # 读完去掉 /unread
-zot tag remove KC5ETPXM "/unread"
+zot tag remove ABCD1234 "/unread"
 
 # 加标签
-zot tag add KC5ETPXM "#AI🤖" "#paper📄"
+zot tag add ABCD1234 "/demo📦" "#demo-alpha"
+
+# 看词表（agent 挑 tag 的候选池）
+zot tag vocab --orphans
+
+# 预览某标题会打哪些 tag（不写库）
+zot tag suggest "A synthetic title about demo widgets"
+
+# 治理存量发散 tag
+zot tag merge "#demo-alphas" "#demo-alpha" --dry-run
 
 # 上传附件
-zot attachment add KC5ETPXM paper.pdf
+zot attachment add ABCD1234 paper.pdf
 
 # 修离线 HTML
 zot attachment update A1B2C3D4 fixed.html
@@ -123,12 +137,30 @@ zot item remove ABCD1234
 | `ZOTERO_WEBDAV_PASS` | 否 | — | WebDAV 密码 |
 | `ZOTERO_ARCHIVE_TRIGGER` | 否 | `【归档到Zotero】` | AI 触发词 |
 | `ZOTERO_OFFLINE_DIR` | 否 | 系统 temp | 无 WebDAV 时本地保存 |
+| `ZOTERO_VOCAB_DIR` | 否 | 系统 temp `/zot_vocab` | 库派生数据目录（标签词表 + 域名 overlay）。**必须在仓库之外** |
+| `ZOTERO_DOMAIN_MAP` | 否 | `<ZOTERO_VOCAB_DIR>/domain_overrides.json` | 域名 overlay 文件路径 |
+
+### 域名 overlay（`domain_overrides.json`）
+
+内置的 `DOMAIN_TO_SUBCOLL` 只放**通用平台**。个人博客等库特定域名走本地 overlay（默认在系统 temp 目录下，**不进版本控制**）：
+
+```json
+{
+  "schema": 1,
+  "map": { "my-favourite-blog.example": "myblog" },
+  "no_fonts": ["my-favourite-blog.example"]
+}
+```
+
+- `map`：域名 → `Misc--<name>`，优先于内置表，可覆盖任何域名
+- `no_fonts`：这些域名归档时给 monolith 加 `-F`（字体重页面会超时）
+- 文件缺失/损坏 → 当作空 overlay，归档不会失败
 
 ## 约定
 
 - 🚫 `🙊Personal` 及其子 Collection 始终排除
 - 📌 新条目自动打 `/unread`，处理后手动移除
-- 🏷️ Tag：`#关键词🤖`，无空格，最多 3 个，优先匹配库内已有
+- 🏷️ Tag：本库命名法 `/rootEmoji` + `#root-child`，无空格，每条 **1 root + ≤7 children**，优先复用库内已有，写 `type: 0`（manual）
 - 🔤 排序：`item search` → 相关性；`item list` / `coll` → dateAdded 降序
 - 📁 Archive 自动识别：HTML → monolith；PDF/EPUB → 直下
 - 📎 附件存 WebDAV，ZIP + `.prop` 侧车

@@ -46,16 +46,21 @@ _misc_key = None
 
 
 @pytest.fixture(scope="session")
-def test_env():
+def test_env(tmp_path_factory):
     """Set env vars for test group library (session-scoped, runs once).
 
     Uses os.environ directly (not monkeypatch) so imports after this fixture
     see the test values.
+
+    ZOTERO_VOCAB_DIR points at a throwaway directory: the vocab/domain-overlay
+    caches hold data derived from whichever library the tests hit, and must
+    never land in (or be read from) the developer's real cache.
     """
     saved = {}
     overrides = {
         "ZOTERO_LIBRARY_ID": TEST_LIBRARY_ID,
         "ZOTERO_LIBRARY_TYPE": TEST_LIBRARY_TYPE,
+        "ZOTERO_VOCAB_DIR": str(tmp_path_factory.mktemp("zot_vocab")),
     }
     for k, v in overrides.items():
         saved[k] = os.environ.get(k)

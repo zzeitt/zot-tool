@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.4.1
+version: 2.5.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -13,6 +13,31 @@ Zotero 文献库命令行管理工具，支持高级搜索、标签过滤、Coll
 - `ZOTERO_LIBRARY_ID` 环境变量已设置（你的 Zotero Library ID）
 - Library Type: user
 - `ZOTERO_WEBDAV_URL/USER/PASS`：坚果云 WebDAV 端点及凭证（附件上传必需）
+
+### 本地数据目录（**不在仓库内**）
+
+派生自**你自己的库**的数据（标签词表、域名 overlay）一律落在仓库之外，绝不进版本控制：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ZOTERO_VOCAB_DIR` | `%TEMP%/zot_vocab`（Unix: `/tmp/zot_vocab`） | 库派生数据的根目录 |
+| `ZOTERO_DOMAIN_MAP` | `<ZOTERO_VOCAB_DIR>/domain_overrides.json` | 域名 overlay 文件路径 |
+
+`domain_overrides.json` 格式（用于给**任何**域名加硬映射，含个人博客）：
+
+```json
+{
+  "schema": 1,
+  "map": { "my-favourite-blog.example": "myblog" },
+  "no_fonts": ["my-favourite-blog.example"]
+}
+```
+
+- `map`：域名 → `Misc--<name>` 的子集合名。**优先于**内置的通用平台表，因此可以覆盖任何域名。
+- `no_fonts`：这些域名归档时给 monolith 加 `-F`（字体重页面会超时）。
+- 文件缺失 / 损坏 / 无权限 → 当作空 overlay，**归档不会因此失败**。
+
+> ⚠️ 该文件默认在临时目录里，可能被系统清理。它是你个人博客映射的唯一副本，建议自己留一份备份。
 
 ### Windows 环境注意事项
 
@@ -66,7 +91,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 
 > **Aliases**: `zot archive` → `item archive` | `zot add` → `item add` | `zot delete` → `item remove` | `zot addnote` → `note add` | `zot setnote` → `note set`
 
-### 标签管理 —— Tag 增删改查 (v1.10.0)
+### 标签管理 —— Tag 增删改查 (v1.10.0 / v2.5.0)
 
 | 命令 | 说明 | 场景 |
 |---|---|---|
@@ -74,8 +99,11 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 | `zot tag remove <key> <tag>...` | 移除指定 tag(s) | 条目读完后去掉 `/unread` |
 | `zot tag set <key> <tag>...` | 替换全部 tags（不传 tag = 清空） | 批量重整标签 |
 | `zot tag list <key>` | 列出某条目的所有 tags | 查看条目有哪些标签 |
+| `zot tag vocab [--refresh] [--json] [--orphans] [--dupes]` | 打印词表（按频次降序派生的高频 tag 表） | agent 挑 tag 前先看候选池 |
+| `zot tag suggest <title> [desc]` | 不写库的 dry-run，预览会打哪些 tag | 归档前预检 / 排查误匹配 |
+| `zot tag merge <old> <new> [--dry-run]` | 全库合并 tag | 治理存量发散 tag |
 
-> **两种用法**：`zot tag add/remove/set/list ...` → Tag CRUD；`zot tag <query> [limit]` → 按 tag **搜索**（向后兼容）。Alias: `zot tags <k>` → `tag list <k>`。
+> **两种用法**：`zot tag add/remove/set/list/vocab/suggest/merge ...` → Tag 子命令；`zot tag <query> [limit]` → 按 tag **搜索**（向后兼容）。Alias: `zot tags <k>` → `tag list <k>`。
 
 ### 附件管理 —— 文件上传、查看、替换 (v1.9.0 / v1.11.0)
 
@@ -98,10 +126,10 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 1. 提取 URL
 2. 抓取标题、描述、平台类型
 3. **Cloudflare 反爬检测**（v1.7.1+）：若 curl 拿到 `Attention Required` 等 CF 拦截页，输出 `⚠️ CLOUDFLARE_BLOCKED` 标记，让 AI 看到后用 browser fallback 补抓正文
-4. 推断合适的 itemType 和 tags
+4. 推断合适的 itemType。tags 交给 `infer_tags_structured()`：**先从词表匹配库内已有 tag，命中不了才新建**，输出 `1 root + ≤7 children`（**v2.5.0**；旧版是 `#领域🤖` 最多 3 个）
 5. 在已有 Collections 中查找最佳匹配（**v1.8.0+: 域名硬映射 → 多信号评分（v1.7.0+）**，无匹配则创建 Misc--xxx 子集合）
 6. 自动添加 /unread 标签
-7. 用户提供的 #tag 建议（若有）优先，未满 3 个时由 infer_tags 补足
+7. 用户提供的 `#tag` 提示**优先占 children 席位且原样保留**；未满 7 个时由匹配结果补足。词表不可用时**只打 `/unread`，不发明 tag**，并写 `zot_pending/tags_*.json` 交给 agent 兜底
 8. **自动识别文件类型**：
    - 二进制文件（PDF/EPUB 等）→ 直接下载原始文件，上传到 WebDAV
    - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
@@ -195,7 +223,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 - 微信公众号 → 库内 `Misc--wechat` 命中 → 不再创建中文长名 coll ✓
 - 茶思屋 chaspark.com → 库内 `Misc--chaspark` 命中 ✓
 - Bilibili / 知乎 / 小红书 / 掘金 → 各自的 `Misc--<sub>` 命中 ✓
-- 全库 516 → 369 colls（清掉 55 个空 coll）→ 0 empty ✓
+- 空 collection 批量清理后全库 0 empty ✓
 
 ### 离线副本 Visual Sanity Check（v1.7.3+）
 - **触发**：每次 `zot archive` 成功保存 monolith HTML 后，输出 `📸 VISUAL_CHECK_READY: /var/minis/offloads/<file>.html`
@@ -230,7 +258,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 **问题**：
 - 早期版本用 4 字符前缀子串匹配 → "transferable" 误匹配 "transformer"
 - 完全忽略 coll 已收录的内容信号
-- **v1.7.4 发现的更严重 bug**：`zot.collections()` 默认 limit=100，但用户的库有 707 colls，旧代码只看了前 100 条（14%），86% 的 coll 完全没参与匹配。即使 `Misc--pi/π` 已经存在，旧代码也看不到！
+- **v1.7.4 发现的更严重 bug**：`zot.collections()` 默认 limit=100，而大库的 coll 数远超这个数，旧代码只看了最前面一小部分（约 14%），其余 coll 完全没参与匹配。即使目标 `Misc--<topic>` 已经存在，旧代码也看不到！
 - **v1.8.0 修复**：`_all_collections()` 用 `zot.everything()` 真正分页拉完所有 colls + 5 分钟 TTL 缓存（之前 SKILL.md 已承诺但代码缺失）。
 
 **新策略**——三维信号评分，阈值 ≥ 3 才匹配：
@@ -239,7 +267,7 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 3. 缓存：单次 bulk zot.items() 拉取所有 items 本地分组，签名缓存 5 分钟 TTL
 
 **两遍扫描**（v1.7.2 性能优化）：先用 name 评分筛出 top 5 候选（无 API 调用），再 fetch content signature。
-**希腊字母支持**（v1.7.4）：regex 包含 `\u0370-\u03ff\u1f00-\u1fff`，否则 `Misc--pi/π` 里的 `π` 永远无法匹配。
+**希腊字母支持**（v1.7.4）：regex 包含 `\u0370-\u03ff\u1f00-\u1fff`，否则 coll 名里的希腊字母（如 `π`）永远无法匹配。
 **分页拉取所有 colls**（v1.7.4→v1.8.0 落地）：`_all_collections()` 替代 `zot.collections()`，分页拉完 + 5 分钟缓存。
 
 **典型场景**：
@@ -280,23 +308,89 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 - 二进制文件无 WebDAV 配置时跳过离线保存
 - `--no-offline` 参数可强制跳过
 
-## 标签约定
+## 标签约定（v2.5.0 重写）
 
-- **优先使用本库中已存在的标签**（模糊匹配，禁止用带空格的 tag）
-- **新生成 tag 格式**：`#领域-子领域🤖` 或 `#领域🤖`（带 `#` 前缀 + emoji 后缀）
-  - 例如：`#AI-ML🤖`、`#编程💻`、`#经济💰`、`#advice🔗`
-  - 最多 3 个 tag，优先取最相关的
-- emoji 映射规则（`scripts/zot.py` 中的 `_emoji_for_tag`）：
-  - 🤖 AI/机器学习 | 💰 经济金融 | 💻 编程开发 | 🔢 数学统计 | 🤔 哲学逻辑
-  - 🎙️ 播客 | 📺 视频 | 📚 教程 | 🛠️ 工具 | 📄 论文 | 📖 书籍 | 📜 历史
-  - 🔬 科学 | 🏥 健康 | 🌍 政治社会 | 🎨 艺术设计 | 🎮 游戏 | 📊 数据
-  - 🎵 音乐 | 🖼️ 图像 | 🔒 安全隐私 | 🌐 网络 | 💼 商业 | 🏠 房产
-  - ✍️ 写作 | 🌱 生活 | 其他 → 🔗
-- **fallback**：无法匹配预设规则时，取标题第一个有意义的英文词作为 tag
+> ⚠️ **本仓库是公开仓库。** 下面所有示例一律是**合成** tag（`/demo📦`、`#demo-alpha`），
+> 不代表任何真实库的内容。真实的 tag 名、计数、collection 名、任何 key
+> 都**不得**出现在源码 / 测试 / 文档 / 提交信息里 —— 它们只活在
+> `ZOTERO_VOCAB_DIR`（仓库外）的运行时缓存中。
+
+### 命名法（本库的既有规律）
+
+| 形态 | 含义 | 例（合成） |
+|---|---|---|
+| `/slug<emoji>` | **level-1 root**（主题） | `/demo📦` |
+| `#slug-child[-leaf]` | 层级子标签，挂在某个 root 下 | `#demo-alpha`、`#demo-alpha-beta` |
+| `/unread` `/reading` `/done` | **状态 tag**，不参与主题匹配 | `/unread` |
+
+- 全部小写，用 `-` 连接，**禁止空格**（带空格的 tag 会被直接丢弃）
+- root 的 slug 必须与既有 root 一致：库内已有 `/demo📦` 时，再造 `/demo🔗` 就是发散
+
+### 复用优先（这是 v2.5.0 的核心）
+
+**先看库里有什么，再看文本能命中什么。** 每次归档：
+
+1. 从服务器按**频次降序**拉取词表（`GET /tags?sort=numItems&direction=desc`），
+   落在 `ZOTERO_VOCAB_DIR/tags.json`，24h 内复用
+2. 用标题/描述去匹配**已有的** root 与 children，命中即复用
+3. 命中不了才新建，且新 tag 立刻写回缓存 —— **下一次归档就能复用**
+
+> 旧实现调用 `zot.tags(limit=200)`，而该端点默认按 `numItems` **升序**排序，
+> 拿回的是全库**最冷门**的 200 个 tag；叠加另外两个缺陷后复用从未生效过。
+> 词表因此改为显式 `direction=desc` 的裸 HTTP 分页拉取。
+
+### 输出形态
+
+**1 个 root + 至多 7 个 children**（旧版是最多 3 个 tag）：
+
+- root 由 matched children 的得分累加选出，状态 root 永不参与
+- children 中英文**成对添加**，逐步完善中文 tag 体系
+- 用户传来的 `#tag` 提示优先占 children 席位且原样保留；
+  裸词提示补成 `#<root>-<word>`，避免落成无归属的 orphan
+- 无词表可用时**只打 `/unread`，绝不发明 tag**（无词表还发明正是发散的成因）
+
+### 中英配对：CLI 能做什么、不能做什么
+
+- **能**：匹配文本里出现的那个语种；若 `pairs.json` 里登记了配对**且配对 tag
+  确实存在于库内**，则双语都打（绝不凭空造一个库里没有的 tag）
+- **不能**：为没登记配对的概念生成另一种语言的 slug（需要翻译）
+
+配对知识是**库特定**的，因此只存在于 `ZOTERO_VOCAB_DIR/pairs.json`，源码里不留任何 seed：
+
+```json
+{"pairs": [{"en": "demo-alpha", "zh": "demo-阿尔法"}]}
+```
+
+### 交给 agent 的异步部分
+
+归档后若存在「待翻译」缺口，会写 `$TEMP/zot_pending/tags_<item_key>.json`，内含
+`needs[{concept, have, have_lang, want_lang, want_example}]` 与中文 instructions。AI 读到后：
+
+1. 按 `needs` 生成另一种语言的 slug（翻译是 LLM 的职责）
+2. `zot tag add <item_key> "#<root_slug>-<中文 slug>"`
+3. 可选：把这对写进 `pairs.json`，以后即可自动双语
+4. 删除该 pending 文件
+
+### tag type：一律写 0（manual）
+
+新建 tag 写 `{"tag": ..., "type": 0}`；复用已存在的 tag 时沿用词表观测到的 type。
+**不要写 1（automatic）** —— Zotero 标签选择器的调色板菜单里有
+「Delete Automatic Tags in This Library…」（一键删除全库自动标签，**不可撤销**）
+与「Show Automatic Tags」开关，type 1 的 tag 处于可被一键清空 / 可被隐藏的桶里。
+
+### 词表命令（agent 挑 tag 的候选池）
+
+| 命令 | 说明 |
+|---|---|
+| `zot tag vocab` | 打印词表（`--refresh` 强制拉取、`--all` 不过滤、`--min-count N`、`--root R`、`--json`、`--cache-path`） |
+| `zot tag vocab --orphans` | 列无归属的 `#` tag —— `tag merge` 的工作清单 |
+| `zot tag vocab --dupes` | 按归一化 slug 分组列出同义变体 |
+| `zot tag suggest <title> [desc]` | 不写库的 dry-run：预览 root + children + 新建项 + 待翻译项（别名 `candidates`） |
+| `zot tag merge <old> <new>` | 全库把 old 合并进 new（`--dry-run` 预览、`--limit N` 限流） |
 
 ### /unread 标签
 **所有新添加的条目必须自动带上 /unread 标签。** 这是本库的核心约定：
-- 新建条目 → 自动附加 `{"tag": "/unread", "type": 1}`
+- 新建条目 → 自动附加 `{"tag": "/unread", "type": 0}`
 - 读完/处理完后 → 手动移除 `/unread` 标签
 
 ## 隐私保护
@@ -325,12 +419,47 @@ alias zot="python3 scripts/zot.py"
 
 ## 版本历史
 
-### v2.4.1 — `lemire.me` 硬映射 + collection flow 修正 + monolith `-F`
+### v2.5.0 — 本库原生 Tag 体系（复用优先 + 双语层级）
 
-- **`lemire.me → lemire` 域名映射**：Daniel Lemire 个人 CPU 基准评测博客（2026-09-20 验证：`how-did-apple-silicon-get-50-faster-in-three-years` 多信号评分严重误判匹配到《How to Win Friends and Influence People》coll —— "people" 关键字巧合）。与 alanzucconi/barrd/gatesnotes 同类个人博客 → 加进硬映射 → 命中/创建 `Misc--lemire`。
-- **archive_url collection flow 修正**（关键 bugfix）：v1.8.0 的设计是"硬映射命中 `Misc--<sub>` 已存在 → 直接返回；不命中 → fall through 到多信号评分"。这导致 lemire.me 第一次归档时（`Misc--lemire` 还不存在）走评分分支 → 误判。**新流程**：`_domain_subcoll_name(url)` 命中 → 强制走 `create_misc_subcollection` 创建 `Misc--<sub>`，**完全跳过评分**。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
-- **monolith `-F` 标志扩展到 lemire.me**：Cloudflare-fronted WordPress + Google Fonts 挂载导致 240s 超时，加 `-F` 跳字体后 3.3MB/数十秒完成。
-- **archive 时自动按域名添加 `-F`**：现在 Google 系 + lemire.me 共 7 个域名默认 `--no-fonts`。
+- **根因修复：复用从未生效过。** 旧 `get_existing_tags()` 调 `zot.tags(limit=200)`，
+  而 `/tags` 端点的**默认排序是 `numItems` 升序** —— 拿回的是全库**最冷门**的 200 个 tag。
+  叠加「模糊匹配要求 ≥2 词命中」（单 token tag 永远匹配不上）与「`#领域🤖` 格式与库内
+  命名法永不碰撞」，每次归档都必然新建 tag。改为显式 `sort=numItems&direction=desc`
+  的裸 HTTP 分页拉取（pyzotero 的 `retrieve` 装饰器会把含 `tags` 的 URL 拍平成字符串名，
+  计数拿不到），约 4 个请求即可拿全「用过 ≥3 次」的 tag。
+- **不维护手工高频表**：那份表是**派生的、永远新鲜的**，落在 `ZOTERO_VOCAB_DIR/tags.json`，
+  24h TTL；拉取失败回退陈旧磁盘缓存（**陈旧词表严格优于无词表**）；完全无词表时
+  **只打 `/unread`，绝不发明 tag**。
+- **改用本库命名法**：`/rootEmoji` = level-1 root，`#root-child[-leaf]` = 层级子标签，
+  `/unread` `/reading` `/done` = 状态 tag（不参与主题匹配）。废弃 `#领域🤖`。
+- **输出形态 3 → 1+≤7**：1 个 root + 至多 7 个 children。children 得分累加到各自 root
+  再选 root；用户 `#tag` 提示优先占席位；裸词提示补成 `#<root>-<word>`。
+- **中英成对**：`pairs.json` 登记配对**且配对 tag 确实在库内**才双语都打；
+  无配对的缺口写 `zot_pending/tags_<key>.json` 异步交给 agent 翻译。
+- **手动标签优先**：库内「仅 automatic」的 tag 混着导入抓来的英文短语式元数据垃圾，
+  而用户策展的词汇表全是 manual，故对 auto-only 追加 `W_AUTO_ONLY = 0.5` 降权系数。
+  热度先验用**乘法**（`1 + 0.30 × prior`）—— 加法会把零文本证据的高频 tag 顶上来。
+- **tag type 改 0（manual）**：旧代码硬编码 `type: 1`，导致 CLI 打的每个 tag 都落进
+  「可被 Delete Automatic Tags 一键清空（不可撤销）/ 可被 Show Automatic Tags 隐藏」的桶。
+- **新增三个命令**：`zot tag vocab`（含 `--orphans`/`--dupes`/`--cache-path`）、
+  `zot tag suggest`（别名 `candidates`）、`zot tag merge`（批量合并，`update_items` 分批
+  + 逐条回退，显式清理同名 0/1 两条）。
+- **隐私：库特定知识一律出源码。** 源码中不再有任何具体 tag 字面量（唯一例外是
+  公共约定 `/unread`），也没有 `_TAG_PAIRS_SEED`。词表 / 配对 / 域名 overlay 全部落在
+  `ZOTERO_VOCAB_DIR`（仓库外）。删除 `_extract_concepts` 时一并移除了硬编码在公共源码里的
+  两个真实中文 tag 字面量。**注意：文件级脱敏不清除 git 历史。**
+- **域名 overlay**：个人博客类域名映射移入 `domain_overrides.json`（默认与词表同目录），
+  优先于内置的通用平台表；文件缺失/损坏 → 静默退回内置表，归档不失败。
+  `DOMAIN_TO_SUBCOLL` 只保留通用平台。
+- **其它**：`_strip_diacritics` / `_title_keywords` 从 `_extract_concepts` 的嵌套 helper
+  提为模块级；新增 `_parse_tag_hints` / `_merge_tag_plan` 单点保证输出形态。
+
+### v2.4.1 — 个人博客硬映射 + collection flow 修正 + monolith `-F`
+
+- **个人博客域名映射**：新增 1 条个人博客 → `Misc--<blog>` 映射。此前该站长文走多信号评分时被严重误判匹配到完全无关的 coll（标题里的常见词与 coll 名偶然撞车）。加进硬映射 → 命中/创建 `Misc--<blog>`。（**v2.5.0 起这类映射已外置到本地 overlay，不再进源码。**）
+- **archive_url collection flow 修正**（关键 bugfix）：v1.8.0 的设计是"硬映射命中 `Misc--<sub>` 已存在 → 直接返回；不命中 → fall through 到多信号评分"。这导致该域名第一次归档时（`Misc--<blog>` 还不存在）走评分分支 → 误判。**新流程**：`_domain_subcoll_name(url)` 命中 → 强制走 `create_misc_subcollection` 创建 `Misc--<sub>`，**完全跳过评分**。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
+- **monolith `-F` 标志扩展到该域名**：Cloudflare-fronted WordPress + Google Fonts 挂载导致 240s 超时，加 `-F` 跳字体后数十秒完成。
+- **archive 时自动按域名添加 `-F`**：Google 系 + 该域名默认 `--no-fonts`（v2.5.0 起改为「内置 Google 系 + overlay `no_fonts`」）。
 
 ### v2.4.0 — arXiv/预印本 itemType 修复
 
