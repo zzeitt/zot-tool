@@ -1202,7 +1202,10 @@ def _vocab_note_new_tags(names):
 
     没有这一步，「复用优先」要等 24h TTL 过期才生效 —— 也就是根本没生效。
     """
-    tags = [n for n in (names or []) if n and " " not in n]
+    # root 先插：child 的归属需要完整的 root 集合，顺序反了 child 会落成孤儿
+    # 且再也不会被重新归属（sorted 稳定，组内原序不变）
+    tags = sorted((n for n in (names or []) if n and " " not in n),
+                  key=lambda t: 0 if t.startswith("/") else 1)
     if not tags:
         return
     disk = _read_vocab_file()

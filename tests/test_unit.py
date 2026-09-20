@@ -503,6 +503,21 @@ class TestVocabCacheRoundTrip:
         assert plan["root"] == "/fresh🎈"
         assert "#fresh-thing" in plan["children"]
 
+    def test_note_new_tags_orders_root_first(self, zot, tmp_path, monkeypatch):
+        """Children must be filed under the root even if passed child-first.
+
+        A child inserted before its root would land in ``orphans`` and never
+        be re-filed — the reuse guarantee would silently break.
+        """
+        monkeypatch.setenv("ZOTERO_VOCAB_DIR", str(tmp_path))
+        zot._write_vocab_file(_synthetic_vocab())
+        zot._vocab_note_new_tags(["#later-thing", "/later🎈"])
+        disk = zot._read_vocab_file()
+        assert any(r["tag"] == "/later🎈" for r in disk["roots"])
+        assert [c["tag"] for c in disk["children"]["later"]] == ["#later-thing"]
+        assert not any(o["tag"] == "#later-thing" for o in disk["orphans"])
+
+
     def test_pairs_file_round_trip(self, zot, tmp_path, monkeypatch):
         monkeypatch.setenv("ZOTERO_VOCAB_DIR", str(tmp_path))
         with open(zot._pairs_path(), "w", encoding="utf-8") as f:

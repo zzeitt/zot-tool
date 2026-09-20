@@ -149,31 +149,72 @@ class TestTagVocab:
             f"cache path is inside the repo: {path}"
 
     def test_vocab_fetch(self, zot_mod, capsys):
-        """A fetched vocabulary satisfies the structural invariants."""
+        """A fetched vocabulary satisfies the structural invariants.
+
+        The test library is a scratch library that holds few or no tags at
+        any given moment (every test cleans up after itself), so these are
+        invariants — never expectations about which tags exist.
+        """
         zot_mod.tag_vocab(refresh=True, as_json=True)
         vocab = _json_from(capsys.readouterr().out)
         for key in ("roots", "children", "orphans", "pairs", "local_new"):
             assert key in vocab, f"missing {key}"
-        assert vocab["count"] >= len(vocab["roots"])
+
         root_slugs = {r["slug"] for r in vocab["roots"]}
+        for r in vocab["roots"]:
+            assert r["tag"].startswith("/")
+            assert r["slug"]
+            assert r["status"] is (r["slug"] in zot_mod._STATUS_TAG_SLUGS)
         for root_slug, children in vocab["children"].items():
             assert root_slug in root_slugs, \
                 f"children under unknown root {root_slug!r}"
             for c in children:
                 assert c["tag"].startswith("#")
                 assert c["tag"].count(" ") == 0
-        for r in vocab["roots"]:
-            assert r["tag"].startswith("/")
-            assert r["status"] is (r["slug"] in zot_mod._STATUS_TAG_SLUGS)
+                # Longest-root-prefix routing: a child must really sit under
+                # the root it was filed under.
+                body = zot_mod._child_body(c["tag"])
+                assert body == root_slug or body.startswith(root_slug + "-"), \
+                    f"{c['tag']!r} does not belong under {root_slug!r}"
+        for o in vocab["orphans"]:
+            assert o["tag"].startswith("#")
+            body = zot_mod._child_body(o["tag"])
+            assert not any(body == rs or body.startswith(rs + "-")
+                           for rs in root_slugs), \
+                f"orphan {o['tag']!r} actually belongs to a known root"
 
-    def test_vocab_cache_reuse(self, zot_mod):
+        placed = (len(vocab["roots"]) + len(vocab["orphans"])
+                  + sum(len(v) for v in vocab["children"].values()))
+        assert placed <= vocab["count"], \
+            f"placed {placed} tags but only parsed {vocab['count']}"
+
+    def test_vocab_cache_reuse(self, zot_mod, monkeypatch):
         """A second load inside the TTL is served from disk, not the API."""
-        zot_mod.load_vocab(force_refresh=True)
+        calls = []
+        real_fetch = zot_mod._fetch_all_tags_raw
+
+        def counting_fetch(*args, **kwargs):
+            calls.append(1)
+            return real_fetch(*args, **kwargs)
+
+        monkeypatch.setattr(zot_mod, "_fetch_all_tags_raw", counting_fetch)
+
+        fresh = zot_mod.load_vocab(force_refresh=True)   # API + disk write
+        assert len(calls) == 1, "first load should hit the API once"
+
         # Drop the in-memory copy so the disk path is exercised.
         zot_mod._vocab_cache["data"] = None
-        vocab = zot_mod.load_vocab()
-        assert vocab["source"] == "disk"
-        assert vocab["roots"], "disk cache came back empty"
+        cached = zot_mod.load_vocab()
+
+        assert cached["source"] == "disk"
+        assert len(calls) == 1, "second load hit the API instead of disk"
+        # The disk round-trip must be lossless. Comparing against the fresh
+        # fetch keeps this independent of which tags the library happens to
+        # contain (it may contain none at all).
+        assert cached["roots"] == fresh["roots"]
+        assert cached["children"] == fresh["children"]
+        assert cached["orphans"] == fresh["orphans"]
+        assert cached["count"] == fresh["count"]
 
 
 class TestTagSuggest:
