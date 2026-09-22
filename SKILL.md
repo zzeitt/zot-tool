@@ -454,6 +454,11 @@ alias zot="python3 scripts/zot.py"
 - **其它**：`_strip_diacritics` / `_title_keywords` 从 `_extract_concepts` 的嵌套 helper
   提为模块级；新增 `_parse_tag_hints` / `_merge_tag_plan` 单点保证输出形态。
 
+### v2.4.2 — `fs.blog` 硬映射
+
+- **`fs.blog → fs-blog` 域名映射**：Farnam Street — Shane Parrish 署名的心智模型/学习/决策博客（2026-09-21 验证：`/learning/` 「Accelerated Learning」描述里 `learning` / `knowledge` / `brain` 关键词触发多信号评分高分匹配到 `Misc--machine/learning` (X3V2CSDP) — 文章真实主题是「通用学习法/心智模型/决策」，与 machine learning 教科书严重不符。加进硬映射 → 命中/创建 `Misc--fs-blog`）。
+- 跟 gatesnotes / alanzucconi / barrd / lemire 同类独立个人博客。
+
 ### v2.4.1 — 个人博客硬映射 + collection flow 修正 + monolith `-F`
 
 - **个人博客域名映射**：新增 1 条个人博客 → `Misc--<blog>` 映射。此前该站长文走多信号评分时被严重误判匹配到完全无关的 coll（标题里的常见词与 coll 名偶然撞车）。加进硬映射 → 命中/创建 `Misc--<blog>`。（**v2.5.0 起这类映射已外置到本地 overlay，不再进源码。**）
