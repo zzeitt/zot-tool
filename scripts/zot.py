@@ -33,6 +33,21 @@ def _get_offline_dir():
         return os.environ.get("ZOTERO_OFFLINE_DIR", default_dir)
     return os.environ.get("ZOTERO_OFFLINE_DIR", "/tmp/zotero-offline")
 
+def _get_vocab_dir():
+    """Get the library-derived data directory.
+
+    Deliberately OUTSIDE the repository. This directory holds data derived
+    from the user's own Zotero library (tag names + frequencies, domain
+    overrides) that must never be committed to the public repo.
+    """
+    default_dir = os.path.join(_get_temp_dir(), "zot_vocab")
+    return os.environ.get("ZOTERO_VOCAB_DIR", default_dir)
+
+def _get_domain_map_path():
+    """Path to the local domain-override overlay (untracked, outside the repo)."""
+    return os.environ.get("ZOTERO_DOMAIN_MAP",
+                          os.path.join(_get_vocab_dir(), "domain_overrides.json"))
+
 LIBRARY_ID = os.environ.get("ZOTERO_LIBRARY_ID")
 API_KEY = os.environ.get("ZOTERO_API_KEY")
 FORBIDDEN_COLLECTION = os.environ.get("ZOTERO_FORBIDDEN_COLLECTION")
@@ -109,42 +124,77 @@ DOMAIN_TO_SUBCOLL = {
     "devblogs.microsoft.com": "microsoft",
     "learn.microsoft.com": "microsoft",
     "blogs.microsoft.com": "microsoft",
-    # 个人数学博客（Joel David Hamkins "Infinitely More" 等付费 Substack 系）
-    # 2026-08-25 验证：infinitelymore.xyz 多信号评分误匹配《Handbook of Floating-Point Arithmetic》
-    "infinitelymore.xyz": "infinitelymore",
-    # 个人技术博客（barrd.dev — Dave 的 Bristol 个人站，git/devops/Laravel 文章）
-    # 2026-08-31 验证：barrd.dev 描述 "Git worktree ... without stashing or constant checkouts"
-    # 多信号评分误匹配到 Turing《On Computable Numbers, with an Applicatoin to the Entscheidungsproblem》
-    # （"without"/"decision" 与 coll name 的 "Applicatoin" 偶然高分）。加硬映射 → 走 Misc--barrd。
-    "barrd.dev": "barrd",
-    # Bill Gates 署名个人博客（gatesnotes.com — 主页 / 年信 / AI 治理 essay 等）
-    # 2026-08-31 验证：gatesnotes 反爬 Cloudflare 403, fetch_url_metadata 拿到 "Access Denied",
-    # 多信号评分误判 → 退化成 fallback "www" 命名. 加进硬映射 → 命中/创建 Misc--gatesnotes.
-    "gatesnotes.com": "gatesnotes",
-    # Alan Zucconi 个人博客（alanzucconi.com — 数学/图形/Unity 教学深文 + 配套视频纪录片）
-    # 2026-08-31 验证：xorshift-generators 长文被多信号评分误匹配到 Misc--《The Mystery of the Prime Numbers》,
-    # 创建出完全无关的母题集合. 加进硬映射 → 命中/创建 Misc--alanzucconi.
-    "alanzucconi.com": "alanzucconi",
-    # Daniel Lemire 个人技术博客（lemire.me — 计算机科学/性能/SIMD/JSON 系列评测文章）
-    # 2026-09-20 验证：how-did-apple-silicon-get-50-faster-in-three-years 多信号评分
-    # 严重误判匹配到《How to Win Friends and Influence People》（人名/people 巧合）。
-    # Lemire 是 Quebec U. 教授 + benchmark 系列知名作者（Geekbench/JSON parse 评测等），
-    # 跟 alanzucconi / barrd 同类。加硬映射 → 命中/创建 Misc--lemire.
-    "lemire.me": "lemire",
-    # Farnam Street — Shane Parrish 署名心智模型/学习/决策博客（fs.blog）
-    # 2026-09-21 验证：fs.blog/learning/ "Accelerated Learning" 描述里的 "learning"
-    # 关键词触发多信号评分高分匹配到 Misc--machine/learning (X3V2CSDP), 与文章真实主题
-    # (通用学习法/心智模型/决策) 严重不符。加硬映射 → 命中/创建 Misc--fs-blog。
-    "fs.blog": "fs-blog",
 }
+# NOTE: personal blogs the maintainer follows are deliberately NOT listed here.
+# They are library-specific reading-interest data, so they live in an untracked
+# local overlay instead — see _load_domain_overrides(). Add your own there.
+
+# monolith 在这些域名上会挂载成百上千个 .woff2 字体文件，必须加 -F (--no-fonts)。
+# 库特定的字体重灾区（如某些 Cloudflare-fronted WordPress 个人博客）同样走 overlay。
+_FONT_HEAVY_DOMAINS = (
+    "googleblog.com", "blog.google", "ai.google.dev",
+    "cloud.google.com", "developers.google.com",
+    "research.google", "deepmind.google",
+)
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
 _collections_cache = {"data": None, "ts": 0.0}
 _COLLECTIONS_CACHE_TTL = 300  # seconds
 
+# 5 分钟 TTL 缓存域名 overlay（本地文件很小，但 archive 路径会查它两次）
+_domain_overlay_cache = {"data": None, "ts": 0.0}
+_DOMAIN_OVERLAY_TTL = 300  # seconds
+
+
+def _load_domain_overrides(force_refresh=False):
+    """读取本地域名 overlay：``{"map": {...}, "no_fonts": [...]}``
+
+    overlay 承载**库特定**的域名知识——用户关注的个人博客、以及在字体重灾区
+    需要跳过字体的域名。这类数据属于「阅读兴趣」信号，不能进公共源码树，
+    因此外置到未被跟踪的本地文件（``ZOTERO_DOMAIN_MAP``，默认在
+    ``ZOTERO_VOCAB_DIR`` 下）。
+
+    文件缺失 / 无权限 / 格式损坏 → 一律退化成空 overlay，**归档绝不因此失败**。
+    """
+    import time as _time
+    now = _time.time()
+    if (not force_refresh and _domain_overlay_cache["data"] is not None
+            and (now - _domain_overlay_cache["ts"]) < _DOMAIN_OVERLAY_TTL):
+        return _domain_overlay_cache["data"]
+
+    overlay = {"map": {}, "no_fonts": []}
+    try:
+        with open(_get_domain_map_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            mapping = raw.get("map")
+            if isinstance(mapping, dict):
+                overlay["map"] = {str(k).lower(): str(v)
+                                  for k, v in mapping.items() if k and v}
+            no_fonts = raw.get("no_fonts")
+            if isinstance(no_fonts, list):
+                overlay["no_fonts"] = [str(d).lower() for d in no_fonts if d]
+    except (OSError, ValueError):
+        pass  # 无 overlay → 只用内置表
+
+    _domain_overlay_cache["data"] = overlay
+    _domain_overlay_cache["ts"] = now
+    return overlay
+
+
+def _domain_wants_no_fonts(url):
+    """该 URL 的域名是否需要 monolith ``-F``（跳过 webfonts）"""
+    low = (url or "").lower()
+    if any(d in low for d in _FONT_HEAVY_DOMAINS):
+        return True
+    return any(d in low for d in _load_domain_overrides()["no_fonts"])
+
 
 def _domain_subcoll_name(url):
     """从 URL 提取已知平台的子集合名。未命中返回 None。
+
+    先查本地 overlay（``_load_domain_overrides()["map"]``），再查内置
+    ``DOMAIN_TO_SUBCOLL``。overlay 优先，便于用户覆盖任何域名。
 
     使用 netloc 后缀匹配，支持子域名（如 news.ycombinator.com → ycombinator.com）。
     要求 '.' 边界，避免 'notgithub.com' 误匹配 'github.com' 这类 substring bug。
@@ -171,7 +221,9 @@ def _domain_subcoll_name(url):
         return None
     # 按域名长度降序遍历，更具体的域名先匹配
     # (e.g. "mp.weixin.qq.com" 应在 "weixin.qq.com" 之前命中)
-    for dom, sub in sorted(DOMAIN_TO_SUBCOLL.items(), key=lambda x: -len(x[0])):
+    overlay = dict(DOMAIN_TO_SUBCOLL)
+    overlay.update(_load_domain_overrides()["map"])  # overlay 覆盖内置
+    for dom, sub in sorted(overlay.items(), key=lambda x: -len(x[0])):
         if netloc == dom or netloc.endswith("." + dom):
             return sub
     return None
@@ -611,12 +663,16 @@ def list_collections():
         print(f"    Key: {key}\n")
 
 def add_item(item_type, title, url, coll_key, extra_json=None):
-    """Add a new item to Zotero with automatic /unread tag"""
+    """Add a new item to Zotero with automatic /unread tag
+
+    ``/unread`` 写 ``type: 0``（manual）—— 与 ``_DEFAULT_TAG_TYPE`` 一致，
+    避免 CLI 打的 tag 落进 Zotero「可一键清空的自动标签」桶。
+    """
     item = {
         'itemType': item_type,
         'title': title,
         'url': url,
-        'tags': [{'tag': '/unread', 'type': 1}]
+        'tags': [{'tag': '/unread', 'type': _DEFAULT_TAG_TYPE}]
     }
     if extra_json:
         import json
@@ -624,7 +680,7 @@ def add_item(item_type, title, url, coll_key, extra_json=None):
         # Ensure /unread is still present even if extra_json had tags
         tags = item.get('tags', [])
         if not any(t.get('tag') == '/unread' for t in tags):
-            tags.append({'tag': '/unread', 'type': 1})
+            tags.append({'tag': '/unread', 'type': _DEFAULT_TAG_TYPE})
             item['tags'] = tags
 
     response = zot.create_items([item])
@@ -780,21 +836,403 @@ def fetch_url_metadata(url):
                 "error": str(e), **extra_fields}
 
 
-# 缓存已有 tags（模块级，首次调用时加载）
-_existing_tags_cache = None
+# ---------------------------------------------------------------------------
+# v2.5.0 — Library-native tag vocabulary
+# ---------------------------------------------------------------------------
+# 设计约束：**源码里不出现任何具体 tag 字面量**。本仓库是公共仓库，真实 tag
+# 名属于用户私人数据。一切 tag 名只在运行时从 API 派生，落盘到仓库之外的
+# ZOTERO_VOCAB_DIR。唯一例外 `/unread`（既有公共约定）。
+#
+# 旧实现 get_existing_tags() 用 zot.tags(limit=200)，而 /tags 默认按 numItems
+# **升序**排序 —— 它拿到的是全库最冷门的 200 个 tag，与真实高频 tag 交集为 0。
+# 这才是「tag 发散、复用从未生效」的根因。
 
-def get_existing_tags():
-    """获取 Zotero 库中已有的所有 tags（带缓存）"""
-    global _existing_tags_cache
-    if _existing_tags_cache is not None:
-        return _existing_tags_cache
+_VOCAB_CACHE_TTL = 86400          # 24h —— tag 词表变化很慢
+_vocab_cache = {"data": None, "ts": 0.0}
+
+# 状态 tag：/unread /reading /done 参与「已存在」判定，但不参与主题匹配
+_STATUS_TAG_SLUGS = frozenset({"unread", "reading", "done"})
+
+# root 候选最低分。低于此值说明库里没有合适主题 → 走「新建 root」路径
+_ROOT_SCORE_THRESHOLD = 2.0
+
+# 「仅 automatic」tag 的降权系数。导入时抓来的元数据垃圾（英文短语式，
+# 形如 "Computer Science"）只以 automatic 存在，而用户策展的词汇表全是 manual。
+W_AUTO_ONLY = 0.5
+
+# 写入新 tag 时用的 type：0 = manual。1 = automatic 会在 Zotero 标签选择器里
+# 落进可隐藏 / 可被「Delete Automatic Tags」一键清空的桶（不可撤销）。
+_DEFAULT_TAG_TYPE = 0
+
+
+def _vocab_path():
+    return os.path.join(_get_vocab_dir(), "tags.json")
+
+
+def _pairs_path():
+    return os.path.join(_get_vocab_dir(), "pairs.json")
+
+
+def _empty_vocab(reason="empty"):
+    return {"roots": [], "children": {}, "orphans": [], "pairs": {},
+            "local_new": [], "generated_ts": 0.0, "count": 0,
+            "source": reason}
+
+
+# ── 命名法工具层 ──────────────────────────────────────────────────────────
+# /rootEmoji          → level-1 root（结尾带 emoji）
+# #root-child[-leaf]  → 层级子标签
+# /unread /reading /done → 状态 tag，不参与主题匹配
+
+# 三个不落在 S*/M* 判据内、但属于 emoji 的码位
+ZWJ = "\u200d"        # zero-width joiner（Cf）
+VS16 = "\ufe0f"       # variation selector-16（Mn）
+KEYCAP = "\u20e3"     # combining enclosing keycap（Me）
+
+
+def _strip_tag_emoji(tag):
+    """剥离 tag 尾部的 emoji / 修饰符。
+
+    emoji 的 Unicode 类别是 S*（符号）或 M*（修饰符），但有三类**不是**，
+    必须显式列出，否则复合 emoji 剥不干净（见文件顶部的 ZWJ / VS16 / KEYCAP）：
+
+    - U+200D ZWJ（类别 Cf）—— 拼接复合 emoji
+    - U+FE0F 变体选择符（类别 Mn）
+    - U+20E3 键帽（类别 Me）
+
+    只从**尾部**剥，避免破坏 tag 中段的连字符结构。
+    """
+    import unicodedata
+    s = (tag or "").rstrip()
+    while s:
+        c = s[-1]
+        if (unicodedata.category(c)[0] in ("S", "M")
+                or c in (ZWJ, VS16, KEYCAP)):
+            s = s[:-1]
+            continue
+        break
+    return s
+
+
+def _root_slug(tag):
+    """``/rootEmoji`` → ``root``（casefold）。非 root 形态返回 ''"""
+    if not (tag or "").startswith("/"):
+        return ""
+    return _strip_tag_emoji(tag[1:]).strip().casefold()
+
+
+def _child_body(tag):
+    """``#root-child🧇`` → ``root-child``（去 sigil / 去 emoji / casefold）"""
+    if not (tag or "").startswith("#"):
+        return ""
+    return _strip_tag_emoji(tag[1:]).strip().casefold()
+
+
+def _child_root_slug(tag):
+    """``#root-child`` → ``root``（以**第一个** '-' 切分）
+
+    仅在 root 未知时作为兜底归属；已知 root 集合时应改用最长 root slug 前缀
+    匹配（见 _vocab_add_tag），因为 root 名本身可能含连字符。
+    """
+    body = _child_body(tag)
+    return body.split("-", 1)[0] if body else ""
+
+
+def _child_slug(tag):
+    """``#root-child-leaf`` → ``child-leaf``（去掉 root 段；casefold）"""
+    body = _child_body(tag)
+    return body.split("-", 1)[1] if "-" in body else ""
+
+
+def _tag_key(tag):
+    """去 sigil / 去 emoji / casefold —— 去重键。
+
+    使 ``#demo-alpha`` 与 ``#demo-alpha🧇`` 视为同一个 tag。
+    """
+    t = (tag or "").strip()
+    if t[:1] in ("#", "/"):
+        t = t[1:]
+    return _strip_tag_emoji(t).strip().casefold()
+
+
+def _norm_child_slug(child_slug):
+    """归一化 child slug 用于查重：取最后一段 + 去复数"""
+    seg = (child_slug or "").rsplit("-", 1)[-1]
+    if len(seg) > 3 and seg.endswith("s") and not seg.endswith("ss"):
+        seg = seg[:-1]
+    return seg
+
+
+# ── 词表拉取 / 解析 / 缓存 ─────────────────────────────────────────────────
+
+def _fetch_all_tags_raw(min_count=3, max_pages=12, page_size=100):
+    """裸 HTTP 分页拉取 tag 及其计数。
+
+    pyzotero 的 retrieve 装饰器会把任何含 "tags" 的 URL 经 _tags_data() 拍平成
+    字符串名，numItems 永远拿不到 —— 所以计数只能走裸 HTTP。
+
+    显式 ``sort=numItems&direction=desc``：这才是那份「高频 tag 表」，
+    而且是派生的、永远新鲜的，不需要手工维护。
+
+    注意：numItems 排序下 ``Total-Results`` 响应头不可信（实测恒为 1），
+    因此终止条件用「本页最后一条 numItems < min_count」或空页。
+    """
+    url = f"{zot.endpoint}/{zot.library_type}/{zot.library_id}/tags"
+    out, start = [], 0
+    for _ in range(max_pages):
+        resp = zot.client.get(url, params={
+            "sort": "numItems", "direction": "desc",
+            "limit": page_size, "start": start,
+        })
+        resp.raise_for_status()
+        page = resp.json()
+        if not page:
+            break
+        out.extend(page)
+        if page[-1].get("meta", {}).get("numItems", 0) < min_count:
+            break
+        start += page_size
+    return out
+
+
+def _vocab_add_tag(vocab, tag, n=1, types=None):
+    """把一个 tag 插进词表结构（幂等）。返回 True 表示新增。
+
+    child → root 归属按 **root slug 最长优先**，与 DOMAIN_TO_SUBCOLL 的 netloc
+    后缀规则同源；合法边界是 ``body == slug`` 或 ``body.startswith(slug + '-')``。
+    """
+    if not tag or " " in tag:
+        return False
+    types = set(types or [0])
+    if tag.startswith("/"):
+        slug = _root_slug(tag)
+        if not slug or any(r["slug"] == slug for r in vocab["roots"]):
+            return False
+        vocab["roots"].append({
+            "tag": tag, "slug": slug, "n": n,
+            "types": sorted(types), "type": 0 if 0 in types else 1,
+            "status": slug in _STATUS_TAG_SLUGS, "children_count": 0,
+        })
+        return True
+    if not tag.startswith("#"):
+        return False
+    body = _child_body(tag)
+    if not body:
+        return False
+    entry = {"tag": tag, "slug": body, "n": n,
+             "types": sorted(types), "type": 0 if 0 in types else 1}
+    root_slugs = sorted((r["slug"] for r in vocab["roots"]), key=len, reverse=True)
+    owner = next((rs for rs in root_slugs
+                  if body == rs or body.startswith(rs + "-")), None)
+    if owner is None:
+        if any(o["tag"] == tag for o in vocab["orphans"]):
+            return False
+        vocab["orphans"].append(entry)
+        return True
+    bucket = vocab["children"].setdefault(owner, [])
+    if any(c["tag"] == tag for c in bucket):
+        return False
+    child_slug = body[len(owner):].lstrip("-")
+    bucket.append({**entry, "child": child_slug,
+                   "norm": _norm_child_slug(child_slug)})
+    bucket.sort(key=lambda x: (-x["n"], x["slug"]))
+    root = next(r for r in vocab["roots"] if r["slug"] == owner)
+    root["children_count"] = len(bucket)
+    return True
+
+
+def _parse_vocab(raw):
+    """把 /tags 原始响应解析成词表结构。
+
+    同名 tag 会以 type 0（manual）和 type 1（automatic）两条独立行出现，
+    需按名合并计数。分页在 numItems 相同的 tie 上可能重复返回同一行，
+    故先按 ``(name, type)`` 取 max（避免重复页把计数翻倍），再跨 type 求和。
+    """
+    buckets = {}   # (name, type) -> max numItems
+    for entry in raw or []:
+        name = (entry.get("tag") or "").strip()
+        # 带空格的 tag 一律丢弃（既有约定；也顺带排除导入抓来的英文短语垃圾）
+        if not name or " " in name:
+            continue
+        meta = entry.get("meta") or {}
+        try:
+            n = int(meta.get("numItems") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        try:
+            t = int(meta.get("type", 0))
+        except (TypeError, ValueError):
+            t = 0
+        key = (name, t)
+        buckets[key] = max(buckets.get(key, 0), n)
+
+    merged = {}
+    for (name, t), n in buckets.items():
+        rec = merged.setdefault(name, {"n": 0, "types": set()})
+        rec["n"] += n
+        rec["types"].add(t)
+
+    vocab = _empty_vocab("api")
+    # 先插 root，再插 child —— child 归属需要完整的 root 集合
+    for name in sorted(merged):
+        if name.startswith("/"):
+            _vocab_add_tag(vocab, name, merged[name]["n"], merged[name]["types"])
+    for name in sorted(merged):
+        if name.startswith("#"):
+            _vocab_add_tag(vocab, name, merged[name]["n"], merged[name]["types"])
+
+    vocab["roots"].sort(key=lambda r: (-r["n"], r["slug"]))
+    vocab["count"] = len(merged)
+    return vocab
+
+
+def _read_vocab_file():
     try:
-        tags_resp = zot.tags(limit=200)
-        # API returns a list of tag strings directly (not dicts)
-        _existing_tags_cache = tags_resp
-        return _existing_tags_cache
-    except Exception:
-        return []
+        with open(_vocab_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_vocab_file(vocab):
+    """原子写（tmp + replace），失败静默 —— 词表落盘失败不该影响归档"""
+    try:
+        os.makedirs(_get_vocab_dir(), exist_ok=True)
+        tmp = _vocab_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(vocab, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _vocab_path())
+        return True
+    except OSError:
+        return False
+
+
+def _load_pairs():
+    """中英配对表 —— 只存在于本地（``<ZOTERO_VOCAB_DIR>/pairs.json``）。
+
+    文件格式（两种都接受）::
+
+        {"pairs": [{"en": "demo-alpha", "zh": "demo-阿尔法"}]}
+        [{"en": "demo-alpha", "zh": "demo-阿尔法"}]
+
+    返回双向映射 ``{slug: {"slug": 对方 slug, "lang": 对方语言}}``。
+
+    这是配对知识的**唯一**来源 —— 源码里不留任何 seed，因为「哪个概念有中英
+    两版」天然是库特定的，写进公共仓库就是泄漏。
+    """
+    try:
+        with open(_pairs_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    items = raw.get("pairs") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return {}
+    out = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        en = str(it.get("en") or "").strip().casefold()
+        zh = str(it.get("zh") or "").strip().casefold()
+        if not en or not zh or en == zh:
+            continue
+        out[en] = {"slug": zh, "lang": "zh"}
+        out[zh] = {"slug": en, "lang": "en"}
+    return out
+
+
+def load_vocab(force_refresh=False):
+    """加载本库标签词表（roots / children / orphans / pairs）。
+
+    解析顺序：内存 TTL(24h) → 磁盘未过期 → 裸 HTTP 拉取 → 磁盘陈旧仍用 → 空词表。
+
+    **陈旧词表严格优于无词表**：无词表时我们不发明任何 tag（那正是发散的成因），
+    而陈旧词表至少还能复用库内既有 tag。
+    """
+    import time as _time
+    now = _time.time()
+    if (not force_refresh and _vocab_cache["data"] is not None
+            and (now - _vocab_cache["ts"]) < _VOCAB_CACHE_TTL):
+        return _vocab_cache["data"]
+
+    disk = None if force_refresh else _read_vocab_file()
+    if disk and (now - float(disk.get("generated_ts") or 0)) < _VOCAB_CACHE_TTL:
+        disk["source"] = "disk"
+        _vocab_cache["data"], _vocab_cache["ts"] = disk, now
+        return disk
+
+    try:
+        vocab = _parse_vocab(_fetch_all_tags_raw())
+        vocab["generated_ts"] = now
+        vocab["pairs"] = _load_pairs()
+        _write_vocab_file(vocab)
+    except Exception as e:                              # noqa: BLE001 — 归档绝不因此失败
+        print(f"⚠️  标签词表拉取失败: {e}")
+        if disk:
+            age_h = (now - float(disk.get("generated_ts") or 0)) / 3600.0
+            print(f"⚠️  回退到本地陈旧词表（{age_h:.0f}h 前）")
+            disk["source"] = "stale"
+            disk.setdefault("pairs", _load_pairs())
+            vocab = disk
+        else:
+            print("⚠️  无本地词表可用 —— 本次只打 /unread，不发明新 tag")
+            vocab = _empty_vocab("vocab_unavailable")
+
+    _vocab_cache["data"], _vocab_cache["ts"] = vocab, now
+    return vocab
+
+
+def _invalidate_vocab_cache():
+    """让词表在**下一个进程**重新拉取。
+
+    不删文件：磁盘缓存是 API 不可用时的离线兜底，删了会丢。
+    把 mtime 设成 epoch 0，下个进程读到就认为过期。
+    """
+    _vocab_cache["data"] = None
+    _vocab_cache["ts"] = 0.0
+    try:
+        os.utime(_vocab_path(), (0, 0))
+    except OSError:
+        pass
+
+
+def _vocab_note_new_tags(names):
+    """把本次新发明的 tag 立刻写回磁盘缓存，让**下一次归档就能复用**。
+
+    没有这一步，「复用优先」要等 24h TTL 过期才生效 —— 也就是根本没生效。
+    """
+    # root 先插：child 的归属需要完整的 root 集合，顺序反了 child 会落成孤儿
+    # 且再也不会被重新归属（sorted 稳定，组内原序不变）
+    tags = sorted((n for n in (names or []) if n and " " not in n),
+                  key=lambda t: 0 if t.startswith("/") else 1)
+    if not tags:
+        return
+    disk = _read_vocab_file()
+    if not disk:
+        return
+    added = [t for t in tags if _vocab_add_tag(disk, t, 1, {0})]
+    if not added:
+        return
+    disk["local_new"] = sorted(set(disk.get("local_new") or []) | set(added))
+    disk["count"] = int(disk.get("count") or 0) + len(added)
+    if _write_vocab_file(disk):
+        _vocab_cache["data"] = None     # 下次从磁盘重读（含新 tag）
+
+
+def _vocab_tag_types(vocab=None):
+    """``{tag 名: type}``，供写入时沿用库内既有 type（不再制造 0/1 双份）"""
+    vocab = vocab if vocab is not None else load_vocab()
+    out = {}
+    for r in vocab.get("roots", []):
+        out[r["tag"]] = r.get("type", 0)
+    for lst in (vocab.get("children") or {}).values():
+        for c in lst:
+            out[c["tag"]] = c.get("type", 0)
+    for o in vocab.get("orphans", []):
+        out[o["tag"]] = o.get("type", 0)
+    return out
+
 
 
 def _emoji_for_tag(tag_text):
@@ -838,146 +1276,466 @@ def _emoji_for_tag(tag_text):
     return "🔗"
 
 
-def _fuzzy_match_existing(text_lower, existing_tags):
-    """从已有 tags 中模糊匹配（严格匹配，禁止空格 tags）"""
-    # 过滤掉带空格的 tags（禁止使用）
-    filtered_tags = [t for t in existing_tags if ' ' not in t]
+# ── 匹配器 ────────────────────────────────────────────────────────────────
+#
+# 设计原则：**先看库里有什么，再看文本能命中什么**。旧实现反了过来 —— 先由
+# 关键词表造 tag 字面量，再去库里找同名，于是永远找不到，每次归档都新建。
 
-    text_words = re.findall(r'[a-z]+', text_lower)
-    text_prefixes = set(w[:4] for w in text_words if len(w) > 2)
-    text_full_words = set(text_words)
+# 概念 → (规范 slug, emoji)。**不含任何 tag 字面量**：slug 只有在库里真的存在
+# 同名 root 时才被复用，否则只作为「新建 root 的建议名」。
+#
+# 一举两用：① 别名桥（标题写「数学」也能命中库里 slug 为 math 的 root，尽管
+# 文本里没有 "math"）；② 新建 root 时的规范 slug 与 emoji。
+#
+# 别名取舍：宁可漏（漏了退化成新建 root，是软失败），不可错（错了会打错 tag）。
+# 尤其中文别名 —— 它是**子串**匹配，所以剔除了会嵌进其它领域词的两字别名
+# （如 tutorial 的「学习」会命中「机器学习」，art 的「设计」会命中「设计模式」）。
+_TOPIC_KEYWORDS = [
+    (("ai", "artificial intelligence", "llm", "gpt", "chatgpt", "claude",
+      "machine learning", "deep learning", "transformer", "neural network",
+      "大模型", "机器学习", "深度学习", "神经网络", "人工智能"), "ai", "🤖"),
+    (("programming", "code", "coding", "developer", "software", "编程",
+      "代码", "开发者", "软件工程"), "programming", "💻"),
+    (("economics", "finance", "investment", "wealth", "经济", "金融",
+      "投资", "财富", "通胀"), "economics", "💰"),
+    (("mathematics", "math", "proof", "theorem", "algebra", "axiom",
+      "数学", "证明", "代数", "几何", "拓扑"), "math", "🔢"),
+    (("philosophy", "ethics", "metaphysics", "epistemology", "哲学",
+      "伦理", "形而上学", "认识论"), "philosophy", "🤔"),
+    (("podcast", "episode", "播客", "访谈"), "podcast", "🎙️"),
+    (("video", "lecture", "youtube", "bilibili", "视频", "讲座"), "video", "📺"),
+    (("tutorial", "guide", "how to", "cheat sheet", "教程", "入门"), "tutorial", "📚"),
+    (("cli", "plugin", "extension", "framework", "工具", "插件", "框架"), "tool", "🛠️"),
+    (("paper", "preprint", "research", "survey", "arxiv", "academic",
+      "论文", "预印本", "综述", "学术"), "paper", "📄"),
+    (("book", "reading", "literature", "novel", "书籍", "阅读", "文学",
+      "小说"), "book", "📖"),
+    (("history", "historical", "ancient", "历史", "古代", "考古"), "history", "📜"),
+    (("science", "physics", "chemistry", "biology", "科学", "物理",
+      "化学", "生物"), "science", "🔬"),
+    (("health", "medicine", "medical", "healthcare", "健康", "医学",
+      "医疗"), "health", "🏥"),
+    (("politics", "policy", "government", "society", "政治", "政策",
+      "政府", "社会"), "politics", "🌍"),
+    (("art", "creative", "paint", "艺术", "绘画", "摄影"), "art", "🎨"),
+    (("gaming", "game", "娱乐", "游戏"), "game", "🎮"),
+    (("data", "dataset", "statistics", "analytics", "visualization",
+      "数据", "统计", "可视化"), "data", "📊"),
+    (("music", "audio", "sound", "音乐", "歌曲", "音频"), "music", "🎵"),
+    (("image", "photo", "vision", "graphics", "图像", "视觉", "图片"), "image", "🖼️"),
+    (("security", "privacy", "cryptography", "安全", "隐私", "加密",
+      "密码学"), "security", "🔒"),
+    (("web", "internet", "cloud", "http", "网络", "互联网", "浏览器"), "web", "🌐"),
+    (("business", "startup", "company", "marketing", "商业", "创业",
+      "公司", "营销"), "business", "💼"),
+    (("housing", "real estate", "mortgage", "房产", "买房", "房贷"), "housing", "🏠"),
+    (("writing", "blog", "写作", "博客", "自媒体"), "writing", "✍️"),
+    (("life", "lifestyle", "travel", "food", "生活", "旅行", "美食"), "life", "🌱"),
+]
 
-    matches = []
-    for tag in filtered_tags:
-        tag_lower = tag.lower()
-        tag_words = re.findall(r'[a-z]+', tag_lower)
-        if not tag_words:
-            continue
-        tag_prefixes = set(w[:4] for w in tag_words if len(w) > 2)
+# 通用技术缩写 ↔ 展开写法。只收**通用**缩写，不得从真实库内容派生 ——
+# 没有这张表，`#xxx-cv` 这类缩写 slug 永远匹配不上 "computer vision"。
+_CHILD_SLUG_ALIASES = {
+    "cv": ("computer vision", "计算机视觉"),
+    "ml": ("machine learning", "机器学习"),
+    "llm": ("large language model", "large language models", "大语言模型"),
+    "nlp": ("natural language processing", "自然语言处理"),
+    "rl": ("reinforcement learning", "强化学习"),
+    "fp": ("floating point", "浮点"),
+    "gpu": ("graphics processing unit", "显卡"),
+    "cpu": ("central processing unit", "处理器"),
+    "os": ("operating system", "操作系统"),
+    "db": ("database", "数据库"),
+    "sql": ("structured query language",),
+    "k8s": ("kubernetes",),
+    "ci": ("continuous integration", "持续集成"),
+    "api": ("application programming interface",),
+    "simd": ("vectorization", "vectorisation", "向量化"),
+    "jit": ("just in time", "即时编译"),
+    "gc": ("garbage collection", "垃圾回收"),
+    "vm": ("virtual machine", "虚拟机"),
+    "dns": ("domain name system",),
+    "tls": ("transport layer security",),
+    "json": ("javascript object notation",),
+}
 
-        # 严格匹配规则（满足其一）：
-        # 1. tag 完整包含在 text 中（短语匹配）
-        # 2. 至少 2 个前缀匹配（tag 中的重要词在 text 中出现）
-        # 3. 至少 2 个完整词匹配
-        prefix_count = len(tag_prefixes & text_prefixes)
-        word_count = len(set(tag_words) & text_full_words)
-        tag_in_text = tag_lower in text_lower
+# 标题分词停用词
+_STOP_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with",
+    "is", "are", "was", "were", "be", "been", "this", "that", "these",
+    "those", "it", "its", "by", "as", "from", "at", "up", "out", "about",
+    "into", "over", "what", "which", "who", "when", "where", "why", "how",
+    "all", "some", "any", "each", "new", "old", "best", "first", "last",
+    "such", "do", "does", "did", "can", "could", "will", "would", "should",
+    "may", "might", "must", "not", "no", "you", "your", "we", "our",
+    "but", "if", "than", "then", "there", "here", "so", "just", "very",
+    "more", "most", "other", "only", "also", "one", "get", "got", "make",
+    "made", "use", "using", "used", "way", "part", "upon",
+})
 
-        if tag_in_text or prefix_count >= 2 or word_count >= 2:
-            matches.append(tag)
-
-    return matches
+_MAX_NEEDS = 3        # 每次归档最多提几个「待翻译」概念，避免刷屏
+_MAX_CHILDREN = 7     # 1 root + ≤7 children
 
 
-def infer_tags(title, description):
-    """推断合适的标签
+def _build_slug_aliases():
+    """``{slug: frozenset(等价写法)}`` —— 缩写 ↔ 展开、英文 slug ↔ 中文词"""
+    out = {}
+    for keywords, slug, _emoji in _TOPIC_KEYWORDS:
+        out.setdefault(slug, set()).update(k.casefold() for k in keywords)
+    for abbr, expansions in _CHILD_SLUG_ALIASES.items():
+        out.setdefault(abbr, set()).add(abbr)
+        for e in expansions:
+            out.setdefault(abbr, set()).add(e.casefold())
+            out.setdefault(e.casefold(), set()).add(abbr)
+    return {k: frozenset(v) for k, v in out.items()}
 
-    策略：
-    1. 优先从已有 tags 中模糊匹配（仅返回无空格 tags）
-    2. 若无匹配，生成 #tag 格式的精炼 tag（无空格，不超过3个）
-    3. 以 emoji 结尾增强辨识度
+
+_SLUG_ALIASES = _build_slug_aliases()
+
+
+def _has_cjk(s):
+    return bool(re.search(r"[㐀-䶿一-鿿豈-﫿]", s or ""))
+
+
+def _strip_diacritics(s):
+    """去除组合附加符：``Gödel`` → ``Godel``
+
+    否则 ``[A-Za-z]`` 正则会把它拆成 ``Godel`` + 落单的 ``o``。
     """
-    text = (title + " " + description).lower()
-
-    # 1. 尝试匹配已有 tags（_fuzzy_match_existing 已过滤空格 tags）
-    existing = get_existing_tags()
-    matched = _fuzzy_match_existing(text, existing)
-    if matched:
-        # 去重，最多取3个
-        unique = []
-        for m in matched:
-            if m not in unique:
-                unique.append(m)
-            if len(unique) >= 3:
-                break
-        return unique
-
-    # 2. 无匹配时，从内容中提炼核心概念词
-    concepts = _extract_concepts(title + " " + description)
-    return concepts
-
-
-def _extract_concepts(text):
-    """从文本中提取核心概念，生成 #tag 格式（无空格，不超过3个）"""
-    # Unicode 处理：去除所有组合附加符（diacritics）
-    # "Gödel" (ö=U+00F6) → "Godel"; 避免 [A-Za-z] 被组合字符拆散
     import unicodedata
-    def strip_diacritics(s):
-        return ''.join(c for c in unicodedata.normalize('NFD', s)
-                       if not unicodedata.combining(c))
-    text_stripped = strip_diacritics(text)
-    text_lower = text_stripped.lower()
+    return "".join(c for c in unicodedata.normalize("NFD", s or "")
+                   if not unicodedata.combining(c))
 
-    # 如果文本看起来像URL（而非真实标题），跳过概念规则匹配，直接走 fallback
-    is_url_text = _is_url(text)
 
-    # 预设领域关键词到 tag 的映射
-    concept_rules = [
-        (["ai", "artificial intelligence", "大模型", "gpt", "claude", "llm", "machine learning", "机器学习", "deep learning", "深度学习", "transformer", "neural network"], "#AI-ML🤖"),
-        (["programming", "编程", "code", "代码", "developer", "开发", "software", "软件", "coding"], "#编程💻"),
-        (["economics", "经济", "finance", "金融", "wealth", "财富", "investment", "投资", "market"], "#经济💰"),
-        (["mathematics", "数学", "math", "proof", "theorem", "theorems", "证明", "algebra", "几何", "axiom", "logic"], "#数学🔢"),
-        (["philosophy", "哲学", "logic", "logics", "logical", "ethics", "伦理", "metaphysics"], "#哲学🤔"),
-        (["podcast", "播客", "episode", "广播", "interview", "访谈"], "#播客🎙️"),
-        (["video", "视频", "youtube", "bilibili", "lecture", "讲座"], "#视频📺"),
-        (["tutorial", "教程", "guide", "入门", "how to", "cheat sheet", "学习"], "#教程📚"),
-        (["tool", "工具", "cli", "plugin", "extension", "library", "framework", "app"], "#工具🛠️"),
-        (["paper", "论文", "research", "survey", "arxiv", "academic", "学术", "研究"], "#论文📄"),
-        (["book", "书", "reading", "阅读", "literature", "文学", "novel", "小说"], "#书籍📖"),
-        (["history", "历史", "historical", "过去", "ancient"], "#历史📜"),
-        (["science", "科学", "physics", "物理", "chemistry", "化学", "biology", "生物"], "#科学🔬"),
-        (["health", "健康", "medicine", "医学", "medical", "healthcare"], "#健康🏥"),
-        (["politics", "政治", "policy", "政策", "government", "社会", "society"], "#政治🌍"),
-        (["art", "艺术", "design", "设计", "creative", "绘画", "paint"], "#艺术🎨"),
-        (["game", "游戏", "gaming", "娱乐", "entertainment"], "#游戏🎮"),
-        (["data", "数据", "statistics", "统计", "analytics", "可视化", "visualization"], "#数据📊"),
-        (["music", "音乐", "audio", "sound", "song", "歌曲"], "#音乐🎵"),
-        (["image", "图像", "photo", "vision", "graphics", "视觉"], "#图像🖼️"),
-        (["security", "安全", "privacy", "隐私", "cryptography", "加密", "密码"], "#安全🔒"),
-        (["web", "网络", "internet", "互联网", "cloud"], "#网络🌐"),
-        (["business", "商业", "startup", "创业", "company", "marketing", "市场"], "#商业💼"),
-        (["housing", "房产", "house", "房子", "买房", "real estate"], "#房产🏠"),
-        (["writing", "写作", "content creation", "blog", "博客"], "#写作✍️"),
-        (["life", "生活", "lifestyle", "旅行", "travel", "food", "美食"], "#生活🌱"),
-    ]
+def _title_keywords(text):
+    """文本 → 有意义的关键词集合（casefold、去停用词、长度 ≥ 2）"""
+    words = re.findall(r"[A-Za-z一-鿿]+", _strip_diacritics(text))
+    return {w.casefold() for w in words
+            if len(w) >= 2 and w.casefold() not in _STOP_WORDS}
 
-    tags = []
 
-    # URL文本：无法提取有意义的标签，直接返回空列表
-    if is_url_text:
-        return []
+def _phrase_in(needle, haystack):
+    """needle 是否作为**短语**出现在 haystack 中。
 
-    # 非URL文本：正常进行概念规则匹配（单词边界严格匹配）
-    for keywords, tag in concept_rules:
-        matched = False
-        for kw in keywords:
-            # \b 单词边界，中文/英文均可精确匹配，不会误匹配子串
-            if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE):
-                matched = True
+    ASCII 要求词边界（否则 ``os`` 会命中 ``cost``）；CJK 无空格，直接子串匹配。
+    """
+    needle = (needle or "").casefold()
+    if not needle:
+        return False
+    if _has_cjk(needle):
+        return needle in haystack
+    return re.search(r"\b" + re.escape(needle) + r"\b", haystack) is not None
+
+
+def _prior_multiplier(n, auto_only=False):
+    """热度先验 —— **乘法**系数，只用来给已有文本证据的 tag 打破平局。
+
+    乘法而非加法：加法会把零文本证据的高频 tag 顶上来，那是「高频霸榜」
+    而不是「高频优先」。
+
+    库内「仅 automatic」的 tag 混着导入时抓来的元数据垃圾（英文短语式），
+    而用户策展的词汇表全是 manual，故对 auto-only 追加降权。不直接排除，
+    以免误伤。
+    """
+    import math
+    prior = min(math.log10(1 + max(0, int(n or 0))), 3.0) / 3.0
+    mult = 1.0 + 0.30 * prior
+    return mult * W_AUTO_ONLY if auto_only else mult
+
+
+def _slug_strength(slug, text_lower, words):
+    """slug 与文本的匹配强度（未乘热度先验）。0 表示无证据。
+
+    4.0 = 整条 slug 作为短语命中 / 2.5 = 别名桥（中英、缩写）/
+    2.0 = 某一段是文本里的完整词 / 1.2 = 某一段是文本词的前缀（≥4 字符）
+    """
+    if _phrase_in(slug, text_lower):
+        return 4.0
+    for alias in _SLUG_ALIASES.get(slug, ()):
+        if alias != slug and _phrase_in(alias, text_lower):
+            return 2.5
+    segs = [s for s in slug.replace("_", "-").split("-") if s]
+    if any(s in words for s in segs):
+        return 2.0
+    if any(len(s) >= 4 and any(w.startswith(s) for w in words) for s in segs):
+        return 1.2
+    return 0.0
+
+
+def _is_auto_only(entry):
+    """该 tag 是否**只**以 automatic 形式存在"""
+    return set(entry.get("types") or []) == {1}
+
+
+def _find_root(vocab, slug):
+    for r in vocab.get("roots", []):
+        if r["slug"] == slug:
+            return r
+    return None
+
+
+def _iter_vocab_candidates(vocab):
+    """词表 → 可参与打分的候选（状态 root 及其 children 直接排除）"""
+    for r in vocab.get("roots", []):
+        if r.get("status"):
+            continue
+        yield {"kind": "root", "tag": r["tag"], "slug": r["slug"],
+               "n": r.get("n", 0), "auto_only": _is_auto_only(r)}
+    for root_slug, lst in (vocab.get("children") or {}).items():
+        root = _find_root(vocab, root_slug)
+        if root is None or root.get("status"):
+            continue
+        for c in lst:
+            yield {"kind": "child", "tag": c["tag"],
+                   "slug": c.get("child") or c.get("slug") or "",
+                   "root": root_slug, "n": c.get("n", 0),
+                   "auto_only": _is_auto_only(c)}
+
+
+def _parse_tag_hints(tag_hints):
+    """用户提示 → ``{"root": tag|None, "children": [tag], "bare": [word]}``
+
+    ``/xxx`` → root 提示；``#xxx`` → 原样保留的 child 提示；裸词 → 待限定
+    （会补成 ``#<root>-<word>``，避免用户随手一个词就落成无归属 orphan）。
+    """
+    root, children, bare = None, [], []
+    for h in tag_hints or []:
+        h = (h or "").strip()
+        if not h:
+            continue
+        if h.startswith("/"):
+            if root is None:
+                root = h
+        elif h.startswith("#"):
+            children.append(h)
+        else:
+            bare.append(h)
+    return {"root": root, "children": children, "bare": bare}
+
+
+def _root_or_new(vocab, slug, emoji, note):
+    """决定 ``/slugEmoji`` —— 但**先看这个 slug 是否已被现有 root 占用**。
+
+    emoji 不同不构成不同的 root：库内已有 ``/demo📦`` 时再造一个 ``/demo🔗``
+    就是 tag 发散。状态 slug（``unread``/``reading``/``done``）永不作为主题
+    root，直接放弃该候选。
+    """
+    if slug in _STATUS_TAG_SLUGS:
+        return None, None, "none"
+    existing = _find_root(vocab, slug) if vocab else None
+    if existing and not existing.get("status"):
+        return existing["tag"], existing["slug"], "existing"
+    return f"/{slug}{emoji}", slug, note
+
+
+def _new_root_for(text_lower, title, vocab=None):
+    """库里没有合适 root 时决定 root。
+
+    slug 取 ``_TOPIC_KEYWORDS`` 的规范 slug（小写连字符），emoji 沿用既有
+    ``_emoji_for_tag``。返回 ``(tag, slug, note)``。
+    """
+    for keywords, slug, emoji in _TOPIC_KEYWORDS:
+        if any(_phrase_in(k, text_lower) for k in keywords):
+            tag, s, note = _root_or_new(vocab, slug, emoji, "new-topic")
+            if s:
+                return tag, s, note
+    words = re.findall(r"[A-Za-z一-鿿]+", _strip_diacritics(title or ""))
+    for w in words:
+        core = w.casefold()
+        if len(core) < 2 or core in _STOP_WORDS:
+            continue
+        tag, s, note = _root_or_new(vocab, core, _emoji_for_tag(core),
+                                    "new-fallback")
+        if s:
+            return tag, s, note
+    return None, None, "none"
+
+
+def _child_lang(slug):
+    return "zh" if _has_cjk(slug) else "en"
+
+
+def infer_tags_structured(title, description="", tag_hints=None, vocab=None):
+    """推断标签方案 —— **复用优先**，确定性实现（不走 LLM）。
+
+    返回::
+
+        {"root": tag|None, "children": [tag], "new": [tag],
+         "needs": [{concept, have, have_lang, want_lang, want_example}],
+         "attached": [tag], "mode": str, "scores": {slug: float}}
+
+    ``new`` 是本次要新建的 tag（既有库内 tag 不算）；``needs`` 是需要 agent
+    补翻译的中英配对缺口；``attached`` 是命中的既有 tag。
+
+    形态不变量由 ``_merge_tag_plan()`` 单点保证。
+    """
+    vocab = vocab if vocab is not None else load_vocab()
+
+    # 无词表 → **绝不发明 tag**。无词表还发明正是发散的成因。
+    if vocab.get("source") == "vocab_unavailable":
+        return {"root": None, "children": [], "new": [], "needs": [],
+                "attached": [], "mode": "vocab_unavailable", "scores": {}}
+
+    title = title or ""
+    description = description or ""
+    if _is_url(title.strip()) and not description.strip():
+        return {"root": None, "children": [], "new": [], "needs": [],
+                "attached": [], "mode": "url_only", "scores": {}}
+
+    text_lower = _strip_diacritics(f"{title} {description}").casefold()
+    words = _title_keywords(f"{title} {description}")
+    hints = _parse_tag_hints(tag_hints)
+
+    # ── 打分：children 的得分累加到各自 root ────────────────────────────
+    # 某个具体 child 命中，比 root 自己那个泛化 slug 命中强得多。
+    root_scores, child_hits = {}, []
+    for cand in _iter_vocab_candidates(vocab):
+        strength = _slug_strength(cand["slug"], text_lower, words)
+        if not strength:
+            continue
+        score = strength * _prior_multiplier(cand["n"], cand["auto_only"])
+        if cand["kind"] == "root":
+            root_scores[cand["slug"]] = root_scores.get(cand["slug"], 0.0) + score
+        else:
+            key = cand["root"]
+            root_scores[key] = root_scores.get(key, 0.0) + score
+            child_hits.append((score, cand))
+
+    # ── root 选择 ───────────────────────────────────────────────────────
+    root_tag, root_slug, root_note = None, None, ""
+    if hints["root"]:
+        slug = _tag_key(hints["root"])
+        existing = _find_root(vocab, slug)
+        if existing:
+            root_tag, root_slug, root_note = existing["tag"], existing["slug"], "user"
+        else:
+            root_tag, root_slug, root_note = hints["root"], slug, "user-new"
+    elif root_scores:
+        best_slug, best_score = max(root_scores.items(),
+                                    key=lambda kv: (kv[1], kv[0]))
+        if best_score >= _ROOT_SCORE_THRESHOLD:
+            r = _find_root(vocab, best_slug)
+            if r:
+                root_tag, root_slug, root_note = r["tag"], r["slug"], "existing"
+    if root_slug is None:
+        root_tag, root_slug, root_note = _new_root_for(text_lower, title, vocab)
+
+    # ── children 选择 ───────────────────────────────────────────────────
+    root_children = ((vocab.get("children") or {}).get(root_slug, [])
+                     if root_slug else [])
+    by_child_slug = {c.get("child", "").casefold(): c["tag"] for c in root_children}
+    pairs = vocab.get("pairs") or {}
+
+    child_hits.sort(key=lambda x: (-x[0], -x[1]["n"], x[1]["slug"]))
+    inferred, seen = [], {_tag_key(root_tag or "")}
+
+    def _push(tag):
+        key = _tag_key(tag)
+        if not tag or key in seen:
+            return False
+        seen.add(key)
+        inferred.append(tag)
+        return True
+
+    attached, needs = [], []
+    for _score, cand in child_hits:
+        if len(inferred) >= _MAX_CHILDREN:
+            break
+        if cand.get("root") != root_slug:
+            continue                      # 只收本 root 下的 child
+        if not _push(cand["tag"]):
+            continue
+        attached.append(cand["tag"])
+        # 中英成对：已知配对**且配对 tag 确实存在于库内**才双语都打，
+        # 绝不凭空造一个库里没有的 tag。
+        counterpart = pairs.get(cand["slug"]) or {}
+        pair_tag = by_child_slug.get((counterpart.get("slug") or "").casefold())
+        if pair_tag:
+            _push(pair_tag)
+            attached.append(pair_tag)
+
+    # 待翻译缺口：只对「还没登记配对」的概念提，且限量
+    if root_slug:
+        for tag in inferred:
+            if len(needs) >= _MAX_NEEDS:
                 break
-        if matched:
-            if tag not in tags:
-                tags.append(tag)
-            if len(tags) >= 3:
-                return tags
+            prefix = "#" + root_slug
+            slug = tag[len(prefix):].lstrip("-") if tag.startswith(prefix) else ""
+            if not slug or slug.casefold() in pairs:
+                continue
+            lang = _child_lang(slug)
+            needs.append({
+                "concept": slug,
+                "have": tag,
+                "have_lang": lang,
+                "want_lang": "en" if lang == "zh" else "zh",
+                "want_example": f"#{root_slug}-<{('en' if lang == 'zh' else 'zh')} slug>",
+            })
 
-    # fallback：提取标题中的核心名词，生成无空格 tag
-    if not tags:
-        words = re.findall(r'[A-Za-z\u4e00-\u9fff]+', text_stripped)
-        stop_words = {"the", "a", "an", "and", "or", "of", "in", "on", "to", "for", "with", "is", "are",
-                      "this", "that", "it", "by", "as", "from", "at", "up", "out", "about", "into", "over",
-                      "what", "which", "who", "when", "where", "why", "how", "all", "some", "any", "each",
-                      "tiny", "small", "large", "big", "new", "old", "best", "first", "last", "such",
-                      "does", "doesn", "did", "didn", "do", "don", "can", "could", "will", "would",
-                      "should", "may", "might", "must", "shall", "mayn", "mightn", "mustn", "shalln",
-                      "s", "re", "ve", "ll", "d", "won"}
-        candidates = [w for w in words if len(w) > 2 and w.lower() not in stop_words]
-        if candidates:
-            core = candidates[0].lower()
-            emoji = _emoji_for_tag(core)
-            tags.append(f"#{core}{emoji}")
+    # 新建 root：顺手把文本里其它概念作为 children 建议交给 agent
+    if root_note in ("new-topic", "new-fallback", "user-new"):
+        suggestions = []
+        for keywords, slug, _emoji in _TOPIC_KEYWORDS:
+            if slug == root_slug or len(suggestions) >= _MAX_NEEDS:
+                continue
+            if any(_phrase_in(k, text_lower) for k in keywords):
+                suggestions.append({
+                    "concept": slug,
+                    "have": None,
+                    "have_lang": None,
+                    "want_lang": "zh+en",
+                    "want_example": f"#{root_slug}-<slug>",
+                })
+        needs = (needs + suggestions)[:_MAX_NEEDS]
 
-    return tags if tags else []
+    plan = {"root": root_tag, "root_slug": root_slug, "children": inferred,
+            "needs": needs, "attached": attached, "mode": root_note or "none",
+            "scores": root_scores}
+    plan["new"] = [t for t in ([root_tag] if root_tag else []) + inferred
+                   if t not in attached]
+    return plan
+
+
+def _merge_tag_plan(plan, tag_hints=None, max_children=_MAX_CHILDREN):
+    """单点保证输出形态：1 root + ≤max_children children，去重，child ≠ root。
+
+    用户 ``#tag`` 提示**优先占 children 席位**且原样保留（显式意图是权威的，
+    也是「我就是想打这个 tag」的逃生口）；裸词提示补成 ``#<root>-<word>``。
+    """
+    plan = dict(plan or {})
+    root = plan.get("root")
+    # 用 slug 而非 tag 拼 child —— `/demo📦` 的 slug 是 `demo`，
+    # 拼成 `#demo-word` 而不是 `#/demo📦-word`
+    root_slug = plan.get("root_slug") or _root_slug(root or "")
+    hints = _parse_tag_hints(tag_hints)
+
+    merged, seen = [], {_tag_key(root or "")}
+    for h in hints["children"]:
+        if _tag_key(h) not in seen:
+            seen.add(_tag_key(h))
+            merged.append(h)
+    for h in hints["bare"]:
+        word = h.lstrip("#").strip()
+        tag = f"#{root_slug}-{word}" if root_slug else f"#{word}"
+        if _tag_key(tag) not in seen:
+            seen.add(_tag_key(tag))
+            merged.append(tag)
+    for tag in plan.get("children") or []:
+        if _tag_key(tag) not in seen:
+            seen.add(_tag_key(tag))
+            merged.append(tag)
+
+    plan["root"] = root
+    plan["children"] = merged[:max_children]
+    return plan
+
+
+def infer_tags(title, description="", tag_hints=None):
+    """扁平兼容包装：``[root, *children]``（v2.5.0 之前的调用方仍可用）"""
+    plan = _merge_tag_plan(
+        infer_tags_structured(title, description, tag_hints=tag_hints),
+        tag_hints)
+    return ([plan["root"]] if plan["root"] else []) + plan["children"]
 
 
 def _is_url(text):
@@ -1257,24 +2015,19 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
 
     print(f"💾 Saving offline copy with monolith...")
     tmp_html = os.path.join(_get_temp_dir(), filename)
-    # Google 域名外挂几百个 .woff2 字体文件，不加 -F 会在 120s 内超时
+    # 字体重页面外挂几百个 .woff2，不加 -F 会在 120-240s 内超时。
+    # 内置 Google 系 + 本地 overlay 里的字体重灾域名（见 _domain_wants_no_fonts）。
     monolith_args = ["monolith", "-o", tmp_html]
-    if any(gdom in url for gdom in ("googleblog.com", "blog.google", "ai.google.dev",
-                                     "cloud.google.com", "developers.google.com",
-                                     "research.google", "deepmind.google")):
+    if _domain_wants_no_fonts(url):
         monolith_args.append("-F")   # --no-fonts
-    # 2026-09-20: 已知 Cloudflare-fronted WordPress 个人博客 (fonts-heavy) 也加 -F
-    # lemire.me 验证: 不加 -F 在 240s 内超时 (挂载 Google Fonts)
-    if any(ldom in url for ldom in ("lemire.me",)):
-        monolith_args.append("-F")
     monolith_args.append(url)
     try:
         result = subprocess.run(
             monolith_args,
-            capture_output=True, text=True, timeout=240  # Google 域名给更多时间
+            capture_output=True, text=True, timeout=240  # 字体重页面给更多时间
         )
         if result.returncode != 0:
-            # Google 域名 + -F 仍失败 → 给出明确提示
+            # 内置 Google 域名 + -F 仍失败 → 给出明确提示
             if any(gdom in url for gdom in ("googleblog.com", "blog.google")):
                 print(f"⚠️  monolith failed (Google 域名): {result.stderr[:200]}")
             else:
@@ -1898,13 +2651,31 @@ def tags_list(item_key):
         print(f"  {i}. {tag_name} {type_str}")
 
 
-def _tags_update(item_key, tags, mode):
+def _tag_type_for(name, vocab_types):
+    """写入该 tag 时用的 type。
+
+    库内已有同名 tag → 沿用观测到的 type（避免同一 tag 又多出一份 0/1 双子）；
+    否则用 ``_DEFAULT_TAG_TYPE``。
+    """
+    return vocab_types.get(name, _DEFAULT_TAG_TYPE)
+
+
+def _tags_update(item_key, tags, mode, tag_type=None):
     """内部：更新 item 的 tags
 
     Args:
         item_key: 条目 key
-        tags: 新 tag 名列表 (如 ['/unread', '#AI-ML🤖'])
+        tags: 新 tag 名列表 (如 ['/unread', '#demo-alpha'])
         mode: 'add' | 'remove' | 'set'
+        tag_type: 新 tag 的 type，None 表示用 ``_DEFAULT_TAG_TYPE``。
+
+    为什么默认 0（manual）：Zotero 按 (name, type) 把 tag 存成两套。CLI 历史上
+    硬编码 ``type: 1``（automatic），而 automatic 桶在标签选择器菜单里对应
+    「Show Automatic Tags」开关和**不可撤销**的「Delete Automatic Tags in This
+    Library…」。用户手打的 tag 是 manual，于是 CLI 打的每个 tag 都落在另一套
+    体系里、可被一键清空。改打 manual 后 CLI 写入与手动策展一致。
+
+    库内已存在的 tag 沿用其观测 type，不再制造新的 0/1 双份。
     """
     try:
         items = zot.item(item_key)
@@ -1916,15 +2687,25 @@ def _tags_update(item_key, tags, mode):
     data = item.get('data', {})
     existing = data.get('tags', [])
 
+    try:
+        vocab_types = _vocab_tag_types()
+    except Exception:                                   # noqa: BLE001
+        vocab_types = {}
+
+    def _type_for(name):
+        if tag_type is not None:
+            return tag_type
+        return vocab_types.get(name, _DEFAULT_TAG_TYPE)
+
     if mode == 'set':
-        new_tags = [{'tag': t, 'type': 1} for t in tags]
+        new_tags = [{'tag': t, 'type': _type_for(t)} for t in tags]
     elif mode == 'add':
         existing_names = {t.get('tag', '') for t in existing}
         new_tags = list(existing)
         added = 0
         for t in tags:
             if t not in existing_names:
-                new_tags.append({'tag': t, 'type': 1})
+                new_tags.append({'tag': t, 'type': _type_for(t)})
                 existing_names.add(t)
                 added += 1
         if added == 0:
@@ -1978,6 +2759,183 @@ def tags_remove(item_key, *tag_names):
 def tags_set(item_key, *tag_names):
     """替换条目的全部 tags（允许清空——不传 tag 则设为空列表）"""
     _tags_update(item_key, list(tag_names), 'set')
+
+
+# ── v2.5.0: tag vocab / suggest / merge ──────────────────────────────────
+
+def tag_vocab(refresh=False, show_all=False, min_count=3, root=None,
+              orphans=False, dupes=False, as_json=False, cache_path=False):
+    """打印本库标签词表 —— agent 挑选 tag 的候选池。
+
+    这就是那份「高频 tag 表」，但它是**派生的、永远新鲜的**，不需要手工维护：
+    Zotero 支持服务端按频次排序，约 4 个请求即可拿全「用过 ≥min_count 次」的 tag。
+    """
+    if cache_path:
+        print(_vocab_path())
+        return
+
+    vocab = load_vocab(force_refresh=refresh)
+    roots = vocab.get("roots", [])
+    children = vocab.get("children") or {}
+
+    if as_json:
+        out = {k: v for k, v in vocab.items() if k != "scores"}
+        if min_count > 1:
+            out["roots"] = [r for r in roots if r.get("n", 0) >= min_count]
+            out["children"] = {
+                k: [c for c in v if c.get("n", 0) >= min_count]
+                for k, v in children.items()}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return
+
+    src = vocab.get("source", "?")
+    print(f"\n🏷️  Tag vocabulary — source={src}, "
+          f"{len(roots)} roots, {vocab.get('count', 0)} tags total")
+    import time as _time
+    ts = float(vocab.get("generated_ts") or 0)
+    if ts:
+        age_h = (_time.time() - ts) / 3600.0
+        print(f"    cached {age_h:.1f}h ago  ({_vocab_path()})")
+    print()
+
+    if orphans:
+        orphs = vocab.get("orphans", [])
+        print(f"  # tags with no resolvable root ({len(orphs)}) "
+              f"— merge candidates:")
+        for o in sorted(orphs, key=lambda x: -x.get("n", 0)):
+            print(f"    {o['tag']}  ({o.get('n', 0)})")
+        if not orphs:
+            print("    (none)")
+        return
+
+    if dupes:
+        groups = {}
+        for r in roots:
+            for c in children.get(r["slug"], []):
+                groups.setdefault((r["slug"], c.get("norm", "")), []).append(c)
+        shown = 0
+        for (_rslug, norm), lst in sorted(groups.items()):
+            if len(lst) < 2:
+                continue
+            shown += 1
+            print(f"  ~{norm}: " + ", ".join(
+                f"{c['tag']}({c.get('n', 0)})" for c in lst))
+        print(f"\n  {shown} near-duplicate group(s). "
+              f"Merge with: zot tag merge <old> <new>")
+        return
+
+    for r in roots:
+        if root and r["slug"] != root:
+            continue
+        if not show_all and r.get("n", 0) < min_count:
+            continue
+        flag = " (status)" if r.get("status") else ""
+        print(f"  {r['tag']}  n={r.get('n', 0)}{flag}")
+        for c in children.get(r["slug"], []):
+            if not show_all and c.get("n", 0) < min_count:
+                continue
+            print(f"      {c['tag']}  n={c.get('n', 0)}")
+    if root and not any(r["slug"] == root for r in roots):
+        print(f"  (no root with slug '{root}')")
+
+
+def tag_suggest(title, description="", as_json=False):
+    """不写库的 dry-run：预览 root + children + 新建项 + 待翻译项。
+
+    别名 ``zot tag candidates``。
+    """
+    if isinstance(description, (list, tuple)):
+        description = " ".join(description)
+    plan = _merge_tag_plan(infer_tags_structured(title, description))
+    final = ([plan["root"]] if plan["root"] else []) + plan["children"]
+
+    if as_json:
+        print(json.dumps({**plan, "final": final}, ensure_ascii=False, indent=2))
+        return final
+
+    print(f"\n🔎 Tag suggestion for: {title[:70]}")
+    print(f"    mode: {plan['mode']}")
+    print(f"    root: {plan['root'] or '(none)'}")
+    for tag in plan["children"]:
+        mark = "♻️" if tag in (plan.get("attached") or []) else "✨"
+        print(f"      {mark} {tag}")
+    if not plan["children"]:
+        print("      (no children)")
+    if plan.get("needs"):
+        print("    needs:")
+        for nd in plan["needs"]:
+            print(f"      {nd['concept']} → {nd['want_lang']} "
+                  f"(e.g. {nd['want_example']})")
+    print(f"    → {', '.join(final) if final else '(nothing)'}")
+    return final
+
+
+def tag_merge(old_tag, new_tag, dry_run=False, limit=0):
+    """把 old_tag 全库合并进 new_tag（治理存量发散 tag）。
+
+    Zotero 里同名 tag 会以 type 0/1 两条独立行存在，故必须**显式处理两条**，
+    否则合并后仍会残留一条。写完清词表缓存（让 merge 结果立刻对下次归档生效）。
+    """
+    if not old_tag or not new_tag:
+        print("Usage: zot tag merge <old-tag> <new-tag> [--dry-run] [--limit N]")
+        return 0
+    if _tag_key(old_tag) == _tag_key(new_tag):
+        print("⚠️  old and new are the same tag — nothing to do.")
+        return 0
+
+    try:
+        items = zot.everything(zot.items(tag=old_tag))
+    except Exception as e:
+        print(f"❌ Failed to query items tagged {old_tag}: {e}")
+        return 0
+
+    targets = [i for i in items if is_allowed(i['key'])]
+    denied = len(items) - len(targets)
+    if limit:
+        targets = targets[:limit]
+    print(f"\n🏷️  Merge {old_tag} → {new_tag}")
+    print(f"    {len(items)} item(s) carry the tag"
+          + (f", {denied} skipped (🙊Personal)" if denied else "")
+          + (f", {len(targets)} selected (--limit {limit})" if limit else ""))
+    if not targets:
+        print("ℹ️  Nothing to update.")
+        return 0
+    if dry_run:
+        print(f"    DRY RUN — would update {len(targets)} item(s), nothing written.")
+        return len(targets)
+
+    payload, new_key = [], _tag_key(new_tag)
+    for it in targets:
+        data = it.get('data', {})
+        tags = data.get('tags', []) or []
+        # 同名 0/1 两条都要清掉；目标 tag 已存在则保留其原有 type
+        kept = [t for t in tags if _tag_key(t.get('tag', '')) != _tag_key(old_tag)]
+        if not any(_tag_key(t.get('tag', '')) == new_key for t in kept):
+            kept.append({'tag': new_tag,
+                         'type': _tag_type_for(new_tag, _vocab_tag_types())})
+        data['tags'] = kept
+        it['data'] = data
+        payload.append(it)
+
+    updated = 0
+    try:
+        if zot.update_items(payload):
+            updated = len(payload)
+        else:
+            raise RuntimeError("update_items returned falsy")
+    except Exception as e:                              # noqa: BLE001
+        print(f"⚠️  Batch update failed ({e}) — falling back to one-by-one")
+        updated = 0
+        for it in payload:
+            try:
+                zot.update_item(it)
+                updated += 1
+            except Exception as ie:                     # noqa: BLE001
+                print(f"❌ {it.get('key', '?')}: {ie}")
+
+    _invalidate_vocab_cache()
+    print(f"✅ Merged: {updated} item(s) updated, {old_tag} → {new_tag}")
+    return updated
 
 
 def _download_binary(url, dest_path):
@@ -2217,6 +3175,69 @@ def _write_pending_summary(title, source_text, item_type, url, parent_key):
     with open(task_file, "w", encoding="utf-8") as f:
         json.dump(task, f, ensure_ascii=False, indent=2)
     print(f"[INFO] _llm_summarize: wrote pending note task to {task_file}")
+    return task_file
+
+
+def _write_pending_tags(item_key, plan, title=None, url=None):
+    """写「标签待办」文件，交给 agent 异步补全 —— 与 ``note_<key>.json`` 同级。
+
+    两类任务共用 ``$TEMP/zot_pending/`` 目录，agent 已有的「检查 zot_pending/」
+    习惯直接覆盖：
+
+    - ``needs_translation``：推断出的 child 还缺中英配对。翻译属 LLM 职责，
+      CLI 不能凭空造另一种语言的 slug。agent 翻译后
+      ``zot tag add <key> "#<root>-<中文 slug>"``，可顺手把这对登记进
+      ``pairs.json``（此后 CLI 就能确定性双语齐打），然后删除本文件。
+    - ``vocab_unavailable``：词表完全拿不到，本次只打了 ``/unread``。
+      agent 需先 ``zot tag vocab --refresh`` 恢复词表，再补打标签。
+
+    没有待办时**不写文件**（避免每次归档都留下空任务）。
+    """
+    needs = plan.get("needs") or []
+    unavailable = plan.get("mode") == "vocab_unavailable"
+    if not needs and not unavailable:
+        return None
+
+    if unavailable:
+        instructions = [
+            "标签词表不可用，本次归档只打了 /unread。",
+            "1. 运行 `zot tag vocab --refresh` 重建词表",
+            "2. 运行 `zot tag suggest \"<标题>\"` 得到建议的 root + children",
+            "3. `zot tag add <item_key> <tag>...` 补打标签",
+            "4. 删除本文件",
+        ]
+    else:
+        instructions = [
+            "为下列概念补上另一种语言的 slug，逐步完善中文 tag 体系。",
+            "1. 逐个翻译 `needs[].concept`，拼成 want_example 所示的 tag 形状",
+            "2. `zot tag add <item_key> <tag>...` 写入（tag 必须无空格）",
+            "3. 可选：把这对登记进 pairs.json，此后 CLI 会自动双语齐打",
+            "   格式 [{\"en\": \"<英文 slug>\", \"zh\": \"<中文 slug>\"}]",
+            "4. 删除本文件",
+        ]
+
+    task = {
+        "item_key": item_key,
+        "title": title,
+        "url": url,
+        "mode": "vocab_unavailable" if unavailable else "needs_translation",
+        "attached": plan.get("attached") or [],
+        "root": plan.get("root"),
+        "children": plan.get("children") or [],
+        "needs": needs,
+        "pairs_path": _pairs_path(),
+        "instructions": instructions,
+    }
+    try:
+        task_dir = os.path.join(_get_temp_dir(), "zot_pending")
+        os.makedirs(task_dir, exist_ok=True)
+        task_file = os.path.join(task_dir, f"tags_{item_key}.json")
+        with open(task_file, "w", encoding="utf-8") as f:
+            json.dump(task, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"⚠️  标签待办写入失败: {e}")
+        return None
+    print(f"🏷️  Tag task queued: {task_file}")
     return task_file
 
 
@@ -2679,24 +3700,24 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         print("❌ Please provide a title hint: zot archive <url> \"<title>\"")
         return None
 
-    # 合并 tags：用户建议优先（取前3个），不足时用 infer_tags 结果补满3个
-    inferred = infer_tags(title, description)
-    final_tags = []
-    if tag_hints:
-        for t in tag_hints:
-            tag = t if t.startswith("#") else f"#{t}"
-            if tag not in final_tags:
-                final_tags.append(tag)
-            if len(final_tags) >= 3:
-                break
-    if len(final_tags) < 3:
-        for t in inferred:
-            tag = t if t.startswith("#") else f"#{t}"
-            if tag not in final_tags:
-                final_tags.append(tag)
-            if len(final_tags) >= 3:
-                break
-    print(f"🏷️  Tags: {', '.join(final_tags)}")
+    # v2.5.0: 复用优先 —— 从本库既有 tag 词表里选 1 root + ≤7 children。
+    # 用户 #tag 提示优先占 children 席位（_merge_tag_plan 单点保证形态）。
+    tag_plan = _merge_tag_plan(
+        infer_tags_structured(title, description, tag_hints=tag_hints),
+        tag_hints)
+    final_tags = ([tag_plan["root"]] if tag_plan["root"] else []) + tag_plan["children"]
+    if tag_plan["mode"] == "vocab_unavailable":
+        print("⚠️  标签词表不可用 —— 本次只打 /unread，不发明新 tag（待办见 zot_pending/）")
+    if not final_tags:
+        print("🏷️  Tags: (none — no library tag matched)")
+    else:
+        reused = [t for t in final_tags if t in (tag_plan.get("attached") or [])]
+        fresh = [t for t in final_tags if t not in reused]
+        print(f"🏷️  Tags: {', '.join(final_tags)}")
+        if reused:
+            print(f"    ♻️  reused: {', '.join(reused)}")
+        if fresh:
+            print(f"    ✨ new:    {', '.join(fresh)}")
 
     # v1.8.0: 域名硬映射优先 (优先于多信号评分,优先于 create_misc_subcollection)
     # 场景: WeChat 文章 description 为空 → find_best_collection 早返回 None
@@ -2704,8 +3725,8 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     #       修复: 已知平台域名直接命中已有 Misc--<sub> coll
     #
     # 2026-09-20 修正: 当 _domain_subcoll_name() 命中但 Misc--<sub> 还不存在时，
-    #   旧代码会 fall through 到 find_best_collection 多信号评分，
-    #   导致严重误判（lemire.me CPU 文章被误匹配到 "How to Win Friends..." coll）。
+    #   旧代码会 fall through 到 find_best_collection 多信号评分，导致严重误判
+    #   （长尾标题撞上 coll 名里的偶然同名词）。
     #   新流程：硬映射命中 → 强制走 create_misc_subcollection 创建 Misc--<sub>，
     #   完全跳过评分。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
     domain_sub = _domain_subcoll_name(url)
@@ -2745,7 +3766,8 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         'title': title,
         'url': url,
         'abstractNote': description,
-        'tags': [{'tag': '/unread', 'type': 1}] + [{'tag': t, 'type': 1} for t in final_tags]
+        'tags': ([{'tag': '/unread', 'type': _DEFAULT_TAG_TYPE}]
+                 + [{'tag': t, 'type': _DEFAULT_TAG_TYPE} for t in final_tags])
     }
     if item_type == "podcast" and meta.get("seriesTitle"):
         item['seriesTitle'] = meta['seriesTitle']
@@ -2756,6 +3778,11 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     if response.get('successful'):
         item_key = response['successful']['0']['key']
         print(f"✅ Created item: {item_key}")
+
+        # 让**下一次**归档就能复用本次新造的 tag（否则复用要等 24h TTL 过期）
+        _vocab_note_new_tags(tag_plan.get("new") or [])
+        _write_pending_tags(item_key, tag_plan, title=title, url=url)
+
         items = zot.item(item_key)
         fetched = items[0] if isinstance(items, list) else items
         zot.addto_collection(coll_key, fetched)
@@ -2798,7 +3825,7 @@ def _build_parser():
         epilog="Conventions:\n"
                "  🚫 🙊Personal collection excluded\n"
                "  📌 New items auto-tagged /unread\n"
-               "  🏷️  Tags: #keyword🤖, no spaces, max 3\n"
+               "  🏷️  Tags: /rootEmoji + #root-child, no spaces, 1 root + ≤7\n"
                "  🔤 Sort: item search → relevance; item list/coll → dateAdded▼\n"
                "  📁 Archive: HTML→monolith; PDF/EPUB→direct download",
     )
@@ -2853,6 +3880,40 @@ def _build_parser():
     tse = tag_s.add_parser("search", help="Search by tag")
     tse.add_argument("query", help="Tag to search for")
     tse.add_argument("limit", nargs="?", type=int, default=10)
+
+    tv = tag_s.add_parser("vocab", help="Show the library tag vocabulary")
+    tv.add_argument("--refresh", action="store_true",
+                    help="Force re-fetch from the API")
+    tv.add_argument("--all", action="store_true", dest="show_all",
+                    help="Include rare tags (below --min-count)")
+    tv.add_argument("--min-count", type=int, default=3, dest="min_count",
+                    help="Only show tags used at least N times (default 3)")
+    tv.add_argument("--root", help="Only show children of this root slug")
+    tv.add_argument("--orphans", action="store_true",
+                    help="List # tags with no resolvable root (merge worklist)")
+    tv.add_argument("--dupes", action="store_true",
+                    help="Group children by normalized slug to spot near-duplicates")
+    tv.add_argument("--json", action="store_true", dest="as_json")
+    tv.add_argument("--cache-path", action="store_true", dest="cache_path",
+                    help="Print the vocab cache path and exit")
+
+    tsu = tag_s.add_parser("suggest",
+                           help="Dry-run tag inference (writes nothing)")
+    tsu.add_argument("title")
+    tsu.add_argument("description", nargs="*", default=[])
+    tsu.add_argument("--json", action="store_true", dest="as_json")
+
+    tca = tag_s.add_parser("candidates", help="Alias of suggest")
+    tca.add_argument("title")
+    tca.add_argument("description", nargs="*", default=[])
+    tca.add_argument("--json", action="store_true", dest="as_json")
+
+    tm = tag_s.add_parser("merge", help="Merge one tag into another library-wide")
+    tm.add_argument("old_tag", help="Tag to eliminate")
+    tm.add_argument("new_tag", help="Tag to keep")
+    tm.add_argument("--dry-run", action="store_true", dest="dry_run")
+    tm.add_argument("--limit", type=int, default=0,
+                    help="Max items to update (0 = all)")
 
     # ── coll ──────────────────────────────────────────────────
     coll = subs.add_parser("coll", help="Collection management")
@@ -2944,9 +4005,12 @@ def _resolve_aliases(argv):
         return [argv[0]] + _ALIAS_MAP[cmd] + tail
 
     # tag <non-subcommand> → tag search <query> [limit]
+    # 注意：每加一个 tag 子命令都必须登记到这里，否则 `zot tag vocab` 会被
+    # 悄悄改写成 `zot tag search vocab`。
     if cmd == "tag" and tail:
         sub = tail[0]
         if sub not in ("add", "remove", "set", "list", "search",
+                       "vocab", "suggest", "candidates", "merge",
                        "-h", "--help"):
             argv = [argv[0], "tag", "search"] + tail
             return argv
@@ -3173,6 +4237,16 @@ if __name__ == "__main__":
                 tags_list(args.item_key)
             elif action == "search":
                 search_by_tag(args.query, args.limit)
+            elif action == "vocab":
+                tag_vocab(refresh=args.refresh, show_all=args.show_all,
+                          min_count=args.min_count, root=args.root,
+                          orphans=args.orphans, dupes=args.dupes,
+                          as_json=args.as_json, cache_path=args.cache_path)
+            elif action in ("suggest", "candidates"):
+                tag_suggest(args.title, args.description, as_json=args.as_json)
+            elif action == "merge":
+                tag_merge(args.old_tag, args.new_tag,
+                          dry_run=args.dry_run, limit=args.limit)
 
         elif cmd == "coll":
             action = args.action

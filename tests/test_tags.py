@@ -127,3 +127,143 @@ class TestTagSet:
         item = items[0] if isinstance(items, list) else items
         tags = [t.get("tag") for t in item.get("data", {}).get("tags", [])]
         assert set(tags) == {"#tag-1🤖", "#tag-2💻", "#tag-3💰"}
+
+
+def _json_from(text):
+    """Parse the JSON blob out of a command's stdout (warnings may precede it)."""
+    import json
+    start = text.find("{")
+    assert start >= 0, f"no JSON in output: {text!r}"
+    return json.loads(text[start:])
+
+
+class TestTagVocab:
+    """zot tag vocab — derived high-frequency vocabulary (v2.5.0)."""
+
+    def test_cache_path_outside_repo(self, zot_mod, capsys):
+        """The vocab cache must live outside the repo — it holds library data."""
+        zot_mod.tag_vocab(cache_path=True)
+        path = capsys.readouterr().out.strip()
+        assert "zot_vocab" in path
+        assert "zot-tool" not in path.replace("\\", "/"), \
+            f"cache path is inside the repo: {path}"
+
+    def test_vocab_fetch(self, zot_mod, capsys):
+        """A fetched vocabulary satisfies the structural invariants.
+
+        The test library is a scratch library that holds few or no tags at
+        any given moment (every test cleans up after itself), so these are
+        invariants — never expectations about which tags exist.
+        """
+        zot_mod.tag_vocab(refresh=True, as_json=True)
+        vocab = _json_from(capsys.readouterr().out)
+        for key in ("roots", "children", "orphans", "pairs", "local_new"):
+            assert key in vocab, f"missing {key}"
+
+        root_slugs = {r["slug"] for r in vocab["roots"]}
+        for r in vocab["roots"]:
+            assert r["tag"].startswith("/")
+            assert r["slug"]
+            assert r["status"] is (r["slug"] in zot_mod._STATUS_TAG_SLUGS)
+        for root_slug, children in vocab["children"].items():
+            assert root_slug in root_slugs, \
+                f"children under unknown root {root_slug!r}"
+            for c in children:
+                assert c["tag"].startswith("#")
+                assert c["tag"].count(" ") == 0
+                # Longest-root-prefix routing: a child must really sit under
+                # the root it was filed under.
+                body = zot_mod._child_body(c["tag"])
+                assert body == root_slug or body.startswith(root_slug + "-"), \
+                    f"{c['tag']!r} does not belong under {root_slug!r}"
+        for o in vocab["orphans"]:
+            assert o["tag"].startswith("#")
+            body = zot_mod._child_body(o["tag"])
+            assert not any(body == rs or body.startswith(rs + "-")
+                           for rs in root_slugs), \
+                f"orphan {o['tag']!r} actually belongs to a known root"
+
+        placed = (len(vocab["roots"]) + len(vocab["orphans"])
+                  + sum(len(v) for v in vocab["children"].values()))
+        assert placed <= vocab["count"], \
+            f"placed {placed} tags but only parsed {vocab['count']}"
+
+    def test_vocab_cache_reuse(self, zot_mod, monkeypatch):
+        """A second load inside the TTL is served from disk, not the API."""
+        calls = []
+        real_fetch = zot_mod._fetch_all_tags_raw
+
+        def counting_fetch(*args, **kwargs):
+            calls.append(1)
+            return real_fetch(*args, **kwargs)
+
+        monkeypatch.setattr(zot_mod, "_fetch_all_tags_raw", counting_fetch)
+
+        fresh = zot_mod.load_vocab(force_refresh=True)   # API + disk write
+        assert len(calls) == 1, "first load should hit the API once"
+
+        # Drop the in-memory copy so the disk path is exercised.
+        zot_mod._vocab_cache["data"] = None
+        cached = zot_mod.load_vocab()
+
+        assert cached["source"] == "disk"
+        assert len(calls) == 1, "second load hit the API instead of disk"
+        # The disk round-trip must be lossless. Comparing against the fresh
+        # fetch keeps this independent of which tags the library happens to
+        # contain (it may contain none at all).
+        assert cached["roots"] == fresh["roots"]
+        assert cached["children"] == fresh["children"]
+        assert cached["orphans"] == fresh["orphans"]
+        assert cached["count"] == fresh["count"]
+
+
+class TestTagSuggest:
+    """zot tag suggest — dry run, never writes to the library."""
+
+    def test_suggest_shape(self, zot_mod, capsys):
+        zot_mod.tag_suggest("A synthetic title about zot test widgets",
+                            as_json=True)
+        plan = _json_from(capsys.readouterr().out)
+        final = plan["final"]
+        assert len(plan["children"]) <= 7
+        assert len(final) == len(set(final)), f"duplicates in {final}"
+        if plan["root"]:
+            assert plan["root"].startswith("/")
+            assert plan["root"] not in plan["children"]
+        assert plan["children"] == [t for t in plan["children"] if t.startswith("#")]
+
+    def test_suggest_url_only_yields_nothing(self, zot_mod):
+        final = zot_mod.tag_suggest("https://test.invalid/some/post")
+        assert final == []
+
+
+class TestTagMerge:
+    """zot tag merge <old> <new> — consolidate divergent legacy tags."""
+
+    OLD = "#test-merge-old🤖"
+    NEW = "#test-merge-new🤖"
+
+    def test_merge_dry_run(self, zot_mod, api_client, test_item, capsys):
+        zot_mod.tags_add(test_item, self.OLD)
+        zot_mod.tag_merge(self.OLD, self.NEW, dry_run=True)
+        assert "DRY RUN" in capsys.readouterr().out
+        items = api_client.item(test_item)
+        item = items[0] if isinstance(items, list) else items
+        tags = [t.get("tag") for t in item.get("data", {}).get("tags", [])]
+        assert self.OLD in tags, "dry run must not write"
+
+    def test_merge_real(self, zot_mod, api_client, test_item):
+        zot_mod.tags_add(test_item, self.OLD)
+        updated = zot_mod.tag_merge(self.OLD, self.NEW)
+        assert updated >= 1
+        items = api_client.item(test_item)
+        item = items[0] if isinstance(items, list) else items
+        tags = [t.get("tag") for t in item.get("data", {}).get("tags", [])]
+        assert self.NEW in tags
+        assert self.OLD not in tags, f"old tag still present: {tags}"
+        assert tags.count(self.NEW) == 1
+
+    def test_merge_noop(self, zot_mod, capsys):
+        """Merging a tag nobody carries is a no-op, not an error."""
+        assert zot_mod.tag_merge("#test-merge-absent🤖", self.NEW) == 0
+        assert "Nothing to update" in capsys.readouterr().out

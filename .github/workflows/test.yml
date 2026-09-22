@@ -14,7 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      # v6 is the first release on the Node.js 24 action runtime; v5 runs on
+      # Node.js 20, which GitHub deprecated and removes from runners in
+      # September 2026.
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 

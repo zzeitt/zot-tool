@@ -1,6 +1,6 @@
 # zot-tool
 
-Single-file Python CLI (`scripts/zot.py`, ~3,100 lines) for Zotero library
+Single-file Python CLI (`scripts/zot.py`, ~4,300 lines) for Zotero library
 management via `pyzotero` + Zotero Web API v3. Also contains an OpenCLI skill
 definition (`SKILL.md`). This file is the single source of guidance for AI
 coding agents and contributors working in this repository.
@@ -19,7 +19,7 @@ alias zot="python3 scripts/zot.py"
 # Examples
 zot item search "machine learning"
 zot item archive "https://example.com"
-zot tag add KC5ETPXM "#AI🤖"
+zot tag add ABCD1234 "/demo📦" "#demo-alpha"
 zot coll list
 zot tag "/unread"
 ```
@@ -46,6 +46,8 @@ Optional:
 | `ZOTERO_WEBDAV_URL` / `ZOTERO_WEBDAV_USER` / `ZOTERO_WEBDAV_PASS` | WebDAV endpoint + credentials for offline ZIP uploads |
 | `ZOTERO_ARCHIVE_TRIGGER` | defaults to `【归档到Zotero】` |
 | `ZOTERO_OFFLINE_DIR` | local fallback dir for offline HTML when WebDAV is unavailable (default `/tmp/zotero-offline`) |
+| `ZOTERO_VOCAB_DIR` | root for library-derived data — tag vocabulary + domain overlay. **Must stay outside the repo** (default `%TEMP%/zot_vocab`) |
+| `ZOTERO_DOMAIN_MAP` | path to `domain_overrides.json` (default `<ZOTERO_VOCAB_DIR>/domain_overrides.json`) |
 
 ## Dependencies
 
@@ -67,7 +69,7 @@ Canonical `<noun> <verb>` structure:
 | Noun | Verbs |
 |------|-------|
 | `item` | `add`, `remove`, `list`, `search`, `archive` |
-| `tag` | `add`, `remove`, `set`, `list`, `search` |
+| `tag` | `add`, `remove`, `set`, `list`, `search`, `vocab`, `suggest` (= `candidates`), `merge` |
 | `coll` | `list`, `remove`, `search` |
 | `note` | `add` (LLM), `set` (raw) |
 | `attachment` | `add`, `remove`, `update`, `list` |
@@ -83,14 +85,19 @@ argparse sees them.
 1. **Metadata fetch** (`fetch_url_metadata`): curl + regex title/description
    extraction. Apple Podcasts via iTunes API, Hacker News via Algolia API
    (`_fetch_hn_thread_info`). Cloudflare-block detection.
-2. **Tag inference** (`infer_tags`): fuzzy-matches against existing library
-   tags first (`_fuzzy_match_existing`), falls back to concept extraction with
-   emoji suffix (`_extract_concepts`). User-supplied `#tag` hints take
-   priority, merged to max 3.
+2. **Tag inference** (`infer_tags_structured` → `_merge_tag_plan`): matches
+   against the derived vocabulary (`load_vocab()`) first — reuse beats
+   invention. Vocabulary misses fall back to a new root via `_TOPIC_KEYWORDS`
+   (`_new_root_for`). Output is **1 root + ≤7 children**; user-supplied `#tag`
+   hints take the children seats verbatim and bare hints become
+   `#<root>-<word>`. `infer_tags()` is the flat `[root, *children]` wrapper kept
+   for back-compat. An unavailable vocabulary yields `/unread` only — it never
+   invents tags.
 3. **Collection matching** (three-tier, highest priority first):
    - Domain hard-mapping: `_find_existing_domain_collection()` checks the
-     `DOMAIN_TO_SUBCOLL` dict (33 platform → short-name mappings) against
-     existing `Misc--<sub>` collections.
+     built-in `DOMAIN_TO_SUBCOLL` dict (generic platforms only) merged with the
+     local `domain_overrides.json` overlay, against existing `Misc--<sub>`
+     collections.
    - Multi-signal scoring: `find_best_collection()` — keyword intersection
      between text and collection name/content.
    - Fallback: `create_misc_subcollection()` creates a new `Misc--xxx` under
@@ -120,8 +127,23 @@ argparse sees them.
 - `_forbidden_item_keys` — lazy-loaded set of item keys in `🙊Personal` and all descendant collections.
 - `_forbidden_collection_keys` — lazy-loaded set of collection keys (root + all descendants); used by `list_collections()`, `find_best_collection()`, `get_forbidden_items()`.
 - `_invalidate_forbidden_cache()` — resets both forbidden caches after membership changes.
-- `_existing_tags_cache` — lazy-loaded list of all library tags.
+- `_vocab_cache` — TTL-cached (`_VOCAB_CACHE_TTL`, 24h) tag vocabulary, served
+  memory → disk (`<ZOTERO_VOCAB_DIR>/tags.json`) → raw HTTP fetch. Replaces the
+  deleted `_existing_tags_cache` / `get_existing_tags()` /
+  `_fuzzy_match_existing()` / `_extract_concepts()`. `_invalidate_vocab_cache()`
+  backdates the file's mtime instead of deleting it (the disk copy is the
+  offline fallback); `_vocab_note_new_tags()` writes freshly invented tags back
+  so the *next* archive can reuse them.
 - `_collections_cache` — TTL-cached result of `_all_collections()`.
+- `_domain_overlay_cache` — TTL-cached result of `_load_domain_overrides()`.
+
+Untracked library-derived files under `ZOTERO_VOCAB_DIR` (never in the repo):
+
+| File | Contents |
+|---|---|
+| `tags.json` | tag vocabulary: roots / children / orphans / counts / pairs |
+| `pairs.json` | bilingual tag pairs (`{"pairs": [{"en": ..., "zh": ...}]}`) — the **only** source of pairing knowledge; there is no in-code seed |
+| `domain_overrides.json` | domain → `Misc--<sub>` overlay + `no_fonts` list |
 - `_last_fetched_description` — set by `archive_url()`, read by `_create_content_note()`.
 - `_cached_hn_info` — set by `archive_url()` for HN posts, read by `_create_content_note()`.
 
@@ -132,18 +154,44 @@ strips `visibility:hidden`/`opacity:0` from `#js_content`, removes `data-src`
 from `<img>` tags (keeping the inline base64 `src` — those are real image data,
 not placeholders), and strips WeChat debugging attributes.
 
-### Domain hard-mapping (`DOMAIN_TO_SUBCOLL`)
+### Domain hard-mapping (`DOMAIN_TO_SUBCOLL` + local overlay)
 
 Platform → short-name mapping used by both `_find_existing_domain_collection()`
-(matching) and `_domain_subcoll_name()` (naming). Adding a new platform requires
-updating the dict and the SKILL.md domain-mapping docs.
+(matching) and `_domain_subcoll_name()` (naming).
+
+The in-repo dict holds **generic public platforms only**. Anything
+library-specific — personal blogs the maintainer follows, sites that hang on
+webfonts — belongs in the untracked `domain_overrides.json` overlay instead
+(`_load_domain_overrides()`, path from `ZOTERO_DOMAIN_MAP`). The overlay is
+consulted first, so it can override any built-in entry. A missing or malformed
+overlay degrades to `{}`; archiving never fails because of it.
+
+Adding a *generic* platform requires updating the dict and the SKILL.md
+domain-mapping docs.
 
 ## Conventions
 
+- **This is a PUBLIC repository. Never write real library data into it.** That
+  means no real tag names, no tag frequencies/counts, no real collection names,
+  and no Zotero keys (collection keys, item keys, library ID) — not in source,
+  tests, docs, examples, fixtures, or commit messages. Use synthetic
+  placeholders (e.g. `/demo📦`, `#demo-alpha`, `ABCD1234`) and keep library-
+  specific knowledge in the untracked overlay files instead. Real keys already
+  appear in this repo's **git history**; file-level scrubbing does not remove
+  them.
 - All new items are auto-tagged `/unread`; remove the tag after processing.
-- Tags: no spaces, `#` prefix, emoji suffix, max 3 per item. Prefer matching
-  existing library tags; fallback format is `#<domain>🤖` or
-  `#<domain>-<subdomain>🤖`.
+- Tags follow the library's own naming law: `/slug<emoji>` = level-1 root,
+  `#slug-child[-leaf]` = hierarchical child, `/unread` `/reading` `/done` =
+  status tags excluded from topic matching. Lowercase, hyphen-joined, **no
+  spaces** (spaced tags are dropped outright). Each item gets **1 root + ≤7
+  children**, added as `type: 0` (manual) — `type: 1` sits in Zotero's
+  one-click-deletable "automatic tags" bucket.
+- Tag selection is **reuse-first**: load the derived vocabulary
+  (`zot tag vocab`) and match against it; only invent a tag when nothing in the
+  library fits. Never add a hand-maintained high-frequency list — the
+  vocabulary is derived from `GET /tags?sort=numItems&direction=desc` and is
+  therefore always current. Bilingual children are added only when the
+  counterpart is registered in `pairs.json` *and* already exists in the library.
 - `🙊Personal` collection and all descendants are universally excluded.
 - Misc sub-collections use the `Misc--<shortname>` naming convention.
 - Offline archives use `monolith` for HTML; `scripts/upload-skill.sh` syncs the
@@ -152,7 +200,7 @@ updating the dict and the SKILL.md domain-mapping docs.
 ## Versioning
 
 - The version number is recorded in the `SKILL.md` frontmatter `version:` field
-  (single source of truth). Current version: **v2.3.5**.
+  (single source of truth). Current version: **v2.5.0**.
 - Format: `MAJOR.MINOR.PATCH`
 
 | Part | Meaning | Example |
@@ -170,11 +218,13 @@ Rules:
 
 Recent history (highlights; see SKILL.md for details):
 
-- **v2.3.5** — `alanzucconi.com → alanzucconi` domain mapping
-- **v2.3.4** — `barrd.dev → barrd` domain mapping
-- **v2.3.3** — `gatesnotes.com → gatesnotes` domain mapping (Cloudflare-blocked)
-- **v2.3.2** — `infinitelymore.xyz → infinitelymore` domain mapping
-- **v2.3.1** — integration test assertion fixes; auto-release creates GitHub Release
+- **v2.5.0** — library-native tag system: derived vocabulary, `/root` +
+  `#root-child` naming law, reuse-first matching, 1 root + ≤7 bilingual
+  children, `tag vocab` / `suggest` / `merge`, `type: 0` writes, and the
+  personal-blog domain map moved out of source into a local overlay
+- **v2.4.1** — personal-blog domain mapping + collection flow fix + monolith `-F`
+- **v2.4.0** — arXiv/preprint `itemType` fix
+- **v2.3.5** — personal-blog domain mapping (math/graphics teaching blog)
 
 ## Commit message format
 
