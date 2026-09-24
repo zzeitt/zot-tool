@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.4.2
+version: 2.4.3
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -326,6 +326,11 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.4.3 — `developer.nvidia.com` 硬映射 + 回收 `skg.com` 未提交修改
+
+- **`developer.nvidia.com → nvidia` 域名映射**：NVIDIA Developer Blog（TensorRT / cuDNN / Transformer Engine / NIM / GPU 编程 / 模型优化等技术博文）。2026-09-25 验证：3 篇 NVIDIA 推理优化博文（speculative decoding / QAT / NVFP4）若走多信号评分会分散命中 `LLM-Inference` / `LLM-TurboQuant` / `LLM-Transformer` 等子 coll，但本质都是 NVIDIA 一手技术文档，应统一进 `Misc--nvidia`。加硬映射 → 强制走 `Misc--nvidia`。
+- **回收 `skg.com → skg` 未提交修改**：2026-09-24 在 Minis load point 直接 hack 上去但没 commit 的 SKG 映射（`files.skg.com` / `www.skg.com` / `skg.com`），v2.4.3 一并纳入版本历史。
 
 ### v2.4.2 — `fs.blog` 硬映射
 

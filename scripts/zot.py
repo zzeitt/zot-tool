@@ -136,6 +136,19 @@ DOMAIN_TO_SUBCOLL = {
     # 关键词触发多信号评分高分匹配到 Misc--machine/learning (X3V2CSDP), 与文章真实主题
     # (通用学习法/心智模型/决策) 严重不符。加硬映射 → 命中/创建 Misc--fs-blog。
     "fs.blog": "fs-blog",
+    # SKG（未来健康）品牌官方文件 CDN — files.skg.com 子域
+    # 2026-09-24 验证：T1-3 说明书 PDF 走 fallback 命名 "Misc--files"（取 subdomain 第一段），
+    # 实际品牌是 SKG。加硬映射 → 未来 files.skg.com / www.skg.com / skg.com 都走 Misc--skg。
+    # netloc 后缀匹配会自动覆盖 *.skg.com 子域。
+    "skg.com": "skg",
+    # NVIDIA Developer Blog（developer.nvidia.com — TensorRT / cuDNN / Transformer Engine
+    # / NIM / GPU 编程 / 模型优化等技术博文）。与 Microsoft DevBlogs / Google Developers Blog
+    # 同类大厂技术博客。
+    # 2026-09-25 验证：3 篇 NVIDIA 推理优化博文（speculative decoding / QAT / NVFP4）若走
+    # 多信号评分会分散命中 LLM-Inference / LLM-TurboQuant / LLM-Transformer 等子 coll，
+    # 但本质都是 NVIDIA 一手技术文档，应统一进 Misc--nvidia。加硬映射 → 强制走 Misc--nvidia。
+    # netloc 后缀匹配会自动覆盖 *.developer.nvidia.com 子域。
+    "developer.nvidia.com": "nvidia",
 }
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
