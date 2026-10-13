@@ -12,7 +12,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 2, not the default 1. On a pull_request event the checkout
+      # is the synthetic merge commit and tests/conftest.py's run_identity()
+      # reads HEAD^2 for the real PR tip — at depth 1 the parents are absent, so
+      # that rev-parse fails and the trace note silently records the merge
+      # commit instead of the revision actually under test.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
 
       # v6 is the first release on the Node.js 24 action runtime; v5 runs on
       # Node.js 20, which GitHub deprecated and removes from runners in

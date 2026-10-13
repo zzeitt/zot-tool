@@ -984,3 +984,22 @@ class TestCiTraceNote:
         ident = run_identity()
         assert ident["pr"] == ""
         assert ident["branch"] == "main"
+
+    def test_ci_checkout_keeps_the_merge_parents(self):
+        """run_identity() reads HEAD^2, so the checkout must not prune it.
+
+        On a pull_request event the checkout is the synthetic merge commit and
+        HEAD^2 is the real PR tip. The default fetch-depth of 1 leaves that
+        parent out of the shallow clone, the rev-parse fails, and the note
+        quietly records the merge commit instead of the tested revision — a
+        silent downgrade, which is why it is pinned here rather than left to
+        the workflow comment alone.
+        """
+        import os
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, ".github", "workflows", "test.yml"),
+                  encoding="utf-8") as fh:
+            text = fh.read()
+        assert "actions/checkout@v6" in text
+        step = text.split("actions/checkout@v6", 1)[1].split("- uses:", 1)[0]
+        assert "fetch-depth: 2" in step
