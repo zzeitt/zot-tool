@@ -1691,7 +1691,13 @@ def infer_tags_structured(title, description="", tag_hints=None, vocab=None):
     plan = {"root": root_tag, "root_slug": root_slug, "children": inferred,
             "needs": needs, "attached": attached, "mode": root_note or "none",
             "scores": root_scores}
-    plan["new"] = [t for t in ([root_tag] if root_tag else []) + inferred
+    # ``new`` 是「本次要新建的 tag」——命中的既有 root（``existing``）与用户
+    # 指定且库内已有的 root（``user``）都不算，否则 ``tag suggest --json`` 会把
+    # 库内已有的 tag 报成新建。children 侧无需过滤：候选命中都会被收进
+    # ``attached``，留在 ``inferred`` 里的本来就不在库内。
+    root_is_new = root_note not in ("existing", "user")
+    plan["new"] = [t for t in (([root_tag] if root_tag else [])
+                               if root_is_new else []) + inferred
                    if t not in attached]
     return plan
 
