@@ -4,6 +4,8 @@ Tests functions that do string processing, URL detection, emoji mapping,
 concept extraction, etc. Fast and safe to run without network.
 """
 
+import json
+
 import pytest
 
 
@@ -472,6 +474,195 @@ class TestInferTagsBackCompat:
         monkeypatch.setattr(zot, "load_vocab", lambda *a, **k: _synthetic_vocab())
         tags = zot.infer_tags("demo alpha")
         assert len(tags) == len(set(tags))
+
+
+class TestTagGeneration:
+    """End-to-end tag generation — the contract, not just the matcher.
+
+    ``TestTagMatcher`` checks individual decisions; these check what an archive
+    actually ends up writing, which is where divergence used to happen.
+    """
+
+    # Titles whose only connection to the vocabulary is the synthetic fixture.
+    REUSING_TITLES = (
+        "A deep dive into demo alpha internals",
+        "demo cv pipelines",
+        "阿尔法 算法详解",
+        "demo alpha 阿尔法 notes",
+    )
+
+    def _plan(self, zot, title, description="", hints=None):
+        return zot._merge_tag_plan(
+            zot.infer_tags_structured(title, description, hints,
+                                      vocab=_synthetic_vocab()),
+            hints)
+
+    def _known_tags(self, vocab):
+        known = {r["tag"] for r in vocab["roots"]}
+        known |= {c["tag"] for cs in vocab["children"].values() for c in cs}
+        known |= {o["tag"] for o in vocab["orphans"]}
+        return known
+
+    def test_every_generated_tag_already_exists(self, zot):
+        """Reuse-first: a matched root means nothing new gets invented.
+
+        This is the regression the tag rework exists for — the old code minted
+        a fresh tag on every single archive.
+        """
+        known = self._known_tags(_synthetic_vocab())
+        for title in self.REUSING_TITLES:
+            plan = self._plan(zot, title)
+            assert plan["mode"] == "existing", title
+            produced = ([plan["root"]] if plan["root"] else []) + plan["children"]
+            invented = [t for t in produced if t not in known]
+            assert not invented, f"{title!r} invented {invented}"
+
+    def test_new_excludes_tags_that_already_exist(self, zot):
+        """``new`` means "to be created" — a reused root is not new.
+
+        This field is dumped by ``zot tag suggest --json`` and read by the
+        agent, so listing an existing tag there is misinformation.
+        """
+        reused = self._plan(zot, "A deep dive into demo alpha internals")
+        assert reused["mode"] == "existing"
+        assert reused["new"] == [], f"existing tags reported as new: {reused['new']}"
+
+        minted = self._plan(zot, "Recent advances in machine learning")
+        assert minted["mode"] == "new-topic"
+        assert minted["new"] == [minted["root"]] == ["/ai🤖"]
+
+    def test_user_root_that_exists_is_not_new(self, zot):
+        plan = zot._merge_tag_plan(
+            zot.infer_tags_structured("some unrelated text", tag_hints=["/demo"],
+                                      vocab=_synthetic_vocab()),
+            ["/demo"])
+        assert plan["mode"] == "user"
+        assert plan["root"] == "/demo📦"
+        assert plan["new"] == []
+
+    def test_output_shape_is_one_root_plus_at_most_seven(self, zot):
+        for title in self.REUSING_TITLES + ("Advances in machine learning",):
+            plan = self._plan(zot, title)
+            assert len(plan["children"]) <= 7, title
+            if plan["root"]:
+                assert plan["root"].startswith("/")
+                assert plan["root"] not in plan["children"], title
+            assert len(plan["children"]) == len(set(plan["children"]))
+
+    def test_generated_tags_never_contain_spaces(self, zot):
+        """Spaced tags are dropped by the parser — generating one is a bug."""
+        for title in self.REUSING_TITLES:
+            plan = self._plan(zot, title)
+            for tag in ([plan["root"]] if plan["root"] else []) + plan["children"]:
+                assert " " not in tag, f"{title!r} produced {tag!r}"
+
+    def test_children_never_orphaned_from_root(self, zot):
+        """Every child must sit under the root it is shipped with."""
+        for title in self.REUSING_TITLES:
+            plan = self._plan(zot, title)
+            if not plan["root"]:
+                continue
+            slug = plan["root_slug"]
+            for child in plan["children"]:
+                body = zot._child_body(child)
+                assert body == slug or body.startswith(slug + "-"), \
+                    f"{title!r}: {child!r} does not belong under {slug!r}"
+
+    def test_generation_is_deterministic(self, zot):
+        """Same input, same tags — divergence came from run-to-run drift."""
+        for title in self.REUSING_TITLES:
+            first = self._plan(zot, title)
+            second = self._plan(zot, title)
+            assert first["root"] == second["root"]
+            assert first["children"] == second["children"]
+
+    def test_production_entry_point_loads_the_vocabulary(self, zot, monkeypatch):
+        """vocab=None must go through load_vocab() — the real archive path.
+
+        Every other test injects a vocabulary, so nothing else would catch the
+        disk/memory loader being bypassed.
+        """
+        calls = []
+        monkeypatch.setattr(zot, "load_vocab",
+                            lambda *a, **k: calls.append(1) or _synthetic_vocab())
+        plan = zot.infer_tags_structured("A deep dive into demo alpha internals")
+        assert calls, "infer_tags_structured did not call load_vocab()"
+        assert plan["root"] == "/demo📦"
+
+    def test_new_root_falls_back_to_a_title_word(self, zot):
+        """No topic keyword and no library match → a word from the title."""
+        plan = zot.infer_tags_structured(
+            "Notes on zzqqxx widgetry", vocab=_synthetic_vocab())
+        assert plan["mode"] == "new-fallback"
+        assert plan["root"] and plan["root"].startswith("/")
+        assert plan["mode"] != "none"
+
+    def test_unmatched_url_alone_generates_nothing(self, zot):
+        plan = self._plan(zot, "https://test.invalid/a/b")
+        assert plan["root"] is None
+        assert plan["children"] == []
+
+    def test_vocab_unavailable_generates_no_tags(self, zot):
+        """Dropping to /unread is the only safe move without a vocabulary."""
+        plan = zot._merge_tag_plan(zot.infer_tags_structured(
+            "A deep dive into demo alpha internals",
+            vocab=zot._empty_vocab("vocab_unavailable")))
+        assert plan["root"] is None
+        assert plan["children"] == []
+
+
+class TestPendingTagTasks:
+    """_write_pending_tags() — the agent handoff for bilingual gaps."""
+
+    def _plan(self, zot, title, vocab=None):
+        return zot.infer_tags_structured(title,
+                                         vocab=vocab or _synthetic_vocab())
+
+    def test_writes_task_file_when_a_pair_is_missing(self, zot, tmp_path,
+                                                     monkeypatch):
+        monkeypatch.setattr(zot, "_get_temp_dir", lambda: str(tmp_path))
+        monkeypatch.setenv("ZOTERO_VOCAB_DIR", str(tmp_path / "vocab"))
+        plan = self._plan(zot, "demo cv internals")
+        assert plan["needs"], "fixture should leave an unpaired concept"
+
+        zot._write_pending_tags("ABCD1234", plan, title="t", url="u")
+        path = tmp_path / "zot_pending" / "tags_ABCD1234.json"
+        assert path.exists()
+
+        task = json.loads(path.read_text(encoding="utf-8"))
+        assert task["item_key"] == "ABCD1234"
+        assert task["mode"] == "needs_translation"
+        assert task["needs"] == plan["needs"]
+        assert task["instructions"], "the agent needs instructions"
+
+    def test_writes_nothing_when_there_is_no_work(self, zot, tmp_path,
+                                                 monkeypatch):
+        """A file per archive with an empty task list would be pure noise."""
+        monkeypatch.setattr(zot, "_get_temp_dir", lambda: str(tmp_path))
+        plan = {"needs": [], "mode": "existing", "attached": []}
+        assert zot._write_pending_tags("ABCD1234", plan) is None
+        assert not (tmp_path / "zot_pending").exists()
+
+    def test_vocab_unavailable_is_recorded_as_its_own_mode(self, zot, tmp_path,
+                                                           monkeypatch):
+        monkeypatch.setattr(zot, "_get_temp_dir", lambda: str(tmp_path))
+        monkeypatch.setenv("ZOTERO_VOCAB_DIR", str(tmp_path / "vocab"))
+        plan = zot.infer_tags_structured("anything",
+                                         vocab=zot._empty_vocab("vocab_unavailable"))
+        zot._write_pending_tags("ABCD1234", plan)
+        task = json.loads(
+            (tmp_path / "zot_pending" / "tags_ABCD1234.json").read_text("utf-8"))
+        assert task["mode"] == "vocab_unavailable"
+        assert any("vocab --refresh" in line for line in task["instructions"])
+
+    def test_write_failure_is_not_fatal(self, zot, tmp_path, monkeypatch):
+        """Losing the handoff file must never break the archive."""
+        # A regular file where the task directory belongs: makedirs() raises
+        # FileExistsError, which the helper must swallow.
+        (tmp_path / "zot_pending").write_text("in the way", encoding="utf-8")
+        monkeypatch.setattr(zot, "_get_temp_dir", lambda: str(tmp_path))
+        plan = {"needs": [{"concept": "cv"}], "mode": "needs_translation"}
+        assert zot._write_pending_tags("ABCD1234", plan) is None
 
 
 class TestVocabCacheRoundTrip:
