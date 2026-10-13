@@ -454,10 +454,14 @@ alias zot="python3 scripts/zot.py"
 - **其它**：`_strip_diacritics` / `_title_keywords` 从 `_extract_concepts` 的嵌套 helper
   提为模块级；新增 `_parse_tag_hints` / `_merge_tag_plan` 单点保证输出形态。
 
-### v2.4.2 — `fs.blog` 硬映射
+### v2.4.3 — 厂商技术博客 + 品牌站硬映射
 
-- **`fs.blog → fs-blog` 域名映射**：Farnam Street — Shane Parrish 署名的心智模型/学习/决策博客（2026-09-21 验证：`/learning/` 「Accelerated Learning」描述里 `learning` / `knowledge` / `brain` 关键词触发多信号评分高分匹配到 `Misc--machine/learning` (X3V2CSDP) — 文章真实主题是「通用学习法/心智模型/决策」，与 machine learning 教科书严重不符。加进硬映射 → 命中/创建 `Misc--fs-blog`）。
-- 跟 gatesnotes / alanzucconi / barrd / lemire 同类独立个人博客。
+- **厂商技术博客域名映射**：新增 1 条大厂开发者博客 → `Misc--<vendor>` 映射（2026-09-25 验证：同一家的多篇推理优化博文若走多信号评分，会分散命中多个 `LLM-*` 子 coll，但它们本质是同一厂商的一手技术文档，应统一归档）。硬映射命中后强制走 `create_misc_subcollection`，跳过评分。**v2.5.0 起该映射已移入本地 overlay。**
+- **品牌官网域名映射**：新增 1 条消费品牌官网/说明书 CDN → `Misc--<brand>` 映射（2026-09-24 验证：说明书 PDF 走 fallback 命名会取子域第一段，与实际品牌不符）。netloc 后缀匹配自动覆盖其所有子域。**v2.5.0 起该映射已移入本地 overlay。**
+
+### v2.4.2 — 个人博客硬映射（心智模型/学习类）
+
+- **个人博客域名映射**：新增 1 条个人博客 → `Misc--<blog>` 映射（2026-09-21 验证：`/learning/` 文章的 `learning` / `knowledge` / `brain` 关键词触发多信号评分，高分匹配到某个 machine-learning 教科书 coll，而文章真实主题是「通用学习法/心智模型/决策」，严重不符）。加硬映射 → 命中/创建 `Misc--<blog>`。**v2.5.0 起该映射已移入本地 overlay。**
 
 ### v2.4.1 — 个人博客硬映射 + collection flow 修正 + monolith `-F`
 
