@@ -8,6 +8,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# 集成测试全部打同一个 Zotero 测试组库，彼此共享 Test-Misc / Test-Forbidden。
+# 两个 run 同时跑时，一个 run 的 teardown 会删掉另一个正在用的 collection，
+# 导致对方批量 409 "Collection XXX not found"。这里按仓库级串行化，不按 ref
+# —— main push 与 tag push 也会互相踩。
+concurrency:
+  group: zot-tool-test
+  cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -32,7 +40,7 @@ jobs:
         run: pip install pyzotero pytest pillow requests
 
       - name: Unit tests (no API needed)
-        run: python -m pytest tests/test_unit.py tests/test_image_compress.py -v
+        run: python -m pytest tests/test_unit.py tests/test_image_compress.py tests/test_zot_guard.py tests/test_review_fixes.py -v
 
       - name: Integration tests
         env:

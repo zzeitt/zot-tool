@@ -124,16 +124,48 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 
 ### 归档流程
 1. 提取 URL
-2. 抓取标题、描述、平台类型
-3. **Cloudflare 反爬检测**（v1.7.1+）：若 curl 拿到 `Attention Required` 等 CF 拦截页，输出 `⚠️ CLOUDFLARE_BLOCKED` 标记，让 AI 看到后用 browser fallback 补抓正文
-4. 推断合适的 itemType。tags 交给 `infer_tags_structured()`：**先从词表匹配库内已有 tag，命中不了才新建**，输出 `1 root + ≤7 children`（**v2.5.0**；旧版是 `#领域🤖` 最多 3 个）
-5. 在已有 Collections 中查找最佳匹配（**v1.8.0+: 域名硬映射 → 多信号评分（v1.7.0+）**，无匹配则创建 Misc--xxx 子集合）
-6. 自动添加 /unread 标签
-7. 用户提供的 `#tag` 提示**优先占 children 席位且原样保留**；未满 7 个时由匹配结果补足。词表不可用时**只打 `/unread`，不发明 tag**，并写 `zot_pending/tags_*.json` 交给 agent 兜底
-8. **自动识别文件类型**：
+2. **前置查重闸门（v2.4.4+，必做）**：先跑 `python3 scripts/zot_guard.py "<url>"`。
+   退出码 **2 = 库内已有同一篇文章 → 静默跳过 + 一句确认，不再归档**；
+   退出码 0 = 可以继续（会附带"⚠️ 疑似同题"提示，人工判断，不阻止）。
+   `zot.py` 自带的 `zot.items(q=url)` 查重是**全文搜索**，匹配不到 URL 字段，
+   等于没有查重（2026-10-31 因此一次跑出 3 份重复条目，各带 16.7MB 离线附件）。
+   闸门判定规则：URL 规范化（去 utm_*/mc_cid/mc_eid、去 fragment、去 www.、去尾斜杠、
+   query 排序）后 **host+path 完全一致**才算重复；不同 path 即使同域名也算新文章。
+3. 抓取标题、描述、平台类型
+4. **Cloudflare 反爬检测**（v1.7.1+）：若 curl 拿到 `Attention Required` 等 CF 拦截页，输出 `⚠️ CLOUDFLARE_BLOCKED` 标记，让 AI 看到后用 browser fallback 补抓正文
+5. 推断合适的 itemType。tags 交给 `infer_tags_structured()`：**先从词表匹配库内已有 tag，命中不了才新建**，输出 `1 root + ≤7 children`（**v2.5.0**；旧版是 `#领域🤖` 最多 3 个）
+6. 在已有 Collections 中查找最佳匹配（**v1.8.0+: 域名硬映射 → 多信号评分（v1.7.0+）**，无匹配则创建 Misc--xxx 子集合）
+7. 自动添加 /unread 标签
+8. 用户提供的 `#tag` 提示**优先占 children 席位且原样保留**；未满 7 个时由匹配结果补足。词表不可用时**只打 `/unread`，不发明 tag**，并写 `zot_pending/tags_*.json` 交给 agent 兜底
+9. **自动识别文件类型**：
    - 二进制文件（PDF/EPUB 等）→ 直接下载原始文件，上传到 WebDAV
    - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
-9. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
+10. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
+11. **归档后回读核对**（多信号评分不可信）：确认 collection 归属正确、tags 符合本库惯例。
+    `zot item archive` **没有 `--coll` 覆盖参数**，改法：
+    `z.deletefrom_collection(old_key, item)` + `z.addto_collection(new_key, item)`，
+    每次改之前重新 `z.item(key)` 拉最新 data（否则 412）。
+
+### 前置查重闸门 zot_guard.py（v2.4.4+）
+
+```bash
+python3 scripts/zot_guard.py "<url>"                  # 检查单个
+python3 scripts/zot_guard.py "<url1>" "<url2>"        # 批量
+python3 scripts/zot_guard.py --title "文章标题" "<url>"  # 额外做同题疑似检测
+python3 scripts/zot_guard.py --scan                   # 只扫库打印统计
+python3 scripts/zot_guard.py --json "<url>"           # 机器可读
+```
+
+| 退出码 | 含义 | 该怎么做 |
+|---|---|---|
+| 0 | 无重复 | 正常归档（"疑似同题"仅为提示） |
+| 2 | 命中重复 | **静默跳过**，只回报一句"已归档过，跳过" |
+| 1 | 出错（缺 env / API 失败） | 修好再跑，**不要写重试循环** |
+
+- 扫描 `/items/top`（仅顶层条目），排除 🙊Personal 及其子孙 collection；结果缓存 5 分钟（`/tmp/zot-guard-cache.json`）。
+- 疑似同题检测用 claude-mem 的 IDF veto 思路：标题分词后共享**低频判别词**（文档频率 ≤ 2 且长度 ≥ 5）即提示，
+  共享 ≥ 2 个词或整体 Jaccard ≥ 0.35 才算命中——避免 "rare/best" 这类词造成噪声。
+
 
 ### Note 生成：双后端分发（v2.1.0）
 
@@ -420,7 +452,6 @@ alias zot="python3 scripts/zot.py"
 ## 版本历史
 
 ### v2.5.0 — 本库原生 Tag 体系（复用优先 + 双语层级）
-
 - **根因修复：复用从未生效过。** 旧 `get_existing_tags()` 调 `zot.tags(limit=200)`，
   而 `/tags` 端点的**默认排序是 `numItems` 升序** —— 拿回的是全库**最冷门**的 200 个 tag。
   叠加「模糊匹配要求 ≥2 词命中」（单 token tag 永远匹配不上）与「`#领域🤖` 格式与库内
@@ -453,6 +484,28 @@ alias zot="python3 scripts/zot.py"
   `DOMAIN_TO_SUBCOLL` 只保留通用平台。
 - **其它**：`_strip_diacritics` / `_title_keywords` 从 `_extract_concepts` 的嵌套 helper
   提为模块级；新增 `_parse_tag_hints` / `_merge_tag_plan` 单点保证输出形态。
+
+- **合并前 review 修复（2026-10-31，7 条）**：root 阈值改用**未降权** strength 判定
+  （auto-only 的 0.5 只作平局决胜；否则存量 type-1 词表会把复用分打到 1.1 < 2.0，
+  库里有 `/machine-learning📚` 却新建 `/ai🤖`）；`tag add`/`tag set` 一律写 type 0；
+  `_invalidate_vocab_cache` 改置 `generated_ts=0`（原来改 mtime 是空操作，`tag merge`
+  最长 24h 不生效）；兜底 root 取信息量最高的词、挑不出来就不造 root；
+  `--refresh` 失败仍回退磁盘词表，空词表按"无词表"处理（不发明 tag）；
+  `plan["new"]` 在合并后重算（提示产生的新 child 不再漏报）；
+  厂商/公开出版物域名（nvidia / fs.blog / skg.com）留在内置表，只有个人博客进 overlay。
+  回归测试见 `tests/test_review_fixes.py`（18 例）。
+
+### v2.4.4 — 前置查重闸门 zot_guard.py
+- **新增 `scripts/zot_guard.py`**（不改 zot.py，只在归档前加一道闸门）：
+  规范化 URL（去 `utm_*` / `mc_cid` / `mc_eid`、去 fragment、去 `www.`、去尾斜杠、query 排序）后
+  **host+path 完全一致**即判重复，退出码 2 = 跳过归档。
+- **修根因**：zot.py 的 `archive_url()` 用 `zot.items(q=url, limit=10)` 查重，而 `q=` 是全文搜索，
+  匹配不到 URL 字段 → 查重等于没有。2026-10-31 归档 Quanta 克莱因瓶文章时，因 API 502 写了重试循环，
+  一次跑出 3 份重复条目（各带 16.7MB 离线附件），浪费约 50MB WebDAV。
+- **疑似同题检测**（claude-mem 的 IDF veto 思路）：标题分词后共享低频判别词（df ≤ 2 且长度 ≥ 5），
+  共享 ≥ 2 个或整体 Jaccard ≥ 0.35 才提示；仅提示，不阻止归档。
+- **隐私**：扫描 `/items/top` 并排除 🙊Personal 及其子孙 collection。
+- **同步**：SKILL.md 的「归档流程」补上前置查重步骤 + 归档后回读核对 collection。
 
 ### v2.4.3 — 厂商技术博客 + 品牌站硬映射
 
