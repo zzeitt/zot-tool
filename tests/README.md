@@ -32,6 +32,14 @@ Integration + unit tests for `scripts/zot.py`. Tests run against your own Zotero
 
 The test suite auto-creates prerequisite collections (`Test-Forbidden`, `Test-Misc`) and cleans up all test-created items. No manual setup needed beyond the API key.
 
+> ⚠️ **并发约定（2026-10-31 修复）**：集成测试全部打同一个 Zotero 测试组库，
+> `Test-Forbidden` / `Test-Misc` 是**共享夹具**。
+> - teardown **不再删除**这两个 collection（删了会让并发跑的另一个 run 瞬间拿到失效 key，批量 409）
+> - GitHub Actions 侧用 `concurrency: group: zot-tool-test` 把所有 test run **按仓库级串行化**
+>   （main push / tag push / PR 三种触发共用一个组，否则互相踩）
+> - 本地要跑集成测试时，也请确保没有另一个 run 在同时跑（或者自己指定独立的 collection 名：
+>   `ZOTERO_TEST_MISC_NAME` / `ZOTERO_TEST_FORBIDDEN_NAME`）
+
 ## Quick Start
 
 ```bash
