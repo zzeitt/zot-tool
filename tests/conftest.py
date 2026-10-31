@@ -64,6 +64,12 @@ def test_env(tmp_path_factory):
         "ZOTERO_LIBRARY_ID": TEST_LIBRARY_ID,
         "ZOTERO_LIBRARY_TYPE": TEST_LIBRARY_TYPE,
         "ZOTERO_VOCAB_DIR": str(tmp_path_factory.mktemp("zot_vocab")),
+        # 磁盘缓存必须隔离：测试库在跑的过程中不断新建 collection / item，
+        # 一份跨测试复用的快照会让后续断言看到过期的库状态。
+        "ZOTERO_CACHE_DIR": str(tmp_path_factory.mktemp("zot_cache")),
+        "ZOTERO_COLLECTIONS_TTL": "0",
+        "ZOTERO_GUARD_CACHE": str(tmp_path_factory.mktemp("zot_guard") / "cache.json"),
+        "ZOTERO_GUARD_TTL": "0",
     }
     for k, v in overrides.items():
         saved[k] = os.environ.get(k)

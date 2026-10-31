@@ -151,7 +151,15 @@ _COLLECTIONS_CACHE_TTL = 300  # seconds in-process
 # 磁盘级缓存：CLI 每次调用都是新进程，进程内缓存等于没有 —— 冷启动实测
 # 660 个 collection 要 10.5s（每页 100 条约 1.7s × 7 页）。把结果落盘并带
 # library version 做**增量**刷新，第二次起就是 ms 级。
-_COLLECTIONS_DISK_TTL = int(os.environ.get("ZOTERO_COLLECTIONS_TTL", "3600"))
+_COLLECTIONS_DISK_TTL = 3600          # 默认值；实际以 ZOTERO_COLLECTIONS_TTL 为准
+
+
+def _collections_disk_ttl():
+    """调用时读环境变量 —— 测试要能在 import 之后把它改成 0 关掉磁盘缓存。"""
+    try:
+        return int(os.environ.get("ZOTERO_COLLECTIONS_TTL", _COLLECTIONS_DISK_TTL))
+    except ValueError:
+        return _COLLECTIONS_DISK_TTL
 
 
 def _cache_dir():
@@ -296,7 +304,7 @@ def _all_collections(force_refresh=False):
     disk = _read_collections_cache() if not force_refresh else None
 
     # 磁盘命中且未过期 → 直接用
-    if disk and (now - disk.get("ts", 0)) < _COLLECTIONS_DISK_TTL:
+    if disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
         _collections_cache["data"] = disk["collections"]
         _collections_cache["ts"] = now
         return disk["collections"]
