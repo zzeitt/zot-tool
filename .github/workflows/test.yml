@@ -40,7 +40,7 @@ jobs:
         run: pip install pyzotero pytest pillow requests
 
       - name: Unit tests (no API needed)
-        run: python -m pytest tests/test_unit.py tests/test_image_compress.py tests/test_zot_guard.py tests/test_classify.py tests/test_review_fixes.py -v
+        run: python -m pytest tests/test_unit.py tests/test_image_compress.py tests/test_zot_guard.py tests/test_classify.py tests/test_review_fixes.py tests/test_perf_fixes.py -v
 
       - name: Integration tests
         env:
