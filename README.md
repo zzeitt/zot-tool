@@ -1,6 +1,23 @@
 # zot-tool
 
+[![version](https://img.shields.io/github/v/release/zzeitt/zot-tool?label=version&sort=semver)](https://github.com/zzeitt/zot-tool/releases/latest)
+[![test](https://github.com/zzeitt/zot-tool/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/zzeitt/zot-tool/actions/workflows/test.yml)
+[![released](https://img.shields.io/github/release-date/zzeitt/zot-tool?label=released)](https://github.com/zzeitt/zot-tool/releases)
+[![last commit](https://img.shields.io/github/last-commit/zzeitt/zot-tool/main?label=last%20commit)](https://github.com/zzeitt/zot-tool/commits/main)
+![python](https://img.shields.io/badge/python-3.12-blue)
+
 Zotero 文献库命令行管理工具，基于 pyzotero + Zotero Web API v3。
+
+### 版本与 CI
+
+| 想看什么 | 看哪里 |
+|---|---|
+| **当前版本号** | [Releases](https://github.com/zzeitt/zot-tool/releases/latest)（= `SKILL.md` frontmatter 的 `version:`，单一真相源） |
+| **CI 是否绿** | 上面 `test` 徽章 → [Actions](https://github.com/zzeitt/zot-tool/actions/workflows/test.yml)（单测 + 集成，main 分支） |
+| **版本怎么涨的** | `.github/workflows/version-bump.yml`：PR 上按约定式提交前缀 bump —— `feat:` → minor，其余 → patch，**`!` / BREAKING CHANGE 不自动**（留给人工） |
+| **Release 怎么来的** | `.github/workflows/auto-release.yml`：PR 合并后读 `SKILL.md` 的 `version:` 打 tag + 建 Release |
+
+> 徽章里的 version 是**最近一次 Release**。刚合并还没来得及发版时它会落后于 `SKILL.md`，以 `SKILL.md` 为准。
 
 ```bash
 zot <noun> <verb> [args]

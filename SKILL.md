@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.5.0
+version: 2.5.1
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -450,6 +450,29 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.5.1 — 缓存与增量同步 + 5 个正确性修复
+
+- **collection 磁盘缓存 + 增量刷新**：`_all_collections()` 冷启动 10.5s（660 个
+  collection × 7 页）→ 磁盘命中 68ms / `since=` 增量 2.2s。写操作后只把磁盘 ts 置 0、
+  保留 version，下次只拉变化的那一页。
+- **`zot_guard` 增量扫描**：全库冷扫 240s（4,254 条 / 43 页）→ 增量 3.6s / 缓存命中 42ms。
+  TTL 300s → 3600s；复用 zot.py 的 collections 缓存（省 21.5s/次）；跳过顶层 note 与子条目。
+- **URL 查重不再是死代码**：`zot.items(q=url)` 命中率恒为 0（Zotero 的 `q` 只搜标题/作者）
+  且会被当全文检索、单次 18.5s。改为「读 guard 的 URL 索引 → 标题词兜底 + 本地规范化比对」，
+  实测 1.7s 命中。
+- **WebDAV 失败回滚孤儿附件**：上传顺序是「先建 attachment item → 再 PUT ZIP/.prop」，
+  PUT 失败时库里会留下永远没有文件的条目。现在失败即删除刚建的 item（in-place 更新不删）。
+- **归档摘要 note 不再吞失败**：原来直连 `create_items`、不检查 Zotero 的 200+failed
+  （超长 note 就是这么被静默拒绝的），也不做体积压缩。改走 `_create_note()` +
+  `_fit_note_under_limit()`。
+- **退出码**：附件文件不存在、note 内容为空 → `sys.exit(1)`（原来报错但退 0）。
+- **ZIP 改 DEFLATED**：16MB → 10MB、9MB → 5.4MB，更容易落在 WebDAV 的 60s 超时内。
+- 新增 `tests/test_perf_fixes.py`（12 例）。
+- **发版自动化**：新增 `version-bump` 工作流，PR 上按约定式提交自动 bump `version:`
+  （feat → minor，其余 → patch，**breaking/大版本不自动**，留给人工），
+  合并后由 `auto-release` 打 tag + 建 Release。
+
 
 ### v2.5.0 — 本库原生 Tag 体系（复用优先 + 双语层级）
 - **根因修复：复用从未生效过。** 旧 `get_existing_tags()` 调 `zot.tags(limit=200)`，
