@@ -124,6 +124,12 @@ DOMAIN_TO_SUBCOLL = {
     "devblogs.microsoft.com": "microsoft",
     "learn.microsoft.com": "microsoft",
     "blogs.microsoft.com": "microsoft",
+    # 厂商 / 出版物（**公开平台知识**，不是个人阅读兴趣 —— 所以留在源码里，
+    # 不进本地 overlay。外置它们会让没有 overlay 的机器/CI 静默丢失映射，
+    # NVIDIA 的技术博文就会退化成多信号评分、散落到多个 LLM-* 子集合）
+    "developer.nvidia.com": "nvidia",
+    "fs.blog": "fs-blog",                # Farnam Street（Shane Parrish 公开出版物）
+    "skg.com": "skg",                    # SKG 品牌官方文件 CDN（含 *.skg.com 子域）
 }
 # NOTE: personal blogs the maintainer follows are deliberately NOT listed here.
 # They are library-specific reading-interest data, so they live in an untracked
@@ -873,6 +879,20 @@ def _pairs_path():
     return os.path.join(_get_vocab_dir(), "pairs.json")
 
 
+def _vocab_usable(vocab):
+    """词表是否**可用来复用**：有 root 或有 child 才算。
+
+    「拉到了但里面是空的」（空库、或所有 tag 计数都低于 min_count）与「拉不到」
+    在决策上完全等价 —— 都拿不到任何可复用的 tag。空词表还照常发明新 root，
+    正是 tag 发散的成因之一（2026-10-31 修复）。
+    """
+    if not vocab or vocab.get("source") == "vocab_unavailable":
+        return False
+    if vocab.get("roots"):
+        return True
+    return any((vocab.get("children") or {}).values())
+
+
 def _empty_vocab(reason="empty"):
     return {"roots": [], "children": {}, "orphans": [], "pairs": {},
             "local_new": [], "generated_ts": 0.0, "count": 0,
@@ -1156,8 +1176,9 @@ def load_vocab(force_refresh=False):
             and (now - _vocab_cache["ts"]) < _VOCAB_CACHE_TTL):
         return _vocab_cache["data"]
 
-    disk = None if force_refresh else _read_vocab_file()
-    if disk and (now - float(disk.get("generated_ts") or 0)) < _VOCAB_CACHE_TTL:
+    disk = _read_vocab_file()          # 永远读：它是 API 失败时的兜底
+    if (not force_refresh and disk
+            and (now - float(disk.get("generated_ts") or 0)) < _VOCAB_CACHE_TTL):
         disk["source"] = "disk"
         _vocab_cache["data"], _vocab_cache["ts"] = disk, now
         return disk
@@ -1187,12 +1208,19 @@ def _invalidate_vocab_cache():
     """让词表在**下一个进程**重新拉取。
 
     不删文件：磁盘缓存是 API 不可用时的离线兜底，删了会丢。
-    把 mtime 设成 epoch 0，下个进程读到就认为过期。
+    做法是把 JSON 里的 ``generated_ts`` 置 0 —— ``load_vocab`` 的新鲜度判定
+    读的就是这个字段（不是 mtime），所以回拨 mtime 是空操作（2026-10-31 修复）。
+    置 0 后下一次加载判定过期 → 重新拉取；拉取失败时仍回退到这份陈旧词表。
     """
     _vocab_cache["data"] = None
     _vocab_cache["ts"] = 0.0
+    disk = _read_vocab_file()
+    if disk is not None:
+        disk["generated_ts"] = 0
+        if _write_vocab_file(disk):
+            return
     try:
-        os.utime(_vocab_path(), (0, 0))
+        os.utime(_vocab_path(), (0, 0))     # 兜底：写不动时至少留下痕迹
     except OSError:
         pass
 
@@ -1371,6 +1399,12 @@ _STOP_WORDS = frozenset({
     "but", "if", "than", "then", "there", "here", "so", "just", "very",
     "more", "most", "other", "only", "also", "one", "get", "got", "make",
     "made", "use", "using", "used", "way", "part", "upon",
+    # 高频低信号的「文章体裁/泛化」词 —— 拿它们当 root 等于没分类
+    # （2026-10-31：/notes🔗 /everyone🔗 /understanding🔗 就是这么来的）
+    "note", "notes", "understanding", "understand", "everyone", "anyone",
+    "someone", "study", "studies", "introduction", "intro", "overview",
+    "guide", "tutorial", "analysis", "review", "thoughts", "ideas", "idea",
+    "things", "stuff", "basics", "general", "primer", "explained",
 })
 
 _MAX_NEEDS = 3        # 每次归档最多提几个「待翻译」概念，避免刷屏
@@ -1539,12 +1573,20 @@ def _new_root_for(text_lower, title, vocab=None):
             tag, s, note = _root_or_new(vocab, slug, emoji, "new-topic")
             if s:
                 return tag, s, note
+    # 兜底：取标题里**信息量最高**的词（最长，且不在停用词表），而不是第一个。
+    # 旧行为取第一个非停用词 → 造出 /notes🔗 /everyone🔗 /understanding🔗 这类
+    # 无主题意义的 root（2026-10-31 修复）。一个词都挑不出来时宁可不造 root，
+    # 也不要造垃圾 —— 只打 /unread 比多一个 /everyone🔗 好。
     words = re.findall(r"[A-Za-z一-鿿]+", _strip_diacritics(title or ""))
+    best = None
     for w in words:
         core = w.casefold()
-        if len(core) < 2 or core in _STOP_WORDS:
+        if len(core) < 4 or core in _STOP_WORDS:
             continue
-        tag, s, note = _root_or_new(vocab, core, _emoji_for_tag(core),
+        if best is None or len(core) > len(best):
+            best = core
+    if best is not None:
+        tag, s, note = _root_or_new(vocab, best, _emoji_for_tag(best),
                                     "new-fallback")
         if s:
             return tag, s, note
@@ -1572,7 +1614,8 @@ def infer_tags_structured(title, description="", tag_hints=None, vocab=None):
     vocab = vocab if vocab is not None else load_vocab()
 
     # 无词表 → **绝不发明 tag**。无词表还发明正是发散的成因。
-    if vocab.get("source") == "vocab_unavailable":
+    # 「空词表」与「拉不到词表」在决策上等价 —— 都拿不到任何可复用的 tag。
+    if not _vocab_usable(vocab):
         return {"root": None, "children": [], "new": [], "needs": [],
                 "attached": [], "mode": "vocab_unavailable", "scores": {}}
 
@@ -1588,17 +1631,20 @@ def infer_tags_structured(title, description="", tag_hints=None, vocab=None):
 
     # ── 打分：children 的得分累加到各自 root ────────────────────────────
     # 某个具体 child 命中，比 root 自己那个泛化 slug 命中强得多。
-    root_scores, child_hits = {}, []
+    #
+    # 同时记两类数：`strength`（未降权，用于**阈值判定**）与 `score`
+    # （含 auto-only 降权，仅用于同分排序）。只留 score 会让 auto-only 的
+    # 0.5 惩罚把整份存量词表打到阈值以下 —— 见下面对 _ROOT_SCORE_THRESHOLD 的注释。
+    root_scores, root_strengths, child_hits = {}, {}, []
     for cand in _iter_vocab_candidates(vocab):
         strength = _slug_strength(cand["slug"], text_lower, words)
         if not strength:
             continue
         score = strength * _prior_multiplier(cand["n"], cand["auto_only"])
-        if cand["kind"] == "root":
-            root_scores[cand["slug"]] = root_scores.get(cand["slug"], 0.0) + score
-        else:
-            key = cand["root"]
-            root_scores[key] = root_scores.get(key, 0.0) + score
+        key = cand["slug"] if cand["kind"] == "root" else cand["root"]
+        root_scores[key] = root_scores.get(key, 0.0) + score
+        root_strengths[key] = root_strengths.get(key, 0.0) + strength
+        if cand["kind"] != "root":
             child_hits.append((score, cand))
 
     # ── root 选择 ───────────────────────────────────────────────────────
@@ -1611,9 +1657,16 @@ def infer_tags_structured(title, description="", tag_hints=None, vocab=None):
         else:
             root_tag, root_slug, root_note = hints["root"], slug, "user-new"
     elif root_scores:
-        best_slug, best_score = max(root_scores.items(),
-                                    key=lambda kv: (kv[1], kv[0]))
-        if best_score >= _ROOT_SCORE_THRESHOLD:
+        # 阈值用**未降权**的 strength 判定，auto-only 的 0.5 惩罚只用来打破平局。
+        #
+        # 旧行为用 score 过闸：旧版 CLI 一律写 type 1，于是用户整份策展词表在
+        # 词表里都是 auto_only；root slug 常用连字符而标题写空格 → 只能拿到
+        # 2.0 的 segment 强度 → 2.0 × 1.15 × 0.5 = 1.15 < 2.0，库里有
+        # `/machine-learning📚` 却判定"没有"，转手新建了一个 `/ai🤖`。
+        # 「手动优先」应当是平局决胜，不是生死判决（2026-10-31 修复）。
+        best_slug = max(root_scores,
+                        key=lambda s: (root_strengths[s], root_scores[s], s))
+        if root_strengths[best_slug] >= _ROOT_SCORE_THRESHOLD:
             r = _find_root(vocab, best_slug)
             if r:
                 root_tag, root_slug, root_note = r["tag"], r["slug"], "existing"
@@ -1733,6 +1786,19 @@ def _merge_tag_plan(plan, tag_hints=None, max_children=_MAX_CHILDREN):
 
     plan["root"] = root
     plan["children"] = merged[:max_children]
+
+    # I-5（2026-10-31 修复）：``new`` 原来在合并**之前**算，用户 ``#tag`` 提示与
+    # 裸词提示产生的新 child 永远不会出现在 ``new`` 里 —— ``tag suggest --json``
+    # 因此少报，agent 据此以为"没什么要新建的"。这里在合并之后用同一把尺子重算：
+    # 不在 ``attached``（库内既有）里的都算新建；root 仅在 new-* 模式算新建。
+    attached_keys = {_tag_key(t) for t in (plan.get("attached") or [])}
+    new_list = []
+    if root and plan.get("mode") not in ("existing", "user", "none"):
+        new_list.append(root)
+    for tag in plan["children"]:
+        if _tag_key(tag) not in attached_keys and tag not in new_list:
+            new_list.append(tag)
+    plan["new"] = new_list
     return plan
 
 
@@ -2681,7 +2747,9 @@ def _tags_update(item_key, tags, mode, tag_type=None):
     Library…」。用户手打的 tag 是 manual，于是 CLI 打的每个 tag 都落在另一套
     体系里、可被一键清空。改打 manual 后 CLI 写入与手动策展一致。
 
-    库内已存在的 tag 沿用其观测 type，不再制造新的 0/1 双份。
+    一律写 manual（0）：CLI 写入与手动策展使用同一套 tag 体系，不会落在
+    「Delete Automatic Tags in This Library…」可一键清空的桶里。
+    存量 tag 的 type 迁移由 `zot tag retype` 负责，不在写入路径上暗中改。
     """
     try:
         items = zot.item(item_key)
@@ -2693,15 +2761,16 @@ def _tags_update(item_key, tags, mode, tag_type=None):
     data = item.get('data', {})
     existing = data.get('tags', [])
 
-    try:
-        vocab_types = _vocab_tag_types()
-    except Exception:                                   # noqa: BLE001
-        vocab_types = {}
-
     def _type_for(name):
+        # 一律写 manual（0）—— 与 archive_url / add_item 保持同一条策略。
+        # 旧行为是"沿用词表里观测到的 type"，对**存量 auto-only tag**（旧的 CLI
+        # 一律写 type 1，`/unread` 也是）会继续写 type 1，于是 `tag add` 补打的
+        # tag 仍落在可被「Delete Automatic Tags in This Library…」一键清空的桶里
+        # ——与 SKILL.md 和本函数 docstring 的承诺相反（2026-10-31 修复）。
+        # 存量 tag 的 type 迁移用 `zot tag retype`，不在写入路径上做。
         if tag_type is not None:
             return tag_type
-        return vocab_types.get(name, _DEFAULT_TAG_TYPE)
+        return _DEFAULT_TAG_TYPE
 
     if mode == 'set':
         new_tags = [{'tag': t, 'type': _type_for(t)} for t in tags]
