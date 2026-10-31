@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import Counter
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -38,7 +39,9 @@ except ImportError:
     sys.exit("❌ 需要 pyzotero：apk add py3-pyzotero 或 pip install pyzotero")
 
 CACHE_PATH = os.environ.get("ZOTERO_GUARD_CACHE", "/tmp/zot-guard-cache.json")
-CACHE_TTL = int(os.environ.get("ZOTERO_GUARD_TTL", "300"))
+# 全量扫描实测 4 分钟（4,254 条 / 54 页），300s 的 TTL 意味着几乎每次
+# 归档都要重扫一遍。默认放宽到 1 小时，可用 ZOTERO_GUARD_TTL 覆盖。
+CACHE_TTL = int(os.environ.get("ZOTERO_GUARD_TTL", "3600"))
 TRACKING_EXACT = {"mc_cid", "mc_eid"}
 
 
@@ -95,10 +98,16 @@ def tokenize_title(title):
 
 # ── 库扫描 ────────────────────────────────────────────────────────────────
 def _load_cache():
+    """读缓存快照（**不管新鲜度**）。
+
+    新鲜度由调用方判断 —— scan_library 需要拿过期快照里的 ``version``
+    走增量，如果这里按 TTL 返回 None，增量路径永远进不去（实测退化成
+    每次全量 250s）。
+    """
     try:
         with open(CACHE_PATH, encoding="utf-8") as f:
             blob = json.load(f)
-        if time.time() - blob.get("ts", 0) < CACHE_TTL:
+        if isinstance(blob, dict) and isinstance(blob.get("items"), list):
             return blob
     except (OSError, ValueError):
         pass
@@ -113,13 +122,52 @@ def _save_cache(blob):
         pass
 
 
+_COLLECTIONS_CACHE_FILE = os.path.join(
+    os.environ.get("ZOTERO_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "zot-cache"),
+    "collections.json")
+COLLECTIONS_TTL = int(os.environ.get("ZOTERO_COLLECTIONS_TTL", "3600"))
+
+
+def _collections_cached(zot):
+    """复用 zot.py 写的 collection 磁盘缓存（同一份文件、同一套 TTL）。
+
+    冷启动列 660 个 collection 要 21.5s（7 页 × 3s），而每篇文章只关心其中几个 key。
+    缓存里**必须**能看到 forbidden 根 —— 看不到就当缓存不可信，重新拉，
+    免得用一份"创建隐私 collection 之前"的快照把私密条目扫出来。
+    """
+    root = os.environ.get("ZOTERO_FORBIDDEN_COLLECTION")
+    version = 0
+    try:
+        with open(_COLLECTIONS_CACHE_FILE, encoding="utf-8") as f:
+            blob = json.load(f)
+        version = blob.get("version") or 0
+        fresh = (time.time() - float(blob.get("ts") or 0)) < COLLECTIONS_TTL
+        colls = blob.get("collections") or []
+        if fresh and colls and (not root or any(c.get("key") == root for c in colls)):
+            return colls
+    except (OSError, ValueError):
+        pass
+
+    colls = list(zot.everything(zot.collections()))
+    try:
+        os.makedirs(os.path.dirname(_COLLECTIONS_CACHE_FILE), exist_ok=True)
+        tmp = _COLLECTIONS_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": version, "ts": time.time(), "collections": colls},
+                      f, ensure_ascii=False)
+        os.replace(tmp, _COLLECTIONS_CACHE_FILE)
+    except OSError:
+        pass
+    return colls
+
+
 def forbidden_collection_keys(zot):
     """🙊Personal 及其所有子孙 collection 的 key 集合。"""
     root = os.environ.get("ZOTERO_FORBIDDEN_COLLECTION")
     if not root:
         return set()
     try:
-        colls = list(zot.everything(zot.collections()))
+        colls = _collections_cached(zot)
     except Exception:
         return {root}
     parents = {c["key"]: c["data"].get("parentCollection", False) for c in colls}
@@ -134,35 +182,100 @@ def forbidden_collection_keys(zot):
     return banned
 
 
+def _iter_items_since(client, version):
+    """按 `since` 显式翻页拉变化的条目。
+
+    不用 ``client.everything()``：它依赖 client 上一次请求残留的 ``self.links``，
+    当增量返回 **0 条**时（最常见的情况）会跟着一条过期的 next 链接打转，
+    实测直接挂住不返回。显式 start/limit 翻页没有这个隐患。
+    """
+    start = 0
+    while True:
+        page = client.items(since=version, itemType="-note", limit=100, start=start)
+        for it in page:
+            yield it
+        if len(page) < 100:
+            return
+        start += 100
+
+
+def _slim(it, banned):
+    """一条 item → 索引条目；用不上就返回 None。"""
+    d = it.get("data", {})
+    if d.get("parentItem"):            # 子条目（附件/note）没有独立 URL
+        return None
+    url = d.get("url")
+    if not url:
+        return None
+    if banned and (set(d.get("collections", [])) & banned):
+        return None
+    return {
+        "key": d.get("key"),
+        "title": d.get("title", ""),
+        "url": url,
+        "date": d.get("date", "") or d.get("dateAdded", "")[:10],
+        "itemType": d.get("itemType", ""),
+        "collections": d.get("collections", []),
+    }
+
+
 def scan_library(zot):
-    """返回 [{key,title,url,date,collections}] —— 只含带 URL 的顶层条目。"""
-    cached = _load_cache()
-    if cached:
-        return cached["items"]
+    """返回 [{key,title,url,date,collections}] —— 只含带 URL 的顶层条目。
+
+    缓存 → **增量** → 全量三级。全量实测 4,254 条 / 43 页 / 约 250s，
+    所以只延长 TTL 不够（每次归档都可能是冷扫）；增量用 `since=<library version>`
+    只拉变化的条目，实测 1-2 页。
+    """
+    blob = _load_cache()
+    if blob and (time.time() - float(blob.get("ts") or 0)) < CACHE_TTL:
+        return blob["items"]
 
     banned = forbidden_collection_keys(zot)
+
+    if blob and blob.get("version"):
+        try:
+            changed = list(_iter_items_since(zot, blob["version"]))
+            merged = _merge_items(blob.get("items") or [], changed, banned)
+            version = zot.last_modified_version()
+            _save_cache({"ts": time.time(), "version": version, "items": merged})
+            return merged
+        except Exception:                      # noqa: BLE001 — 增量失败退回全量
+            pass
+
     items = []
     try:
-        for it in zot.everything(zot.top()):
-            d = it.get("data", {})
-            url = d.get("url")
-            if not url:
-                continue
-            if banned and (set(d.get("collections", [])) & banned):
-                continue
-            items.append({
-                "key": d.get("key"),
-                "title": d.get("title", ""),
-                "url": url,
-                "date": d.get("date", "") or d.get("dateAdded", "")[:10],
-                "itemType": d.get("itemType", ""),
-                "collections": d.get("collections", []),
-            })
+        for it in zot.everything(zot.top(itemType="-note")):
+            slim = _slim(it, banned)
+            if slim:
+                items.append(slim)
     except Exception as e:
         raise SystemExit(f"❌ 扫描 Zotero 库失败：{e}")
 
-    _save_cache({"ts": time.time(), "items": items})
+    try:
+        version = zot.last_modified_version()
+    except Exception:                          # noqa: BLE001
+        version = 0
+    _save_cache({"ts": time.time(), "version": version, "items": items})
     return items
+
+
+def _merge_items(cached, changed, banned):
+    """增量结果合进索引：deleted 的删掉，其余按 key 覆盖；新条目过同一套过滤。"""
+    by_key = {it["key"]: it for it in cached or [] if it.get("key")}
+    for it in changed or []:
+        d = it.get("data", {})
+        key = d.get("key")
+        if not key:
+            continue
+        if d.get("deleted"):
+            by_key.pop(key, None)
+            continue
+        slim = _slim(it, banned)
+        if slim:
+            by_key[key] = slim
+        else:
+            by_key.pop(key, None)     # 变成无 URL / 移进黑名单 → 从索引剔除
+    return list(by_key.values())
 
 
 def build_index(items):

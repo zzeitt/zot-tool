@@ -9,7 +9,7 @@ import subprocess
 import html
 import tempfile
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode
 from pyzotero import zotero
 from pyzotero._utils import build_url
 try:
@@ -279,19 +279,70 @@ def _domain_subcoll_name(url):
 
 
 def _all_collections(force_refresh=False):
-    """分页拉取所有 collections（库大时 zot.collections() 默认 limit=100 会漏掉大部分）
+    """所有 collections —— 进程内缓存 → 磁盘缓存 → 增量 → 全量，四级降级。
 
-    5 分钟 TTL 缓存。v1.7.4 SKILL.md 已承诺该函数但代码未实现——v1.8.0 落地。
+    为什么需要磁盘缓存：CLI 每次调用都是**新进程**，进程内缓存等于没有。
+    实测 660 个 collection 全量分页 10.5s（100 条/页 × 7 页，单页约 1.7s）。
+    把结果落盘并带上 library version，第二次起走 `since=` 只拉变化的条目，
+    archive 的固定开销从 ~10s 降到 ms 级。
+
+    任何一级失败都回退到下一级；缓存坏了等同于没有缓存，**归档绝不因此失败**。
     """
     import time as _time
     now = _time.time()
     if not force_refresh and _collections_cache["data"] is not None and (now - _collections_cache["ts"]) < _COLLECTIONS_CACHE_TTL:
         return _collections_cache["data"]
-    # pyzotero everything() 走分页 API
+
+    disk = _read_collections_cache() if not force_refresh else None
+
+    # 磁盘命中且未过期 → 直接用
+    if disk and (now - disk.get("ts", 0)) < _COLLECTIONS_DISK_TTL:
+        _collections_cache["data"] = disk["collections"]
+        _collections_cache["ts"] = now
+        return disk["collections"]
+
+    # 增量：磁盘里有 version 时只拉变化的部分
+    if disk and disk.get("version"):
+        try:
+            changed = list(zot.everything(zot.collections(since=disk["version"])))
+            merged = _merge_by_key(disk["collections"], changed)
+            version = zot.last_modified_version()
+            _write_collections_cache(version, merged)
+            _collections_cache["data"] = merged
+            _collections_cache["ts"] = now
+            return merged
+        except Exception:                      # noqa: BLE001 — 增量失败就全量
+            pass
+
+    # 全量
     all_cols = list(zot.everything(zot.collections()))
+    try:
+        version = zot.last_modified_version()
+    except Exception:                          # noqa: BLE001
+        version = 0
+    _write_collections_cache(version, all_cols)
     _collections_cache["data"] = all_cols
     _collections_cache["ts"] = now
     return all_cols
+
+
+def _merge_by_key(cached, changed):
+    """把增量结果合进缓存快照。
+
+    Zotero 的 `since=` 会返回已删除对象（带 ``data.deleted: true``），
+    这类要从结果里移除，不能当普通条目合并。
+    """
+    by_key = {c.get("key"): c for c in cached or [] if c.get("key")}
+    for c in changed or []:
+        key = c.get("key")
+        if not key:
+            continue
+        if c.get("data", {}).get("deleted"):
+            by_key.pop(key, None)
+        else:
+            by_key[key] = c
+    return list(by_key.values())
+
 
 
 def _find_existing_domain_collection(url):
@@ -352,9 +403,17 @@ def _delete_collection_raw(coll_key):
 
 
 def _invalidate_collections_cache():
-    """强制刷新 _all_collections() 缓存（写操作后调用）"""
+    """强制刷新 _all_collections() 缓存（写操作后调用）
+
+    进程内清空 + 磁盘 ts 置 0。**保留 version**：下次走 `since=` 增量而不是全量，
+    新建/改名一个 collection 只需要拉那一页。
+    """
     _collections_cache["data"] = None
     _collections_cache["ts"] = 0.0
+    disk = _read_collections_cache()
+    if disk is not None:
+        disk["ts"] = 0
+        _write_collections_cache(disk.get("version") or 0, disk.get("collections") or [])
 
 
 # ---------------------------------------------------------------------------
@@ -1853,6 +1912,96 @@ def infer_tags(title, description="", tag_hints=None):
     return ([plan["root"]] if plan["root"] else []) + plan["children"]
 
 
+
+_TRACKING_QUERY_KEYS = {"mc_cid", "mc_eid"}
+
+
+def _normalize_url_key(url):
+    """URL 去重比对键：去跟踪参数 / fragment / www. / 尾斜杠，query 排序。
+
+    与 scripts/zot_guard.py 的 url_key 保持同一套规则（那份是独立脚本，
+    故意不 import 本模块，所以这里各留一份；改规则时两处一起改）。
+    """
+    if not url:
+        return ""
+    try:
+        p = urlparse(str(url).strip())
+    except ValueError:
+        return str(url).strip().lower()
+    host = (p.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (p.path or "").rstrip("/")
+    kept = sorted(
+        (k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+        if not k.lower().startswith("utm_") and k.lower() not in _TRACKING_QUERY_KEYS
+    )
+    q = urlencode(kept)
+    return host + path + (("?" + q) if q else "")
+
+
+def _guard_index_lookup(target_key):
+    """从 zot_guard 的索引缓存里按规范化 URL 找条目。
+
+    缓存路径 / TTL 与 zot_guard.py 保持一致（同一份文件，键为 ZOTERO_GUARD_CACHE
+    与 ZOTERO_GUARD_TTL）。读不到或过期就返回 None，由调用方决定是否回退到 API。
+    """
+    path = os.environ.get("ZOTERO_GUARD_CACHE") or "/tmp/zot-guard-cache.json"
+    ttl = int(os.environ.get("ZOTERO_GUARD_TTL", "3600"))
+    try:
+        with open(path, encoding="utf-8") as f:
+            blob = json.load(f)
+        if time.time() - float(blob.get("ts") or 0) > ttl:
+            return None
+        for it in blob.get("items") or []:
+            if _normalize_url_key(it.get("url")) == target_key:
+                return {"key": it.get("key"),
+                        "data": {"title": it.get("title", ""),
+                                 "url": it.get("url", "")}}
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _find_existing_by_url(url, title=""):
+    """按 URL 找已归档条目，命中返回 item dict，否则 None。
+
+    **为什么不能直接用 zot.items(q=url)**：Zotero 的 ``q`` 只搜标题与作者字段
+    （官方语义），拿整条 URL 当 query 命中率恒为 0 —— 旧查重等于没有
+    （2026-10-31 因 API 502 后的重试循环，一次跑出 3 份重复条目）。
+    而且 `q=<URL>` 会被当成全文检索，实测**单次 18.5s**，纯浪费。
+
+    这里改用标题里最长的几个词粗筛（`q=` 对标题有效，约 1s），
+    再在本地按规范化 URL 精确比对 ``url`` 字段。
+    """
+    target = _normalize_url_key(url)
+    if not target:
+        return None
+
+    # 首选：读 zot_guard 已经扫好并缓存的索引（几十 ms，且是**全库**比对）。
+    # 正常流程里 guard 就在归档前跑过，所以这条几乎总是命中。
+    hit = _guard_index_lookup(target)
+    if hit is not None:
+        return hit
+
+    # 兜底：guard 没跑过 / 缓存过期 → 用标题词粗筛一次 API 后本地比对。
+    # 注意只发一次查询：Zotero 对"查不到"的 q 会退化成全文检索，实测可达 20s。
+    words = [w for w in re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", (title or "").lower())
+             if len(w) > 3]
+    words.sort(key=len, reverse=True)
+    queries = [" ".join(words[:4])] if words else []
+
+    for q in queries:
+        try:
+            candidates = zot.items(q=q, limit=25)
+        except Exception:                     # noqa: BLE001 — 查重失败不该挡住归档
+            continue
+        for it in candidates:
+            if _normalize_url_key(it.get("data", {}).get("url", "")) == target:
+                return it
+    return None
+
+
 def _is_url(text):
     """Check if text looks like a URL"""
     return bool(re.match(r'^https?://', text.strip()))
@@ -2382,6 +2531,24 @@ def _prep_upload_file(src_path):
     return src_path, None
 
 
+def _rollback_new_attachment(attach_key):
+    """WebDAV 上传失败时删掉**刚创建**的 attachment item。
+
+    为什么需要：上传顺序是「先 create_items 建附件条目 → 再 PUT ZIP/.prop」，
+    一旦 PUT 失败，库里就留下一个永远没有文件的孤儿附件（客户端显示 0 字节）。
+    只对新建的 item 调用 —— in-place 更新的条目原本是好的，删了等于丢数据。
+    """
+    if not attach_key:
+        return
+    try:
+        items = zot.item(attach_key)
+        item = items[0] if isinstance(items, list) else items
+        zot.delete_item(item)
+        print(f"\U0001f9f9 Rolled back orphan attachment item: {attach_key}")
+    except Exception as e:                          # noqa: BLE001
+        print(f"\u26a0\ufe0f  Could not roll back attachment {attach_key}: {e}")
+
+
 def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_user, webdav_pass,
                         content_type="text/html", archive_filename=None, existing_key=None):
     """打包为 ZIP，PUT 到 WebDAV，创建或更新 Zotero attachment item
@@ -2406,7 +2573,10 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
     # 1. 打包为 ZIP（Zotero 附件存储格式）
     zip_path = tmp_file_path + ".zip"
     internal_name = archive_filename or os.path.basename(tmp_file_path)
-    with zipfile.ZipFile(zip_path, "w") as zf:
+    # DEFLATED：默认是 ZIP_STORED（不压缩）。离线 HTML 里 base64 图占七成以上，
+    # 实测 16MB → 10MB、9MB → 5.4MB，CPU 多花 1.7~7s，但更容易落在下面
+    # curl PUT 的 60s 硬超时之内（大附件超时是历史事故）。
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(upload_path, internal_name)
 
     # 2. 计算 md5 和 mtime（必须是解压后原始文件的属性）
@@ -2418,6 +2588,7 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
     # 3. 创建或更新 Zotero attachment item
     # filename 和 contentType 必须是解压后的原始文件属性
     # WebDAV 上存的是 <itemKey>.zip，但 Zotero 客户端解压后按 filename 识别
+    created_now = False
     if existing_key:
         # In-place 更新：保留 attachment key，只更新文件内容和元数据
         # 使用 raw PATCH 只发送需要变更的字段，避免 update_item() 的全量校验
@@ -2460,6 +2631,7 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
                 "mtime": mtime
             }])
             attach_key = attach["successful"]["0"]["key"]
+            created_now = True
             print(f"📎 Created attachment item: {attach_key}")
         except Exception as e:
             print(f"⚠️  Failed to create attachment item: {e}")
@@ -2475,6 +2647,7 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
         )
         if result.returncode != 0:
             print(f"⚠️  WebDAV ZIP upload failed: {result.stderr}")
+            _rollback_new_attachment(attach_key if created_now else None)
             return None
         # 验证
         check = subprocess.run(
@@ -2483,10 +2656,12 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
         )
         if "200" not in check.stdout and "201" not in check.stdout:
             print(f"⚠️  WebDAV ZIP verification failed: {check.stdout}")
+            _rollback_new_attachment(attach_key if created_now else None)
             return None
         print(f"☁️  Uploaded ZIP to WebDAV: {attach_key}.zip")
     except Exception as e:
         print(f"⚠️  WebDAV upload error: {e}")
+        _rollback_new_attachment(attach_key if created_now else None)
         return None
 
     # 5. PUT .prop 到 WebDAV (Zotero 使用 XML 格式，不是 JSON)
@@ -2504,10 +2679,12 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
         prop_code = prop_res.stdout.strip()
         if prop_res.returncode != 0 or not prop_code.startswith("2"):
             print(f"⚠️  WebDAV PROP upload failed (HTTP {prop_code}): {prop_res.stderr}")
+            _rollback_new_attachment(attach_key if created_now else None)
             return None
         print(f"☁️  Uploaded PROP to WebDAV: {attach_key}.prop")
     except Exception as e:
         print(f"⚠️  WebDAV PROP upload warning: {e}")
+        _rollback_new_attachment(attach_key if created_now else None)
         return None
 
     # 6. 清理临时 ZIP 文件 + 压缩临时文件（原始文件由调用方负责清理）
@@ -2577,7 +2754,7 @@ def save_file_attachment(file_path, parent_item_key, content_type, archive_filen
     """
     if not os.path.exists(file_path):
         print(f"❌ File not found: {file_path}")
-        return None
+        sys.exit(1)
 
     file_size = os.path.getsize(file_path)
     print(f"📄 Attachment: {file_path} ({file_size/1024/1024:.1f} MB)")
@@ -2719,7 +2896,7 @@ def reattach_attachment(attach_key, file_path, archive_filename=None):
     """
     if not os.path.exists(file_path):
         print(f"❌ File not found: {file_path}")
-        return
+        sys.exit(1)
 
     # 1. 拿旧 attachment 的 parent key 并验证
     try:
@@ -3654,8 +3831,13 @@ def _create_content_note(url, title, item_type, parent_key, offline_path=None):
                 note_text += '</blockquote>'
 
         try:
-            zot.create_items([{'itemType': 'note', 'parentItem': parent_key, 'note': note_text}])
-            print("📝 Created HN summary note")
+            # 走 _create_note：它检查 Zotero 的 200+failed 响应（超长 note 会被
+            # 静默拒绝，create_items 不 raise），并做体积压缩。
+            note_text = _fit_note_under_limit(note_text)
+            if _create_note(parent_key, note_text):
+                print("📝 Created HN summary note")
+            else:
+                print("⚠️  HN 摘要 note 未写入（归档本身已完成）", file=sys.stderr)
         except Exception:
             pass
         return
@@ -3705,8 +3887,13 @@ def _create_content_note(url, title, item_type, parent_key, offline_path=None):
             note_text = _build_minimal_fallback_note(title, url, item_type)
 
     try:
-        zot.create_items([{'itemType': 'note', 'parentItem': parent_key, 'note': note_text}])
-        print("📝 Created content summary note")
+        # 同上：Zotero 对超长 note 返回 HTTP 200 + failed 字典，直连 create_items
+        # 会把失败当成功（打印"Created"但 note 并不存在）。统一走 _create_note。
+        note_text = _fit_note_under_limit(note_text)
+        if _create_note(parent_key, note_text):
+            print("📝 Created content summary note")
+        else:
+            print("⚠️  摘要 note 未写入（归档本身已完成）", file=sys.stderr)
     except Exception as e:
         print(f"⚠️ Note creation failed: {e}")
 
@@ -3906,12 +4093,15 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
             coll_key = create_misc_subcollection(title + " " + description, url=url)
             coll_name = "new Misc--xxx"
 
-    # 检查URL是否已存在（避免重复创建）
-    existing_items = zot.items(q=url, limit=10)
-    allowed = [i for i in existing_items if is_allowed(i['key'])]
-    if allowed:
-        existing_key = allowed[0]['key']
-        existing_title = allowed[0].get('data', {}).get('title', 'Unknown')
+    # 检查 URL 是否已存在（避免重复创建）
+    #
+    # 旧写法 `zot.items(q=url)` 是死代码：Zotero 的 q 只搜标题/作者，不搜 url 字段，
+    # 命中率恒为 0，而且会被当成全文检索，单次 18.5s（实测）。现在改为
+    # 标题粗筛 + 本地规范化 URL 精确比对，约 1s 且真的能命中。
+    existing = _find_existing_by_url(url, title)
+    if existing is not None and is_allowed(existing["key"]):
+        existing_key = existing["key"]
+        existing_title = existing.get("data", {}).get("title", "Unknown")
         print(f"⚠️  URL already archived as item: {existing_key}")
         print(f"⚠️  Existing title: {existing_title[:60]}")
         print(f"⚠️  Skipping duplicate creation.")
@@ -4240,7 +4430,7 @@ def _note_add(item_key, note_content):
         note_content = sys.stdin.read()
     if not note_content.strip():
         print("Error: no note content")
-        return
+        sys.exit(1)
     note_content = note_content.strip()
     summary = _llm_summarize(item_key, note_content, "笔记", "")
     if summary:
@@ -4265,7 +4455,7 @@ def _note_set(item_key, note_content):
         note_content = sys.stdin.read()
     if not note_content.strip():
         print("Error: no note content")
-        return
+        sys.exit(1)
     note_content = note_content.strip()
     # 诊断：压缩前统计图片，便于排查「图片被删成 [图片] / 没压动」这类问题。
     n_img = len(re.findall(r'<img\b', note_content, re.IGNORECASE))
