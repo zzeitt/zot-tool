@@ -200,7 +200,7 @@ domain-mapping docs.
 ## Versioning
 
 - The version number is recorded in the `SKILL.md` frontmatter `version:` field
-  (single source of truth). Current version: **v2.5.0**.
+  (single source of truth). Current version: **v2.5.1**.
 - Format: `MAJOR.MINOR.PATCH`
 
 | Part | Meaning | Example |
@@ -211,13 +211,27 @@ domain-mapping docs.
 
 Rules:
 
-- Bump the version whenever a feature PR is merged.
+- **The version bump is automated** (`.github/workflows/version-bump.yml`, 2026-10-31):
+  on every PR it reads the conventional-commit prefixes since `main` and rewrites
+  `SKILL.md`'s `version:` on the PR branch — `feat:` → MINOR, everything else
+  (fix/perf/refactor/chore/docs/test/ci) → PATCH.
+  `!` / `BREAKING CHANGE` → **not automated**; the workflow comments on the PR and a
+  human must pick the MAJOR number. If the branch already carries a hand-edited
+  version (differs from `main`), the bot leaves it alone.
+- After the merge, `.github/workflows/auto-release.yml` tags that version and creates
+  the GitHub Release — so a merged PR without a new tag now means the bump never
+  happened (the exact failure on 2026-10-31: PR #33 merged, version stayed 2.5.0,
+  auto-release skipped, no Release).
+- You normally do **not** edit `version:` by hand. Hand-edit only for a MAJOR bump
+  or when you deliberately want to skip a number.
 - If a feature branch has multiple commits, tag the version only at the final merge.
 - PATCH fixes may be noted at the end of a commit message (e.g. `(v1.9.1)`) or omitted.
 - Full changelog lives in SKILL.md under `## 版本历史`.
 
 Recent history (highlights; see SKILL.md for details):
 
+- **v2.5.1** — persistent caches + incremental sync (collections 10.5s→68ms,
+  guard 240s→3.6s), live URL de-dup, WebDAV orphan rollback, note failure checks
 - **v2.5.0** — library-native tag system: derived vocabulary, `/root` +
   `#root-child` naming law, reuse-first matching, 1 root + ≤7 bilingual
   children, `tag vocab` / `suggest` / `merge`, `type: 0` writes, and the
