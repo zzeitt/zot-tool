@@ -8,6 +8,7 @@ import json
 import subprocess
 import html
 import tempfile
+import time
 from urllib.parse import urlparse
 from pyzotero import zotero
 from pyzotero._utils import build_url
@@ -145,7 +146,49 @@ _FONT_HEAVY_DOMAINS = (
 
 # 5 分钟 TTL 缓存 _all_collections() 的结果，避免每次 archive 都全量拉
 _collections_cache = {"data": None, "ts": 0.0}
-_COLLECTIONS_CACHE_TTL = 300  # seconds
+_COLLECTIONS_CACHE_TTL = 300  # seconds in-process
+
+# 磁盘级缓存：CLI 每次调用都是新进程，进程内缓存等于没有 —— 冷启动实测
+# 660 个 collection 要 10.5s（每页 100 条约 1.7s × 7 页）。把结果落盘并带
+# library version 做**增量**刷新，第二次起就是 ms 级。
+_COLLECTIONS_DISK_TTL = int(os.environ.get("ZOTERO_COLLECTIONS_TTL", "3600"))
+
+
+def _cache_dir():
+    d = os.environ.get("ZOTERO_CACHE_DIR") or os.path.join(
+        tempfile.gettempdir(), "zot-cache")
+    return d
+
+
+def _collections_cache_path():
+    return os.path.join(_cache_dir(), "collections.json")
+
+
+def _read_collections_cache():
+    """磁盘缓存 ``{"version": int, "ts": float, "collections": [...]}`` 或 None。"""
+    try:
+        with open(_collections_cache_path(), "r", encoding="utf-8") as f:
+            blob = json.load(f)
+        if isinstance(blob, dict) and isinstance(blob.get("collections"), list):
+            return blob
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _write_collections_cache(version, collections):
+    """原子写；失败静默 —— 缓存写不进去不该让归档失败。"""
+    try:
+        os.makedirs(_cache_dir(), exist_ok=True)
+        out = {"version": int(version or 0), "ts": time.time(),
+               "collections": collections}
+        tmp = _collections_cache_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False)
+        os.replace(tmp, _collections_cache_path())
+        return True
+    except (OSError, ValueError):
+        return False
 
 # 5 分钟 TTL 缓存域名 overlay（本地文件很小，但 archive 路径会查它两次）
 _domain_overlay_cache = {"data": None, "ts": 0.0}
