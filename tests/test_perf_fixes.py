@@ -83,7 +83,9 @@ class TestGuardCache:
         """_load_cache 不管新鲜度 —— 否则拿不到 version，增量永远进不去。"""
         p = tmp_path / "cache.json"
         p.write_text('{"ts": 0, "version": 42, "items": [{"key": "X"}]}', encoding="utf-8")
-        monkeypatch.setattr(zot_guard, "CACHE_PATH", str(p))
+        # _cache_path() 优先读环境变量（conftest 会设一个）、环境变量没有才用
+        # 模块常量 —— 这里直接指到环境变量，避免和 conftest 的临时目录打架。
+        monkeypatch.setenv("ZOTERO_GUARD_CACHE", str(p))
         blob = zot_guard._load_cache()
         assert blob is not None
         assert blob["version"] == 42
@@ -91,7 +93,7 @@ class TestGuardCache:
     def test_corrupt_blob_returns_none(self, zot_guard, tmp_path, monkeypatch):
         p = tmp_path / "cache.json"
         p.write_text("{not json", encoding="utf-8")
-        monkeypatch.setattr(zot_guard, "CACHE_PATH", str(p))
+        monkeypatch.setenv("ZOTERO_GUARD_CACHE", str(p))
         assert zot_guard._load_cache() is None
 
 
