@@ -41,7 +41,15 @@ except ImportError:
 CACHE_PATH = os.environ.get("ZOTERO_GUARD_CACHE", "/tmp/zot-guard-cache.json")
 # 全量扫描实测 4 分钟（4,254 条 / 54 页），300s 的 TTL 意味着几乎每次
 # 归档都要重扫一遍。默认放宽到 1 小时，可用 ZOTERO_GUARD_TTL 覆盖。
-CACHE_TTL = int(os.environ.get("ZOTERO_GUARD_TTL", "3600"))
+_DEFAULT_CACHE_TTL = 3600
+
+
+def _cache_ttl():
+    """调用时读 —— 测试/CI 需要把它设成 0 来关掉跨测试的缓存复用。"""
+    try:
+        return int(os.environ.get("ZOTERO_GUARD_TTL", _DEFAULT_CACHE_TTL))
+    except ValueError:
+        return _DEFAULT_CACHE_TTL
 TRACKING_EXACT = {"mc_cid", "mc_eid"}
 
 
@@ -97,6 +105,11 @@ def tokenize_title(title):
 
 
 # ── 库扫描 ────────────────────────────────────────────────────────────────
+def _cache_path():
+    """调用时读环境变量；环境变量未设时用模块级 CACHE_PATH（测试 monkeypatch 它）。"""
+    return os.environ.get("ZOTERO_GUARD_CACHE") or CACHE_PATH
+
+
 def _load_cache():
     """读缓存快照（**不管新鲜度**）。
 
@@ -105,7 +118,7 @@ def _load_cache():
     每次全量 250s）。
     """
     try:
-        with open(CACHE_PATH, encoding="utf-8") as f:
+        with open(_cache_path(), encoding="utf-8") as f:
             blob = json.load(f)
         if isinstance(blob, dict) and isinstance(blob.get("items"), list):
             return blob
@@ -116,7 +129,9 @@ def _load_cache():
 
 def _save_cache(blob):
     try:
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        path = _cache_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(blob, f)
     except OSError:
         pass
@@ -227,7 +242,7 @@ def scan_library(zot):
     只拉变化的条目，实测 1-2 页。
     """
     blob = _load_cache()
-    if blob and (time.time() - float(blob.get("ts") or 0)) < CACHE_TTL:
+    if blob and (time.time() - float(blob.get("ts") or 0)) < _cache_ttl():
         return blob["items"]
 
     banned = forbidden_collection_keys(zot)

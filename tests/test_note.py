@@ -57,8 +57,13 @@ class TestSetNote:
         )
 
     def test_setnote_no_content_error(self, zot_mod, capsys):
-        """_note_set with no content prints an error (no crash)."""
-        zot_mod._note_set("NONEXISTENT99", "")
+        """空内容 → 打印错误并**非零退出**（CLI 失败必须让调用方看见）。
+
+        2026-10-31 改动：原来只 print 后 return，退出码恒为 0，脚本无法判断失败。
+        """
+        with pytest.raises(SystemExit) as exc:
+            zot_mod._note_set("NONEXISTENT99", "")
+        assert exc.value.code == 1
         captured = capsys.readouterr()
         assert "Error" in captured.out or "no note" in captured.out.lower()
 
