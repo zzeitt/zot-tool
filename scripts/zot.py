@@ -1098,9 +1098,34 @@ def find_best_collection(title, description):
             硬映射已由 archive_url 在调用本函数前先尝试。
     v2.5.0: 重构 — 委托给 zot_classify.classify() 多信号评分引擎（PR 1）。
             行为完全不变（PR 1 contract），后续 PR 引入多信号 + 置信度闸门。
+            候选列表、文本关键词、关键词提取函数全部由本侧传入 —— zot_classify
+            不再 `import zot`，避免 CLI 下把 zot.py 以 `zot` 之名再加载一份
+            （第二个 Zotero client + 第二份 collection 缓存，且 collection
+            列表会被完整分页拉两遍）。
     """
     import zot_classify
-    decision = zot_classify.classify_from_title_desc(title, description)
+
+    # 早返回：标题是 URL 且 description 为空 → 不碰 API（保持 v1.8.0 行为）
+    if _is_url(title) and not description.strip():
+        return None
+
+    text = (title + " " + description).lower()
+    text_keywords = _extract_text_keywords(text)
+
+    forbidden = _get_forbidden_collection_keys()
+    candidates = [
+        (c["key"], c["data"].get("name", ""))
+        for c in _all_collections()
+        if c["key"] not in forbidden and c["key"] != MISC_COLLECTION
+    ]
+
+    decision = zot_classify.classify(
+        zot_classify.ArticleInput(title=title, description=description),
+        candidates=candidates,
+        text_keywords=text_keywords,
+        extract_coll_keywords=_extract_collection_keywords,
+        url_title_guard=_is_url,
+    )
     return decision.chosen
 
 

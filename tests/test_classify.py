@@ -25,14 +25,12 @@ from zot_classify import (
     ArticleInput,
     Signal,
     ClassificationDecision,
-    CollectionSignature,
     classify,
     score_collection,
     extract_signals,
     invalidate_signature_cache,
     get_cached_signature,
     SOURCE_WEIGHTS,
-    MIN_ITEMS_FOR_SIGNATURE,
 )
 
 
@@ -129,28 +127,31 @@ class TestExtractSignals:
 
 class TestScoreCollection:
     def test_url_title_no_desc_returns_zero(self, zot):
-        """Early-return: title is URL and description empty → score 0."""
+        """Early-return: title is URL and description empty → count 0, score 0."""
         a = ArticleInput(url="", title="https://example.com", description="")
-        score, trace = score_collection(("X", "Some Coll"), a, [])
+        count, score, trace = score_collection(("X", "Some Coll"), a, [])
+        assert count == 0
         assert score == 0.0
         assert "skip" in trace[0]
 
     def test_score_in_zero_one_range(self, zot):
-        """Score must be a float in [0, 1]."""
+        """Raw count is an int; normalized score is a float in [0, 1]."""
         a = ArticleInput(url="", title="Lean formal proof", description="Mathlib")
         for coll in CANDIDATES:
-            score, _ = score_collection(coll, a, [])
+            count, score, _ = score_collection(coll, a, [])
+            assert isinstance(count, int) and count >= 0
             assert isinstance(score, float)
             assert 0.0 <= score <= 1.0
 
     def test_no_keyword_overlap_returns_zero(self, zot):
-        """Coll name with no shared keywords → 0."""
+        """Coll name with no shared keywords → count 0, score 0.0."""
         a = ArticleInput(url="", title="xyzzy frobozz magic", description="plover")
-        score, trace = score_collection(
+        count, score, trace = score_collection(
             ("X", "On Computable Numbers, with an Applicatoin to the Entscheidungsproblem"),
             a, [],
         )
-        assert score <= 0.4
+        assert count == 0
+        assert score == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +180,10 @@ class TestClassifyOrchestrator:
     def test_score_propagated(self, zot):
         a = ArticleInput(url="", title="Lean proof Mathlib", description="formal")
         decision = classify(a, candidates=CANDIDATES)
-        if decision.chosen is not None:
-            assert decision.score > 0.0
-            assert decision.score <= 1.0
+        if decision.chosen is None:
+            assert decision.score == 0.0
+        else:
+            assert 0.0 < decision.score <= 1.0
 
     def test_debug_log_populated(self, zot):
         a = ArticleInput(url="", title="test", description="")
@@ -247,6 +249,90 @@ class TestBehaviorPreservation:
             f"Behavior diverged for ({title!r}, {description!r}): "
             f"new={new_decision.chosen} legacy={legacy_result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: ordering must use the RAW hit count, not the capped score
+# ---------------------------------------------------------------------------
+
+class TestOrderingByRawCount:
+    """C-1: 排序必须按原始命中计数。
+
+    归一化分数在 5 次命中处封顶，任何两个命中 ≥5 的候选都会变成 1.0。
+    若用归一化分数排序，"命中 14 次" 会输给 "命中 9 次"（严格大于不进），
+    与重构前实现相反，直接改变 `zot item archive` 的落点。
+    """
+
+    TEXT = "alpha bravo charlie delta echo foxtrot golf hotel india juliet"
+    CANDIDATES = [
+        ("COLL-A", "alpha bravo charlie delta echo"),                      # 9 hits
+        ("COLL-B", "alpha bravo charlie delta echo foxtrot golf hotel"),   # 14 hits
+    ]
+
+    def test_premise_both_candidates_saturate(self, zot):
+        """前提：两个候选的归一化分数相同（都封顶），只有原始计数不同。"""
+        tk = zot._extract_text_keywords(self.TEXT)
+        counts = [len(zot._extract_collection_keywords(n) & tk) for _, n in self.CANDIDATES]
+        assert all(c >= 5 for c in counts), f"用例前提不成立，命中不足 5 次: {counts}"
+        assert counts[0] != counts[1]
+        assert min(counts[0], 5) / 5.0 == min(counts[1], 5) / 5.0 == 1.0
+
+    def test_classify_picks_higher_count_not_first_candidate(self, zot):
+        legacy = TestBehaviorPreservation._legacy_with_candidates(
+            self.TEXT, "", self.CANDIDATES, zot
+        )
+        decision = classify(
+            ArticleInput(url="", title=self.TEXT, description=""),
+            candidates=self.CANDIDATES,
+        )
+        assert decision.chosen == legacy, f"new={decision.chosen} legacy={legacy}"
+        assert decision.chosen[0] == "COLL-B"
+        # 归一化分数仍是封顶值 —— 它只用于展示 / PR 4 的闸门
+        assert decision.score == 1.0
+
+
+class TestNoSecondZotImport:
+    """I-1: 传齐 helper 时不得 fallback 到 `import zot`。
+
+    `python3 scripts/zot.py …` 下 zot.py 以 __main__ 运行，`import zot` 会再加载
+    一份（第二个 Zotero client + 第二份 collection 缓存，列表被拉两遍）。
+    """
+
+    def test_no_lazy_import_when_helpers_passed(self, zot, monkeypatch):
+        def boom():
+            raise AssertionError("传齐 helper 时 classify() 不应 fallback 到 import zot")
+
+        monkeypatch.setattr(zot_classify, "_default_keyword_helpers", boom)
+
+        decision = classify(
+            ArticleInput(url="", title="alpha bravo", description=""),
+            candidates=[("K1", "alpha bravo")],
+            text_keywords={"alpha", "bravo"},
+            extract_coll_keywords=zot._extract_collection_keywords,
+            url_title_guard=zot._is_url,
+        )
+        assert decision.chosen == ("K1", "alpha bravo")
+
+
+class TestTextKeywordsComputedOnce:
+    """I-2: 文本关键词只算一次（曾在每个候选内部重算，300 候选 ~6x CPU）。"""
+
+    def test_one_call_for_many_candidates(self, zot, monkeypatch):
+        calls = {"n": 0}
+        real = zot._extract_text_keywords
+
+        def counting(text):
+            calls["n"] += 1
+            return real(text)
+
+        monkeypatch.setattr(
+            zot_classify, "_default_keyword_helpers",
+            lambda: (counting, zot._extract_collection_keywords, zot._is_url),
+        )
+        cands = [(f"K{i}", f"alpha bravo charlie delta echo item{i}") for i in range(50)]
+        classify(ArticleInput(url="", title="alpha bravo charlie", description=""),
+                 candidates=cands)
+        assert calls["n"] == 1, f"_extract_text_keywords 调用 {calls['n']} 次，应为 1 次"
 
 
 # ---------------------------------------------------------------------------

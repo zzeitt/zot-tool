@@ -153,46 +153,75 @@ def get_cached_signature(coll_key: str, coll_name: str) -> Optional[CollectionSi
 # Layer 3: Scoring (PR 1: replicates current find_best_collection logic)
 # ---------------------------------------------------------------------------
 
+def _default_keyword_helpers():
+    """Lazily fetch zot.py's keyword helpers.
+
+    Only used when the caller did not pass pre-computed keywords. The CLI path
+    (zot.find_best_collection) always passes all three, so zot.py is never
+    imported a second time there — `python3 scripts/zot.py …` runs it as
+    __main__, and a plain `import zot` would load a second copy with its own
+    Zotero client and its own collection cache.
+    """
+    import zot  # noqa: WPS433 — intentional lazy import
+    return zot._extract_text_keywords, zot._extract_collection_keywords, zot._is_url
+
+
 def score_collection(
     coll: tuple[str, str],
     article: ArticleInput,
     signals: list[Signal],
-) -> tuple[float, list[str]]:
+    text_keywords: Optional[set[str]] = None,
+    extract_coll_keywords=None,
+    url_title_guard=None,
+) -> tuple[int, float, list[str]]:
     """Score one collection against signals.
 
     PR 1: signals are ignored. Scoring uses title+description text directly,
-    mirroring the existing find_best_collection behavior:
-      1. Early return 0.0 if title is URL and description is empty
-      2. Compute keyword intersection between text and coll name
-      3. Normalize count to 0..1 (1 match=0.2, 5+=1.0) for PR 4 gate compat
+    mirroring the existing find_best_collection behavior.
 
-    Returns: (score 0..1, debug trace lines)
+    Why BOTH the count and the normalized score are returned: ordering MUST use
+    the raw count. The legacy implementation compared counts, so "9 matches"
+    beats "6 matches" — but once the count is capped at 5 both normalize to 1.0
+    and the comparison degenerates into "whichever came first". The 0..1 score
+    is for display and for PR 4's confidence gate only.
+
+    Args:
+        text_keywords: pre-computed keywords for the article text. Computing
+            this per candidate was a ~6x CPU regression, so the caller computes
+            it once. Omitted → derived lazily (tests only).
+        extract_coll_keywords: callable (name → keyword set). Omitted → lazy
+            import from zot.py (tests only).
+        url_title_guard: callable (title → bool), i.e. zot._is_url. Omitted →
+            lazy import (tests only).
+
+    Returns: (intersection_count, score 0..1, debug trace lines)
     """
-    # Lazy import to avoid circular dependency with zot.py
-    import zot
-
     key, name = coll
 
-    # Replicate early-return condition: title is URL and description is empty
-    text = (article.title + " " + article.description).lower()
-    if zot._is_url(article.title) and not article.description.strip():
-        return 0.0, ["skip: title is URL and description empty"]
+    if text_keywords is None or extract_coll_keywords is None or url_title_guard is None:
+        default_text_kw, default_coll_kw, default_is_url = _default_keyword_helpers()
+        if text_keywords is None:
+            text = (article.title + " " + article.description).lower()
+            text_keywords = default_text_kw(text)
+        extract_coll_keywords = extract_coll_keywords or default_coll_kw
+        url_title_guard = url_title_guard or default_is_url
 
-    # Replicate existing scoring: keyword intersection count
-    text_keywords = zot._extract_text_keywords(text)
-    coll_keywords = zot._extract_collection_keywords(name)
+    # Replicate early-return condition: title is URL and description is empty
+    if url_title_guard(article.title) and not article.description.strip():
+        return 0, 0.0, ["skip: title is URL and description empty"]
+
+    coll_keywords = extract_coll_keywords(name)
     intersection_count = len(coll_keywords & text_keywords)
 
-    # Normalize to 0..1 scale.
+    # Normalize to 0..1 scale (display / gate only — never used for ordering).
     # 0 → 0.0; 1 → 0.2; 2 → 0.4; 3 → 0.6; 4 → 0.8; 5+ → 1.0
-    # PR 4 gate threshold 0.5 → needs ≥3 keyword matches (or fallback tier)
     if intersection_count == 0:
         score = 0.0
     else:
         score = min(intersection_count, 5) / 5.0
 
     trace = [f"intersection_count={intersection_count}, score={score:.2f}"]
-    return score, trace
+    return intersection_count, score, trace
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +231,9 @@ def score_collection(
 def classify(
     article: ArticleInput,
     candidates: Optional[list[tuple[str, str]]] = None,
+    text_keywords: Optional[set[str]] = None,
+    extract_coll_keywords=None,
+    url_title_guard=None,
 ) -> ClassificationDecision:
     """Run full classification pipeline.
 
@@ -213,17 +245,42 @@ def classify(
         article: input article data
         candidates: optional pre-fetched (key, name) list. If None, fetches
                     via zot._all_collections() filtered for forbidden + Misc.
+        text_keywords: pre-computed keywords for the article text (computed
+                       once by the caller; see score_collection).
+        extract_coll_keywords: callable (name → keyword set).
+        url_title_guard: callable (title → bool), i.e. zot._is_url.
 
     Returns:
         ClassificationDecision with `chosen` field matching the legacy
         find_best_collection return shape (tuple | None).
     """
-    import zot
-
     signals = extract_signals(article)
+    debug_log: list[str] = [f"signals: {len(signals)} extracted"]
 
-    # Build candidate list
+    # Resolve the keyword helpers. The CLI path (zot.find_best_collection)
+    # passes all three explicitly, so `import zot` never runs there — which is
+    # what keeps zot.py from being loaded a second time as a separate module.
+    if text_keywords is None or extract_coll_keywords is None or url_title_guard is None:
+        default_text_kw, default_coll_kw, default_is_url = _default_keyword_helpers()
+        if text_keywords is None:
+            text_keywords = default_text_kw(
+                (article.title + " " + article.description).lower()
+            )
+        extract_coll_keywords = extract_coll_keywords or default_coll_kw
+        url_title_guard = url_title_guard or default_is_url
+
+    # Legacy early return, before any API work: URL title + empty description
+    if url_title_guard(article.title) and not article.description.strip():
+        debug_log.append("chosen: None (title is URL, description empty)")
+        return ClassificationDecision(
+            chosen=None, score=0.0, runner_up=None, runner_up_score=0.0,
+            signals=signals, signature_used=False, fallback_used=None,
+            rejected_reasons=[], debug_log=debug_log,
+        )
+
+    # Build candidate list (only reached when the caller did not supply one)
     if candidates is None:
+        import zot
         candidates = []
         for c in zot._all_collections():
             key = c["key"]
@@ -233,37 +290,45 @@ def classify(
                 continue
             candidates.append((key, c["data"].get("name", "")))
 
-    # Score each, tracking max (with strict-greater tiebreak for parity)
+    # Score each, tracking max by RAW intersection count (legacy compared
+    # counts; the normalized score saturates at 5 matches and must not decide).
     best_coll: Optional[tuple[str, str]] = None
+    best_count = 0
     best_score = 0.0
     best_trace: list[str] = []
     runner_up: Optional[tuple[str, str]] = None
     runner_up_score = 0.0
 
-    debug_log: list[str] = [f"signals: {len(signals)} extracted"]
-
     for coll in candidates:
-        score, trace = score_collection(coll, article, signals)
-        debug_log.append(f"  {coll[1]:<50}  {score:.2f}  ({trace[0]})")
+        count, score, trace = score_collection(
+            coll, article, signals,
+            text_keywords=text_keywords,
+            extract_coll_keywords=extract_coll_keywords,
+            url_title_guard=url_title_guard,
+        )
+        debug_log.append(f"  {coll[1]:<50}  {count:>2} hit  {score:.2f}  ({trace[0]})")
 
         # Strict-greater tiebreak matches legacy `score > best_score` semantics
-        if score > 0.0 and score > best_score:
+        if count >= 1 and count > best_count:
             runner_up = best_coll
             runner_up_score = best_score
             best_coll = coll
+            best_count = count
             best_score = score
             best_trace = trace
-        elif score > 0.0 and score > runner_up_score:
+        elif count >= 1 and score > runner_up_score:
             runner_up = coll
             runner_up_score = score
 
-    # Legacy behavior: any positive score → chosen
-    chosen = best_coll if best_score > 0.0 else None
+    # Legacy behavior: any positive overlap → chosen
+    chosen = best_coll if best_count >= 1 else None
 
     if chosen and best_trace:
-        debug_log.append(f"chosen: {chosen[1]} (score={best_score:.2f}, {best_trace[0]})")
+        debug_log.append(
+            f"chosen: {chosen[1]} ({best_count} hits, score={best_score:.2f}, {best_trace[0]})"
+        )
     else:
-        debug_log.append("chosen: None (no match above threshold)")
+        debug_log.append("chosen: None (no keyword overlap)")
 
     return ClassificationDecision(
         chosen=chosen,
