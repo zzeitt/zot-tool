@@ -62,8 +62,8 @@ fi
 # Rule 4: Hardcoded Zotero collection/item keys (8-char uppercase alnum)
 #          in variable *value* position (not variable *name* position).
 # -----------------------------------------------------------------------
-# Matches lines like:   FORBIDDEN_COLLECTION = "E2MM3WIC"
-# or bare keys used as: coll = "E2MM3WIC" / key = "E2MM3WIC"
+# Matches lines like:   FORBIDDEN_COLLECTION = "XXXXXXXX"
+# or bare keys used as: coll = "XXXXXXXX" / key = "XXXXXXXX"
 # Skips lines where the key is the env var name itself.
 KEY_VAL_HITS=$(echo "$STAGED" \
     | grep -nE '^\+\s*\w+\s*=\s*["'"'"']?[A-Z0-9]{8}["'"'"']?' \
