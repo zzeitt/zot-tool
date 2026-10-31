@@ -143,34 +143,16 @@ def setup_collections(test_env):
 
     yield forbidden_key, misc_key
 
-    # Teardown: delete prerequisite collections (and all their contents)
-    print("\n[teardown] Cleaning up test collections...")
-    api_base = f"https://api.zotero.org/{TEST_LIBRARY_TYPE}s/{TEST_LIBRARY_ID}"
-    for ck, cname in [(forbidden_key, FORBIDDEN_COLL_NAME),
-                       (misc_key, MISC_COLL_NAME)]:
-        try:
-            # Get version for If-Unmodified-Since-Version
-            import requests
-            r = requests.get(
-                f"{api_base}/collections/{ck}",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Zotero-API-Version": "3"},
-            )
-            if r.status_code == 200:
-                ver = (r.json().get("version")
-                       or r.json().get("data", {}).get("version"))
-                if ver:
-                    requests.delete(
-                        f"{api_base}/collections/{ck}",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Zotero-API-Version": "3",
-                            "If-Unmodified-Since-Version": str(ver),
-                        },
-                    )
-                    print(f"[teardown] Deleted {cname}: {ck}")
-        except Exception as e:
-            print(f"[teardown] Warning: could not delete {cname}: {e}")
+    # Teardown: **保留**前置 collection，不删。
+    #
+    # 这两个 collection 是共享测试组库里的固定夹具。集成测试会在同一个库里并发跑
+    # （main push / tag push / PR 三种触发各起一个 run），任何一个 run 在 teardown
+    # 里删掉它们，都会让并发的另一个 run 瞬间拿到失效的 collection key，
+    # 批量报 409 "Collection XXX not found"。
+    # 测试产生的 item 由各自的 fixture 负责删除，collection 本身留着给下次复用。
+    print("\n[teardown] Keeping prerequisite collections "
+          f"({FORBIDDEN_COLL_NAME}={forbidden_key}, {MISC_COLL_NAME}={misc_key}) "
+          "— shared fixtures; deleting them breaks concurrent runs.")
 
     # Clean up env vars
     os.environ.pop("ZOTERO_FORBIDDEN_COLLECTION", None)
