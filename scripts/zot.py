@@ -7,9 +7,10 @@ import re
 import json
 import subprocess
 import html
+import sqlite3
 import tempfile
 import time
-from urllib.parse import urlparse, parse_qsl, urlencode
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 from pyzotero import zotero
 from pyzotero._utils import build_url
 try:
@@ -864,6 +865,239 @@ def _preprint_from_url(url):
     return None
 
 
+# ---------------------------------------------------------------------------
+# v2.6.0 — Browser request headers + site memory (claude-mem)
+# ---------------------------------------------------------------------------
+# 抓取默认带一套完整浏览器请求头。只发 `-A Mozilla/5.0` 时，Akamai 一类站点
+# （如 developer.arm.com）会因缺少 Sec-Fetch-* 判定为机器人，直接 403。
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_BROWSER_HEADER_ARGS = [
+    "-A", _BROWSER_UA,
+    "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "-H", "Accept-Language: en-US,en;q=0.9",
+    "-H", "Upgrade-Insecure-Requests: 1",
+    "-H", "Sec-Fetch-Dest: document",
+    "-H", "Sec-Fetch-Mode: navigate",
+    "-H", "Sec-Fetch-Site: none",
+]
+
+# 站点档案存在 claude-mem 自己的库里（不额外建文件）：
+#   读 → 只读直连 SQLite，按 (project, title) 精确查（实测 ~36ms）
+#   写 → POST /api/memory/save；worker 毫秒级落库，但 HTTP 响应会挂 30s+，
+#        所以 2s 超时即放弃，不阻塞归档。
+SITE_MEM_PREFIX = "zot-site:"
+SITE_MEM_PROJECT = os.environ.get("ZOTERO_SITE_MEM_PROJECT", "zot-tool")
+SITE_MEM_WORKER = os.environ.get("ZOTERO_SITE_MEM_WORKER", "http://127.0.0.1:37777")
+
+
+def _site_mem_db():
+    return os.path.join(os.path.expanduser("~"), ".claude-mem", "claude-mem.db")
+
+
+def _site_domain(url):
+    try:
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _site_mem_connect():
+    """Open claude-mem's DB read-only. Returns None when unavailable."""
+    db = _site_mem_db()
+    if not os.path.exists(db):
+        return None
+    try:
+        uri = "file:" + db.replace("\\", "/") + "?mode=ro"
+        return sqlite3.connect(uri, uri=True, timeout=2)
+    except Exception:
+        return None
+
+
+def _site_profile_get(url):
+    """Return the learned profile for this URL's domain, or None."""
+    domain = _site_domain(url)
+    if not domain:
+        return None
+    conn = _site_mem_connect()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "select text, metadata from observations "
+            "where project = ? and title = ? order by id desc limit 1",
+            (SITE_MEM_PROJECT, SITE_MEM_PREFIX + domain),
+        ).fetchone()
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not row:
+        return None
+    prof = {"domain": domain}
+    try:
+        prof.update(json.loads(row[1] or "{}"))
+    except Exception:
+        pass
+    if row[0]:
+        prof.setdefault("text", row[0])
+    return prof
+
+
+def _site_profiles_all():
+    """All learned site profiles, one per domain (latest wins)."""
+    conn = _site_mem_connect()
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "select title, text, metadata from observations "
+            "where project = ? and title like ? order by id asc",
+            (SITE_MEM_PROJECT, SITE_MEM_PREFIX + "%"),
+        ).fetchall()
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    latest = {}
+    for title, text, meta in rows:
+        domain = title[len(SITE_MEM_PREFIX):]
+        prof = {"domain": domain, "text": text}
+        try:
+            prof.update(json.loads(meta or "{}"))
+        except Exception:
+            pass
+        latest[domain] = prof
+    return list(latest.values())
+
+
+def _site_profile_put(url, **fields):
+    """Merge fields into the site profile and push it to claude-mem.
+
+    Fire-and-forget: the worker commits the row in milliseconds, but its HTTP
+    response can hang for 30s+, so give up early and never block archiving.
+    """
+    domain = _site_domain(url)
+    if not domain:
+        return
+    prof = _site_profile_get(url) or {"domain": domain}
+    for k, v in fields.items():
+        if v is not None:
+            prof[k] = v
+    from datetime import datetime
+    prof["updated"] = datetime.now().isoformat(timespec="seconds")
+
+    bits = [domain]
+    if prof.get("headers"):
+        bits.append(f"请求头={prof['headers']}")
+    if prof.get("offline"):
+        bits.append(f"离线副本={prof['offline']}")
+    if prof.get("collection"):
+        bits.append(f"集合={prof['collection']}")
+    text = "；".join(bits)
+    if prof.get("note"):
+        text += "。" + str(prof["note"])
+
+    payload = {
+        "title": SITE_MEM_PREFIX + domain,
+        "text": text,
+        "project": SITE_MEM_PROJECT,
+        "metadata": {k: v for k, v in prof.items() if k != "text"},
+    }
+    if not _site_mem_post(payload):
+        # worker 不在线时直接写它的库（同一张表，更新而非追加，避免堆积）
+        _site_mem_upsert(domain, text, payload["metadata"])
+
+
+def _site_mem_post(payload):
+    """POST to the claude-mem worker. Returns True when it accepted the write."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            SITE_MEM_WORKER.rstrip("/") + "/api/memory/save",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=3).read()
+        return True
+    except Exception:
+        return False
+
+
+def _site_mem_upsert(domain, text, metadata):
+    """Update-or-insert the site row directly in claude-mem's SQLite.
+
+    Fallback for when the worker daemon is down; the worker reads the same
+    table, so the row is visible once it comes back.
+    """
+    from datetime import datetime, timezone
+    db = _site_mem_db()
+    if not os.path.exists(db):
+        return False
+    title = SITE_MEM_PREFIX + domain
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    try:
+        conn = sqlite3.connect(db, timeout=5)
+        conn.execute("pragma busy_timeout = 3000")
+        row = conn.execute(
+            "select id from observations where project = ? and title = ? "
+            "order by id desc limit 1",
+            (SITE_MEM_PROJECT, title),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "update observations set text = ?, metadata = ?, created_at = ?, "
+                "created_at_epoch = ? where id = ?",
+                (text, json.dumps(metadata, ensure_ascii=False), stamp,
+                 int(now.timestamp() * 1000), row[0]),
+            )
+        else:
+            import hashlib, uuid
+            conn.execute(
+                "insert into observations (memory_session_id, project, type, title, "
+                "text, created_at, created_at_epoch, metadata, content_hash) "
+                "values (?, ?, 'gotcha', ?, ?, ?, ?, ?, ?)",
+                ("zot-site-" + uuid.uuid4().hex, SITE_MEM_PROJECT, title, text,
+                 stamp, int(now.timestamp() * 1000),
+                 json.dumps(metadata, ensure_ascii=False),
+                 hashlib.md5(text.encode("utf-8")).hexdigest()[:16]),
+            )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _curl_args(url, timeout=30, extra_args=None):
+    """curl argv with the full browser header set."""
+    args = ["curl", "-s", "-L", "--compressed", "--max-time", str(timeout)]
+    args += _BROWSER_HEADER_ARGS
+    if extra_args:
+        args += extra_args
+    args.append(url)
+    return args
+
+
+def _curl_get_text(url, timeout=30, extra_args=None):
+    """GET a URL with full browser headers. Returns text or None."""
+    args = _curl_args(url, timeout, extra_args)
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout + 10)
+    except Exception:
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    return r.stdout.decode("utf-8", errors="replace")
+
+
 def fetch_url_metadata(url):
     """获取 URL 的标题和描述，支持常见平台特殊处理
 
@@ -911,10 +1145,8 @@ def fetch_url_metadata(url):
 
     # 通用网页抓取（bytes 模式，二进制内容不再抛 UnicodeDecodeError）
     try:
-        result = subprocess.run(
-            ["curl", "-s", "-L", "-A", "Mozilla/5.0", "--max-time", "15", fetch_url],
-            capture_output=True, timeout=20
-        )
+        result = subprocess.run(_curl_args(fetch_url, timeout=15),
+                                capture_output=True, timeout=20)
         html = result.stdout.decode("utf-8", errors="replace")
         if result.returncode != 0 or not html.strip():
             return {"title": url, "description": "", "itemType": item_type,
@@ -2267,6 +2499,111 @@ def _detect_binary_url(url):
     return False, None, None
 
 
+def _absolutize_css_urls(css, base_url):
+    """Rewrite url(...) in CSS so it still resolves after being inlined."""
+    return re.sub(
+        r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)",
+        lambda m: "url(" + urljoin(base_url, m.group(2)) + ")",
+        css,
+    )
+
+
+def _inline_css_imports(css, base_url, timeout=20, depth=0):
+    """Recursively inline @import rules (bounded depth)."""
+    if depth >= 3:
+        return css
+
+    def _repl(m):
+        imp_url = urljoin(base_url, m.group(1).strip())
+        sub = _curl_get_text(imp_url, timeout=timeout,
+                             extra_args=["-H", "Accept: text/css,*/*;q=0.1"])
+        if not sub:
+            return ""
+        return _absolutize_css_urls(
+            _inline_css_imports(sub, imp_url, timeout, depth + 1), imp_url)
+
+    return re.sub(r"@import\s*(?:url\()?['\"]?([^'\")\s;]+)['\"]?\)?\s*;", _repl, css)
+
+
+def _inline_stylesheets(html, base_url, timeout=20, max_total=6_000_000):
+    """Replace <link rel=stylesheet> with inline <style> blocks."""
+    chunks, total = [], 0
+    for tag in re.findall(r'<link[^>]+rel=["\']stylesheet["\'][^>]*>', html, re.I):
+        m = re.search(r'href=["\']([^"\']+)["\']', tag)
+        if not m:
+            continue
+        css_url = urljoin(base_url, m.group(1))
+        css = _curl_get_text(css_url, timeout=timeout,
+                             extra_args=["-H", "Accept: text/css,*/*;q=0.1"])
+        if not css:
+            print(f"   ⚠️  CSS unavailable: {css_url[:90]}")
+            continue
+        css = _inline_css_imports(css, css_url, timeout)
+        css = _absolutize_css_urls(css, css_url)
+        if total + len(css) > max_total:
+            print(f"   ⚠️  CSS budget exceeded, skipped {css_url[:60]}")
+            continue
+        total += len(css)
+        chunks.append(css)
+        html = html.replace(tag, "")
+    if not chunks:
+        return html
+    style = "<style>\n" + "\n".join(chunks) + "\n</style>\n</head>"
+    return html.replace("</head>", style, 1)
+
+
+def _looks_blocked(page):
+    """Detect WAF/challenge pages that parse fine but hold no article."""
+    head = page[:4000].lower()
+    return ("access denied" in head or "attention required" in head
+            or "cf-error-code" in head or "captcha" in head)
+
+
+def _download_html_with_headers(url, timeout=40):
+    """Fetch a page with browser headers and inline its CSS.
+
+    monolith cannot send custom headers, so WAF-protected sites (Akamai 403)
+    always fail there. This is the fallback path: plain curl + manual inlining.
+    Returns the temp file path or None.
+    """
+    print("💾 Saving offline copy with curl + inlined CSS...")
+    page = _curl_get_text(url, timeout=timeout)
+    if not page or len(page) < 500:
+        print("⚠️  curl fetch produced nothing usable")
+        return None
+    if _looks_blocked(page):
+        print("⚠️  WAF/challenge page detected, refusing to save it as article")
+        return None
+    page = _inline_stylesheets(page, url)
+    # 去掉脚本：Next.js 在本地水合失败会把整页刷白
+    page = re.sub(r"<script.*?</script>", "", page, flags=re.S | re.I)
+    page = re.sub(r'<link[^>]+rel=["\'](preload|prefetch|modulepreload)["\'][^>]*>',
+                  "", page, flags=re.I)
+
+    path = _offline_temp_path(url)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+    print(f"💾 Offline HTML: {path} ({os.path.getsize(path)} bytes)")
+    return path
+
+
+def _offline_temp_path(slug_source):
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = re.sub(r'[^\w\-]', '_', slug_source)[:40]
+    return os.path.join(_get_temp_dir(), f"{timestamp}_{slug}.html")
+
+
+def _deliver_offline(tmp_path, parent_item_key, url, has_webdav,
+                     webdav_url, webdav_user, webdav_pass, filename=None):
+    """Upload to WebDAV, or keep the file locally when WebDAV is unset."""
+    if has_webdav:
+        return _upload_to_webdav(tmp_path, parent_item_key, url,
+                                 webdav_url, webdav_user, webdav_pass)
+    return _save_local_with_note(tmp_path, parent_item_key, url,
+                                 filename or os.path.basename(tmp_path))
+
+
 def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     """保存离线副本（自动识别 HTML 或二进制文件）
 
@@ -2277,6 +2614,7 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     4. 二进制：用 archive_binary_url 下载 + 上传
     5. 无 WebDAV：保存到本地目录
     """
+    global _last_offline_file
     # 检查是 HTML 还是二进制文件
     is_binary, content_type, fname_hint = _detect_binary_url(url)
 
@@ -2299,62 +2637,84 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
         if not content_type:
             content_type = "application/octet-stream"
         print(f"💾 Binary file detected: {content_type}")
-        return archive_binary_url(
+        result = archive_binary_url(
             url, parent_item_key,
             content_type=content_type,
             filename_hint=fname_hint,
             title_hint=title_hint
         )
+        _site_profile_put(url, headers="browser", offline="binary")
+        return result
+
+    # ---- HTML ----
+    def _via_curl_css(memory_hit=False):
+        """curl + 内联 CSS 兜底：抓页、记档案、投递。monolith 两条失败路径共用。"""
+        global _last_offline_file
+        if memory_hit:
+            print(f"🧠 Site memory: {_site_domain(url)} 上次 curl+内联CSS 成功，跳过 monolith")
+        tmp = _download_html_with_headers(url)
+        if not tmp:
+            _site_profile_put(url, offline="failed")
+            return None
+        _site_profile_put(url, headers="browser", offline="curl_css")
+        _last_offline_file = tmp
+        return _deliver_offline(tmp, parent_item_key, url, has_webdav,
+                                webdav_url, webdav_user, webdav_pass)
+
+    # 站点档案：已知 monolith 抓不动的站，直接走 curl + 内联 CSS
+    profile = _site_profile_get(url) or {}
+    if profile.get("offline") in ("curl_css", "css_inline", "headers"):
+        delivered = _via_curl_css(memory_hit=True)
+        if delivered:
+            return delivered
 
     # ---- HTML：用 monolith 抓取 ----
-    # 检查 monolith 是否可用
+    # 检查 monolith 是否可用（不可用则与失败同样处理，走 curl 兜底）
+    have_monolith = True
     try:
         cmd = "where" if IS_WINDOWS else "which"
         result = subprocess.run([cmd, "monolith"], capture_output=True, text=True)
         if result.returncode != 0:
             print("⚠️  monolith not installed.")
-            return None
+            have_monolith = False
     except Exception:
         print("⚠️  monolith not available")
-        return None
+        have_monolith = False
 
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = re.sub(r'[^\w\-]', '_', (title_hint or url))[:40]
-    filename = f"{timestamp}_{slug}.html"
+    tmp_html = _offline_temp_path(title_hint or url)
+    monolith_failed = not have_monolith
+    if have_monolith:
+        print(f"💾 Saving offline copy with monolith...")
+        # 字体重页面外挂几百个 .woff2，不加 -F 会在 120-240s 内超时。
+        # 内置 Google 系 + 本地 overlay 里的字体重灾域名（见 _domain_wants_no_fonts）。
+        monolith_args = ["monolith", "-o", tmp_html]
+        if _domain_wants_no_fonts(url):
+            monolith_args.append("-F")   # --no-fonts
+        monolith_args.append(url)
+        try:
+            result = subprocess.run(
+                monolith_args,
+                capture_output=True, text=True, timeout=240  # 字体重页面给更多时间
+            )
+            if result.returncode != 0:
+                # 内置 Google 域名 + -F 仍失败 → 给出明确提示
+                if any(gdom in url for gdom in ("googleblog.com", "blog.google")):
+                    print(f"⚠️  monolith failed (Google 域名): {result.stderr[:200]}")
+                else:
+                    print(f"⚠️  monolith failed: {result.stderr}")
+                monolith_failed = True
+        except Exception as e:
+            print(f"⚠️  monolith error: {e}")
+            monolith_failed = True
 
-    print(f"💾 Saving offline copy with monolith...")
-    tmp_html = os.path.join(_get_temp_dir(), filename)
-    # 字体重页面外挂几百个 .woff2，不加 -F 会在 120-240s 内超时。
-    # 内置 Google 系 + 本地 overlay 里的字体重灾域名（见 _domain_wants_no_fonts）。
-    monolith_args = ["monolith", "-o", tmp_html]
-    if _domain_wants_no_fonts(url):
-        monolith_args.append("-F")   # --no-fonts
-    monolith_args.append(url)
-    try:
-        result = subprocess.run(
-            monolith_args,
-            capture_output=True, text=True, timeout=240  # 字体重页面给更多时间
-        )
-        if result.returncode != 0:
-            # 内置 Google 域名 + -F 仍失败 → 给出明确提示
-            if any(gdom in url for gdom in ("googleblog.com", "blog.google")):
-                print(f"⚠️  monolith failed (Google 域名): {result.stderr[:200]}")
-            else:
-                print(f"⚠️  monolith failed: {result.stderr}")
-            return None
-    except Exception as e:
-        print(f"⚠️  monolith error: {e}")
-        return None
-
-    if not os.path.exists(tmp_html):
-        print("⚠️  Offline file not generated")
-        return None
+    if monolith_failed or not os.path.exists(tmp_html):
+        # monolith 不支持自定义请求头，遇 WAF 站点（Akamai 403）必然失败。
+        return _via_curl_css()
 
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
-    global _last_offline_file
     _last_offline_file = tmp_html
+    _site_profile_put(url, headers="browser", offline="monolith")
 
     # v1.8.1: fix WeChat MP articles whose content is hidden by JS-dependent styles
     try:
@@ -2364,10 +2724,9 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     except Exception as e:
         print(f"⚠️  WeChat HTML post-processing skipped: {e}")
 
-    if has_webdav:
-        return _upload_to_webdav(tmp_html, parent_item_key, url, webdav_url, webdav_user, webdav_pass)
-    else:
-        return _save_local_with_note(tmp_html, parent_item_key, url, filename)
+    return _deliver_offline(tmp_html, parent_item_key, url, has_webdav,
+                            webdav_url, webdav_user, webdav_pass,
+                            filename=os.path.basename(tmp_html))
 
 
 # ---------------------------------------------------------------------------
@@ -4082,7 +4441,14 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
     #   完全跳过评分。硬映射的可信度高于多信号评分（评分在长尾标题上极易误判）。
     domain_sub = _domain_subcoll_name(url)
     domain_match = _find_existing_domain_collection(url)
-    if domain_match:
+    # v2.6.0: 人工确认过的站点归属优先。只由 `zot site set` 写入；
+    # 自动匹配的结果不回写，避免把误判学成"经验"。
+    remembered_coll = (_site_profile_get(url) or {}).get("collection")
+    if remembered_coll:
+        coll_key = remembered_coll
+        coll_name = f"site memory ({_site_domain(url)})"
+        print(f"📁 Site memory collection: {coll_key} ({_site_domain(url)})")
+    elif domain_match:
         coll_key, coll_name = domain_match
         print(f"📁 Domain-mapped collection: {coll_name} (from URL domain)")
     elif domain_sub:
@@ -4313,6 +4679,18 @@ def _build_parser():
     atl = att_s.add_parser("list", help="List child items")
     atl.add_argument("parent_key")
 
+    # ── site ──────────────────────────────────────────────────
+    site = subs.add_parser("site", help="Learned per-site recipes (claude-mem)")
+    site_s = site.add_subparsers(dest="action", metavar="<action>")
+
+    site_s.add_parser("list", help="Show learned site profiles")
+
+    sset = site_s.add_parser("set", help="Record/override a site profile")
+    sset.add_argument("target", help="Domain or URL")
+    sset.add_argument("pairs", nargs="*",
+                      help="key=value: collection=<coll-key> offline=<monolith|curl_css|binary> "
+                           "headers=<browser|plain> note=<free text>")
+
     # ── help ──────────────────────────────────────────────────
     subs.add_parser("help", help="Show this help")
 
@@ -4523,6 +4901,55 @@ def _coll_remove(coll_key):
         print(f"❌ Failed: {msg}")
 
 
+# ── site memory ────────────────────────────────────────────────
+
+def _site_list():
+    """Show every learned site profile (claude-mem project: zot-tool)."""
+    profiles = _site_profiles_all()
+    if not profiles:
+        print("📭 No learned sites yet.")
+        return
+    print(f"🧠 Learned sites: {len(profiles)}")
+    for p in sorted(profiles, key=lambda x: str(x.get("updated", "")), reverse=True):
+        line = f"  • {p['domain']}"
+        if p.get("headers"):
+            line += f"  headers={p['headers']}"
+        if p.get("offline"):
+            line += f"  offline={p['offline']}"
+        if p.get("collection"):
+            line += f"  coll={p['collection']}"
+        if p.get("updated"):
+            line += f"  ({p['updated']})"
+        print(line)
+        if p.get("note"):
+            print(f"      {p['note']}")
+
+
+def _site_set(target, pairs):
+    """Record a site profile by hand (used for human-confirmed collections)."""
+    url = target if target.startswith(("http://", "https://")) else "http://" + target
+    if not _site_domain(url):
+        print("❌ Need a domain or URL, e.g. zot site set developer.arm.com collection=ABCD1234")
+        return
+    fields = {}
+    for pair in pairs:
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            fields[k.strip()] = v.strip()
+        elif pair.strip():
+            fields["note"] = pair.strip()
+    if not fields:
+        print("❌ Nothing to set. Try: zot site set <domain> collection=<key> offline=curl_css")
+        return
+    merged = dict(_site_profile_get(url) or {})
+    merged.update(fields)
+    _site_profile_put(url, **fields)
+    print(f"🧠 Saved site memory: {_site_domain(url)}")
+    for k in ("headers", "offline", "collection", "note"):
+        if merged.get(k):
+            print(f"   {k}: {merged[k]}")
+
+
 # ── main ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -4544,7 +4971,7 @@ if __name__ == "__main__":
         # User typed a noun without a verb — show that noun's help
         for _cmd, _sub in [
             ("item", "item"), ("tag", "tag"), ("coll", "coll"),
-            ("note", "note"), ("attachment", "attachment"),
+            ("note", "note"), ("attachment", "attachment"), ("site", "site"),
         ]:
             if _cmd == cmd:
                 parser.parse_args([cmd, "--help"])
@@ -4629,6 +5056,13 @@ if __name__ == "__main__":
                                    archive_filename=args.name)
             elif action == "list":
                 list_attachments(args.parent_key)
+
+        elif cmd == "site":
+            action = args.action
+            if action == "list":
+                _site_list()
+            elif action == "set":
+                _site_set(args.target, args.pairs)
 
     except Exception as e:
         print(f"❌ Failed: {e}")

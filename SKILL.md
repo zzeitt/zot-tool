@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.5.1
+version: 2.6.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -140,11 +140,43 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 9. **自动识别文件类型**：
    - 二进制文件（PDF/EPUB 等）→ 直接下载原始文件，上传到 WebDAV
    - HTML 网页 → 用 monolith 抓取离线副本，上传到 WebDAV
+   - monolith 抓不动（WAF/403）→ 自动退回 curl + 手工内联 CSS（v2.6.0）
 10. 将离线文件作为 Zotero attachment item（linkMode: imported_file）关联到条目
 11. **归档后回读核对**（多信号评分不可信）：确认 collection 归属正确、tags 符合本库惯例。
     `zot item archive` **没有 `--coll` 覆盖参数**，改法：
     `z.deletefrom_collection(old_key, item)` + `z.addto_collection(new_key, item)`，
     每次改之前重新 `z.item(key)` 拉最新 data（否则 412）。
+
+### 站点记忆与浏览器请求头（v2.6.0）
+
+**抓取默认带完整浏览器头**：`curl` 请求统一带 UA + Accept + Accept-Language +
+`Sec-Fetch-Dest/Mode/Site` + `Upgrade-Insecure-Requests`。只发 `-A Mozilla/5.0` 时，
+Akamai 一类站点（如 developer.arm.com）会直接 403 —— 这是 2026-11-02 归档
+ARM 博客时踩到的坑，monolith 因为不支持自定义头而整条路径都走不通。
+
+**站点档案（越用越快）**：每个域名学一条档案，存在 claude-mem 自己的库里，
+**不额外建文件**。
+
+| 字段 | 谁写 | 含义 |
+|---|---|---|
+| `headers` | 自动 | 哪套请求头成功（目前恒为 `browser`） |
+| `offline` | 自动 | 离线副本策略：`monolith` / `curl_css` / `binary` / `failed` |
+| `collection` | **仅人工** | 确认过的集合 key；自动匹配的误判不写回 |
+| `note` | 人工 | 自由备注 |
+
+```bash
+python3 scripts/zot.py site list                            # 看学到了什么
+python3 scripts/zot.py site set developer.arm.com collection=ABCD1234 \
+        offline=curl_css note="monolith 403"
+```
+
+- **读**：只读直连 `~/.claude-mem/claude-mem.db`，`WHERE project='zot-tool' AND title='zot-site:<domain>'`，约 36ms。
+  不走 `/api/search`（语义搜索实测 9.5 秒，太慢）。
+- **写**：优先 `POST /api/memory/save`（3 秒超时）；worker 不在线时直接
+  update-or-insert 同一个库同一张表，所以 worker 挂了也不会丢记忆。
+- **命中后**：`offline=curl_css` 的站点跳过 monolith 直接走 curl+内联 CSS；
+  `collection` 存在时优先于域名硬映射和多信号评分。
+- **注意**：worker 挂掉时写库会绕过它的去重/同步管线；worker 恢复后照常读得到。
 
 ### 前置查重闸门 zot_guard.py（v2.4.4+）
 
@@ -450,6 +482,15 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.6.0 — 站点记忆
+
+详见上文「站点记忆与浏览器请求头」一节。
+
+- 抓取统一带完整浏览器头（Akamai 站点只发 UA 会被 403）
+- 新增 `_download_html_with_headers()`：monolith 失败/缺失时的 curl + 内联 CSS 兜底
+- 新增 `zot site list|set`，档案存 claude-mem 库，读走只读 SQLite、写走 worker + 直写降级
+- 集合归属只记人工确认的，自动匹配不回写
 
 ### v2.5.1 — 缓存与增量同步 + 5 个正确性修复
 
