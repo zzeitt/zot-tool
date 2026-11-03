@@ -882,10 +882,12 @@ _BROWSER_HEADER_ARGS = [
     "-H", "Sec-Fetch-Site: none",
 ]
 
-# 站点档案存在 claude-mem 自己的库里（不额外建文件）：
-#   读 → 只读直连 SQLite，按 (project, title) 精确查（实测 ~36ms）
-#   写 → POST /api/memory/save；worker 毫秒级落库，但 HTTP 响应会挂 30s+，
-#        所以 2s 超时即放弃，不阻塞归档。
+# 站点档案：按域名记住「怎么抓成功的」。存储后端可换
+# （ZOTERO_SITE_MEM = auto | claude-mem | file | off）：
+#   claude-mem → 写进它自己的 observations 表，不额外建文件
+#   file       → <ZOTERO_CACHE_DIR>/sites.json，没装 claude-mem 时的兜底
+#   auto       → 有 claude-mem 库就用它，否则用 file
+# 读是纯本地查询；写 fire-and-forget，任何失败都不阻塞归档。
 SITE_MEM_PREFIX = "zot-site:"
 SITE_MEM_PROJECT = os.environ.get("ZOTERO_SITE_MEM_PROJECT", "zot-tool")
 SITE_MEM_WORKER = os.environ.get("ZOTERO_SITE_MEM_WORKER", "http://127.0.0.1:37777")
@@ -893,6 +895,50 @@ SITE_MEM_WORKER = os.environ.get("ZOTERO_SITE_MEM_WORKER", "http://127.0.0.1:377
 
 def _site_mem_db():
     return os.path.join(os.path.expanduser("~"), ".claude-mem", "claude-mem.db")
+
+
+def _site_mem_file():
+    return os.environ.get("ZOTERO_SITE_MEM_FILE") or os.path.join(
+        _cache_dir(), "sites.json")
+
+
+def _site_mem_mode():
+    """Which store to use: 'claude-mem', 'file' or 'off'."""
+    mode = os.environ.get("ZOTERO_SITE_MEM", "auto").strip().lower()
+    if mode in ("off", "none", "disabled", "0", "false"):
+        return "off"
+    if mode in ("file", "json"):
+        return "file"
+    if mode.startswith("claude-mem"):
+        return "claude-mem" if os.path.exists(_site_mem_db()) else "off"
+    # auto
+    return "claude-mem" if os.path.exists(_site_mem_db()) else "file"
+
+
+def _site_file_load():
+    try:
+        with open(_site_mem_file(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _site_file_save(domain, prof):
+    path = _site_mem_file()
+    store = _site_file_load()
+    store[domain] = prof
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
 
 
 def _site_domain(url):
@@ -919,6 +965,16 @@ def _site_profile_get(url):
     domain = _site_domain(url)
     if not domain:
         return None
+    mode = _site_mem_mode()
+    if mode == "off":
+        return None
+    if mode == "file":
+        prof = _site_file_load().get(domain)
+        return dict(prof, domain=domain) if isinstance(prof, dict) else None
+    return _claude_mem_profile_get(domain)
+
+
+def _claude_mem_profile_get(domain):
     conn = _site_mem_connect()
     if conn is None:
         return None
@@ -949,6 +1005,17 @@ def _site_profile_get(url):
 
 def _site_profiles_all():
     """All learned site profiles, one per domain (latest wins)."""
+    mode = _site_mem_mode()
+    if mode == "off":
+        return []
+    if mode == "file":
+        return [dict(prof, domain=domain)
+                for domain, prof in _site_file_load().items()
+                if isinstance(prof, dict)]
+    return _claude_mem_profiles_all()
+
+
+def _claude_mem_profiles_all():
     conn = _site_mem_connect()
     if conn is None:
         return []
@@ -978,13 +1045,12 @@ def _site_profiles_all():
 
 
 def _site_profile_put(url, **fields):
-    """Merge fields into the site profile and push it to claude-mem.
-
-    Fire-and-forget: the worker commits the row in milliseconds, but its HTTP
-    response can hang for 30s+, so give up early and never block archiving.
-    """
+    """Merge fields into the site profile. Never raises, never blocks archiving."""
     domain = _site_domain(url)
     if not domain:
+        return
+    mode = _site_mem_mode()
+    if mode == "off":
         return
     prof = _site_profile_get(url) or {"domain": domain}
     for k, v in fields.items():
@@ -992,7 +1058,14 @@ def _site_profile_put(url, **fields):
             prof[k] = v
     from datetime import datetime
     prof["updated"] = datetime.now().isoformat(timespec="seconds")
+    if mode == "file":
+        _site_file_save(domain, prof)
+    else:
+        _claude_mem_profile_put(domain, prof)
 
+
+def _claude_mem_profile_put(domain, prof):
+    """Push one profile into claude-mem (worker first, direct DB as backup)."""
     bits = [domain]
     if prof.get("headers"):
         bits.append(f"请求头={prof['headers']}")

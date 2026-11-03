@@ -154,8 +154,12 @@ zot.py 内部调用 `subprocess.run(["monolith", "-o", outfile, url])`，Windows
 Akamai 一类站点（如 developer.arm.com）会直接 403 —— 这是 2026-11-02 归档
 ARM 博客时踩到的坑，monolith 因为不支持自定义头而整条路径都走不通。
 
-**站点档案（越用越快）**：每个域名学一条档案，存在 claude-mem 自己的库里，
-**不额外建文件**。
+**站点档案（越用越快）**：每个域名学一条档案。存储后端可换
+（`ZOTERO_SITE_MEM=auto|claude-mem|file|off`，默认 `auto`）：
+
+- `claude-mem`（装了就用它）→ 写进 claude-mem 的 `observations` 表，不额外建文件
+- `file`（没装时的兜底）→ `<ZOTERO_CACHE_DIR>/sites.json`，路径可用 `ZOTERO_SITE_MEM_FILE` 覆盖
+- `off` → 完全不记，行为退回 v2.5.x
 
 | 字段 | 谁写 | 含义 |
 |---|---|---|
@@ -170,9 +174,10 @@ python3 scripts/zot.py site set developer.arm.com collection=ABCD1234 \
         offline=curl_css note="monolith 403"
 ```
 
-- **读**：只读直连 `~/.claude-mem/claude-mem.db`，`WHERE project='zot-tool' AND title='zot-site:<domain>'`，约 36ms。
+- **读**（claude-mem 后端）：只读直连 `~/.claude-mem/claude-mem.db`，
+  `WHERE project='zot-tool' AND title='zot-site:<domain>'`，约 36ms。
   不走 `/api/search`（语义搜索实测 9.5 秒，太慢）。
-- **写**：优先 `POST /api/memory/save`（3 秒超时）；worker 不在线时直接
+- **写**（claude-mem 后端）：优先 `POST /api/memory/save`（3 秒超时）；worker 不在线时直接
   update-or-insert 同一个库同一张表，所以 worker 挂了也不会丢记忆。
 - **命中后**：`offline=curl_css` 的站点跳过 monolith 直接走 curl+内联 CSS；
   `collection` 存在时优先于域名硬映射和多信号评分。
@@ -489,7 +494,7 @@ alias zot="python3 scripts/zot.py"
 
 - 抓取统一带完整浏览器头（Akamai 站点只发 UA 会被 403）
 - 新增 `_download_html_with_headers()`：monolith 失败/缺失时的 curl + 内联 CSS 兜底
-- 新增 `zot site list|set`，档案存 claude-mem 库，读走只读 SQLite、写走 worker + 直写降级
+- 新增 `zot site list|set`；存储可换（claude-mem / JSON 文件 / 关闭），默认自动选
 - 集合归属只记人工确认的，自动匹配不回写
 
 ### v2.5.1 — 缓存与增量同步 + 5 个正确性修复

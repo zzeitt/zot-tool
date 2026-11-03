@@ -2,6 +2,7 @@
 
 Pure logic only — no network, no Zotero API, no claude-mem worker.
 """
+import json
 import os
 import sqlite3
 import subprocess
@@ -55,8 +56,19 @@ def mem_db(zot, tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setattr(zot, "_site_mem_db", lambda: str(path))
+    monkeypatch.setattr(zot, "_site_mem_file", lambda: str(tmp_path / "sites.json"))
     monkeypatch.setattr(zot, "_site_mem_post", lambda payload: False)
+    monkeypatch.setenv("ZOTERO_SITE_MEM", "claude-mem")
     return str(path)
+
+
+@pytest.fixture
+def file_store(zot, tmp_path, monkeypatch):
+    """Force the JSON-file backend."""
+    path = tmp_path / "sites.json"
+    monkeypatch.setattr(zot, "_site_mem_file", lambda: str(path))
+    monkeypatch.setenv("ZOTERO_SITE_MEM", "file")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +176,54 @@ def test_profiles_all_dedupes_by_domain(zot, mem_db):
     assert domains == {"a.test", "b.test"}
 
 
-def test_site_memory_unavailable_without_db(zot, tmp_path, monkeypatch):
+def test_site_memory_disabled_is_a_noop(zot, tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOTERO_SITE_MEM", "off")
     monkeypatch.setattr(zot, "_site_mem_db",
                         lambda: str(tmp_path / "missing.db"))
+    monkeypatch.setattr(zot, "_site_mem_file",
+                        lambda: str(tmp_path / "sites.json"))
     assert zot._site_profile_get("https://x.test/") is None
-    # must not raise when the store is absent
     zot._site_profile_put("https://x.test/", offline="monolith")
+    assert zot._site_profiles_all() == []
+
+
+# ---------------------------------------------------------------------------
+# Backend selection + JSON-file fallback (works without claude-mem)
+# ---------------------------------------------------------------------------
+
+def test_mode_auto_prefers_claude_mem(zot, tmp_path, monkeypatch):
+    db = tmp_path / "claude-mem.db"
+    db.write_text("")
+    monkeypatch.setenv("ZOTERO_SITE_MEM", "auto")
+    monkeypatch.setattr(zot, "_site_mem_db", lambda: str(db))
+    assert zot._site_mem_mode() == "claude-mem"
+
+
+def test_mode_auto_falls_back_to_file(zot, tmp_path, monkeypatch):
+    monkeypatch.setenv("ZOTERO_SITE_MEM", "auto")
+    monkeypatch.setattr(zot, "_site_mem_db",
+                        lambda: str(tmp_path / "absent.db"))
+    assert zot._site_mem_mode() == "file"
+
+
+def test_mode_off(zot, monkeypatch):
+    monkeypatch.setenv("ZOTERO_SITE_MEM", "off")
+    assert zot._site_mem_mode() == "off"
+
+
+def test_file_backend_roundtrip(zot, file_store):
+    zot._site_profile_put("https://a.test/x", offline="curl_css",
+                          collection="demo0001")
+    prof = zot._site_profile_get("https://a.test/y")
+    assert prof["offline"] == "curl_css"
+    assert prof["collection"] == "demo0001"
+    assert prof["domain"] == "a.test"
+    assert file_store.exists()
+
+
+def test_file_backend_updates_in_place(zot, file_store):
+    zot._site_profile_put("https://a.test/1", offline="monolith")
+    zot._site_profile_put("https://a.test/2", note="second pass")
+    prof = zot._site_profile_get("https://a.test/")
+    assert prof["offline"] == "monolith" and prof["note"] == "second pass"
+    assert set(json.loads(file_store.read_text())) == {"a.test"}
