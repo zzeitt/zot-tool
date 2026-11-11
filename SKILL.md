@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.5.1
+version: 2.5.2
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -450,6 +450,26 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.5.2 — collection 重复创建的根因修复
+
+- **磁盘快照失效语义修正**：`_invalidate_collections_cache()` 原本写磁盘快照时
+  走 `_write_collections_cache(version, collections)`，而该函数**无条件**把
+  `ts` 覆盖成 `time.time()` —— 于是「标记为过期」的那份快照被写成了
+  「刚刚写的、新鲜的」，但里面的 collections 列表其实是**旧的**。
+  后果：磁盘 TTL（默认 3600s）之内，每次 CLI 启动都直接命中这份
+  「标着新鲜、内容过期」的快照 → 看不到别的进程/会话刚建的 collection →
+  `create_misc_subcollection` 判定「不存在」→ **建出同名重复 collection**。
+  现在 `_write_collections_cache()` 接受显式 `ts`，失效时传 `ts=0`。
+- **按名字查集合时强制刷新一次**：新增 `_find_collection_by_name()` —— 快照里
+  查不到目标名字时，先 `force_refresh=True` 走 `since=` 增量再查一遍，
+  仍查不到才允许创建。`create_misc_subcollection()` 与
+  `_find_existing_domain_collection()` 都改走它。
+- **回归测试**：`tests/test_collections_cache.py`（7 例，无需 API）——
+  覆盖失效后 `ts==0`、`ts` 显式写入、查不到时强制刷新、命中时不刷新、
+  已有同名集合时不重复创建。
+- 2026-11-11 实测事故：三个并行会话各建了一个 `Misc--infinitelymore`，
+  库内留下三个同名集合（已合并为一个）。
 
 ### v2.5.1 — 缓存与增量同步 + 5 个正确性修复
 

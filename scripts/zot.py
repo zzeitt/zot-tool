@@ -184,11 +184,16 @@ def _read_collections_cache():
     return None
 
 
-def _write_collections_cache(version, collections):
-    """原子写；失败静默 —— 缓存写不进去不该让归档失败。"""
+def _write_collections_cache(version, collections, ts=None):
+    """原子写；失败静默 —— 缓存写不进去不该让归档失败。
+
+    ``ts`` 显式传入时原样写入（用于把快照标记为过期）；
+    缺省写当前时间。
+    """
     try:
         os.makedirs(_cache_dir(), exist_ok=True)
-        out = {"version": int(version or 0), "ts": time.time(),
+        out = {"version": int(version or 0),
+               "ts": time.time() if ts is None else float(ts),
                "collections": collections}
         tmp = _collections_cache_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -301,10 +306,14 @@ def _all_collections(force_refresh=False):
     if not force_refresh and _collections_cache["data"] is not None and (now - _collections_cache["ts"]) < _COLLECTIONS_CACHE_TTL:
         return _collections_cache["data"]
 
-    disk = _read_collections_cache() if not force_refresh else None
+    # force_refresh 只是**跳过「磁盘快照仍然新鲜」这条捷径**，磁盘快照本身
+    # 仍然要读 —— 有了它里的 version 才能走 `since=` 增量。
+    # （早先写成 `if not force_refresh else None` → force_refresh 直接掉进
+    # 全量分页，660 个 collection 要 10.5s。）
+    disk = _read_collections_cache()
 
     # 磁盘命中且未过期 → 直接用
-    if disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
+    if not force_refresh and disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
         _collections_cache["data"] = disk["collections"]
         _collections_cache["ts"] = now
         return disk["collections"]
@@ -363,9 +372,33 @@ def _find_existing_domain_collection(url):
     if not sub:
         return None
     target_name = f"Misc--{sub}"
+    key = _find_collection_by_name(target_name)
+    if key:
+        return key, target_name
+    return None
+
+
+def _find_collection_by_name(full_name):
+    """按**精确名字**在库内找 collection —— 带一次强制刷新兜底。
+
+    只靠 ``_all_collections()`` 的快照不够：快照可能因为 TTL 未到 / 别的
+    进程刚建过 collection 而不含目标名字，于是
+    ``create_misc_subcollection`` 会建出**同名重复 collection**
+    （2026-11-11 实测：三个并行会话各建了一个 ``Misc--infinitelymore``）。
+
+    所以查不到时强制刷新一次（走 ``since=`` 增量，通常只多一次请求），
+    再查一遍；仍查不到才允许创建。
+    """
     for c in _all_collections():
-        if c['data'].get('name') == target_name:
-            return c['key'], target_name
+        if c['data'].get('name') == full_name:
+            return c['key']
+    # 快照可能过期 —— 强制刷新后再查一次
+    try:
+        for c in _all_collections(force_refresh=True):
+            if c['data'].get('name') == full_name:
+                return c['key']
+    except Exception:                                  # noqa: BLE001
+        pass
     return None
 
 
@@ -415,13 +448,25 @@ def _invalidate_collections_cache():
 
     进程内清空 + 磁盘 ts 置 0。**保留 version**：下次走 `since=` 增量而不是全量，
     新建/改名一个 collection 只需要拉那一页。
+
+    ⚠️ 2026-11-11 修复：原先这里写的是
+    ``_write_collections_cache(version, collections)``，而该函数无条件把
+    ``ts`` 覆盖成 ``time.time()`` —— 于是磁盘快照被标成「刚刚写的、新鲜的」，
+    但里面的 collections 列表其实是**旧的**（不包含本次刚建的 collection）。
+
+    后果：磁盘 TTL（默认 3600s）之内，后续每次 CLI 启动都直接命中这份
+    「标着新鲜、内容过期」的快照 → 看不到别的进程/别的会话刚建的 collection
+    → ``create_misc_subcollection`` 判定「不存在」→ **建出同名重复 collection**。
+
+    2026-11-11 实测：三个并行会话各建了一个 ``Misc--infinitelymore``，
+    库内留下三个同名集合。现在显式传 ``ts=0``，快照真正被标记为过期。
     """
     _collections_cache["data"] = None
     _collections_cache["ts"] = 0.0
     disk = _read_collections_cache()
     if disk is not None:
-        disk["ts"] = 0
-        _write_collections_cache(disk.get("version") or 0, disk.get("collections") or [])
+        _write_collections_cache(disk.get("version") or 0,
+                                 disk.get("collections") or [], ts=0)
 
 
 # ---------------------------------------------------------------------------
@@ -2185,11 +2230,12 @@ def create_misc_subcollection(name_hint, url=None):
         sub_name = _fallback_sub_name_from_title(name_hint)
     full_name = f"Misc--{sub_name}"
 
-    for c in _all_collections():
-        if c['data'].get('name') == full_name:
-            print(f"📁 Collection already exists: {full_name}")
-            _invalidate_collections_cache()
-            return c['key']
+    # 查重时强制刷新一次：快照过期会导致建出同名重复 collection
+    existing = _find_collection_by_name(full_name)
+    if existing:
+        print(f"📁 Collection already exists: {full_name}")
+        _invalidate_collections_cache()
+        return existing
 
     coll_template = {'name': full_name, 'parentCollection': MISC_COLLECTION}
     try:
