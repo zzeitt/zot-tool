@@ -306,10 +306,14 @@ def _all_collections(force_refresh=False):
     if not force_refresh and _collections_cache["data"] is not None and (now - _collections_cache["ts"]) < _COLLECTIONS_CACHE_TTL:
         return _collections_cache["data"]
 
-    disk = _read_collections_cache() if not force_refresh else None
+    # force_refresh 只是**跳过「磁盘快照仍然新鲜」这条捷径**，磁盘快照本身
+    # 仍然要读 —— 有了它里的 version 才能走 `since=` 增量。
+    # （早先写成 `if not force_refresh else None` → force_refresh 直接掉进
+    # 全量分页，660 个 collection 要 10.5s。）
+    disk = _read_collections_cache()
 
     # 磁盘命中且未过期 → 直接用
-    if disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
+    if not force_refresh and disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
         _collections_cache["data"] = disk["collections"]
         _collections_cache["ts"] = now
         return disk["collections"]
