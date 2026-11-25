@@ -1071,3 +1071,34 @@ class TestSniffImageMime:
     ])
     def test_sniff(self, zot, data, expected):
         assert zot._sniff_image_mime(data) == expected
+
+
+class TestAuthHeaders:
+    """_auth_headers() — pyzotero <1.17 vs >=1.17 compatibility."""
+
+    def test_uses_default_headers_when_available(self, zot):
+        class NewClient:
+            def default_headers(self):
+                return {"Authorization": "Bearer new"}
+
+        assert zot._auth_headers(NewClient()) == {"Authorization": "Bearer new"}
+
+    def test_legacy_client_headers_are_preserved(self, zot):
+        class LegacyClient:
+            headers = {"Authorization": "Bearer old"}
+
+        assert zot._auth_headers(LegacyClient()) == {
+            "Authorization": "Bearer old"}
+
+    def test_legacy_client_without_headers_builds_bearer(self, zot):
+        class LegacyClient:
+            headers = {}
+            api_key = "KEY123"
+
+        assert zot._auth_headers(LegacyClient()) == {
+            "Authorization": "Bearer KEY123"}
+
+    def test_real_client_carries_auth(self, zot):
+        """The actual client's headers must include the API key."""
+        headers = zot._auth_headers()
+        assert headers.get("Authorization") == "Bearer dummy-key"

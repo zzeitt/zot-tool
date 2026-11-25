@@ -469,7 +469,8 @@ alias zot="python3 scripts/zot.py"
 
 - **pyzotero ≥1.17 认证**：新版把 `Authorization` 从 `client.headers` 移到按请求生成的
   `default_headers()`，裸 `client.get()` / 手写 `headers=` 的调用会 403。词表分页拉取与
-  附件原地 PATCH（`If-Unmodified-Since-Version`）都改为合并 `zot.default_headers()`。
+  附件原地 PATCH（`If-Unmodified-Since-Version`）改走 `_auth_headers()`：新版用
+  `default_headers()`，旧版回退到 `client.headers` / `api_key`，因此仍兼容 pyzotero 1.11+。
 - **微信懒加载图内联**：2026 版微信把真实图片放在 `data-src`，`src` 只是 1x1 SVG/空白占位，
   旧逻辑直接删 `data-src` → 离线副本全部缺图。新增 `_inline_wechat_lazy_images()`：
   真实图保留、占位图下载后转 base64（单图 ≤10MB / 整篇 ≤40MB）、失败回退外链；

@@ -82,6 +82,24 @@ zot = zotero.Zotero(LIBRARY_ID, LIBRARY_TYPE, API_KEY)
 zot.client.timeout = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
 
 
+def _auth_headers(client=None):
+    """返回带认证的请求头，兼容 pyzotero 1.16 与 ≥1.17。
+
+    pyzotero ≥1.17 把 ``Authorization`` 从共享 client 移到按请求生成的
+    ``default_headers()``；直接调 ``client.get()`` 会漏掉认证 → 403。
+    旧版本没有该方法，认证仍挂在 ``client.headers`` 上。
+    """
+    client = client or zot
+    default_headers = getattr(client, "default_headers", None)
+    if callable(default_headers):
+        return default_headers()
+    headers = dict(getattr(client, "headers", {}) or {})
+    api_key = getattr(client, "api_key", None)
+    if api_key and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 # ---------------------------------------------------------------------------
 # v1.8.0 — Domain hard-mapping & helpers
 # ---------------------------------------------------------------------------
@@ -1288,7 +1306,7 @@ def _fetch_all_tags_raw(min_count=3, max_pages=12, page_size=100):
         resp = zot.client.get(url, params={
             "sort": "numItems", "direction": "desc",
             "limit": page_size, "start": start,
-        }, headers=zot.default_headers())
+        }, headers=_auth_headers())
         resp.raise_for_status()
         page = resp.json()
         if not page:
@@ -2862,7 +2880,7 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
                 # 同 _fetch_all_tags_raw：pyzotero ≥1.17 的认证在 default
                 # headers 里，裸 client 调用必须显式带上。
                 headers={
-                    **zot.default_headers(),
+                    **_auth_headers(),
                     "If-Unmodified-Since-Version": str(version),
                 },
                 json={
