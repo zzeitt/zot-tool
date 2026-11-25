@@ -477,6 +477,140 @@ def _invalidate_collections_cache():
 # 此函数在 monolith 完成后对 HTML 做后处理，移除反爬样式并展开图片 src。
 
 
+_IMG_MAX_BYTES = 10 * 1024 * 1024      # 单图上限
+_IMG_TOTAL_BUDGET = 40 * 1024 * 1024   # 整篇内联图片总预算
+
+
+def _sniff_image_mime(data):
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    # 微信的矢量图（公式/示意图）常以 SVG 返回，Content-Type 也是 image/svg+xml
+    _head = data.lstrip(b"\r\n\t ")[:5].lower()
+    if _head.startswith(b"<?xml") or _head.startswith(b"<svg"):
+        return "image/svg+xml"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _fetch_image_data_uri(url, _budget):
+    """下载图片并转成 data URI；失败返回 None。``_budget`` 是单元素 list（剩余预算）。"""
+    if not url.startswith("http"):
+        if url.startswith("//"):
+            url = "https:" + url
+        else:
+            return None
+    if _budget[0] <= 0:
+        return None
+    try:
+        # 用模块级 httpx（venv 里装的可能是 httpx2，plain httpx 不一定有）
+        resp = httpx.get(
+            url,
+            headers={
+                "User-Agent": _WECHAT_UA,
+                "Referer": "https://mp.weixin.qq.com/",
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            },
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0),
+        )
+        resp.raise_for_status()
+        data = resp.content
+    except Exception:  # noqa: BLE001
+        return None
+    if not data or len(data) > _IMG_MAX_BYTES or len(data) > _budget[0]:
+        return None
+    mime = _sniff_image_mime(data)
+    if not mime:
+        return None
+    _budget[0] -= len(data)
+    import base64
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+def _inline_wechat_lazy_images(document):
+    """把微信图片的 ``data-src`` 落成可离线渲染的 ``src``。
+
+    返回 ``(new_html, n_changed)``。分三种情况：
+
+    1. ``src`` 已经是真实图片（非 1x1 SVG 占位、非空白 gif）→ 只删 ``data-src``；
+    2. ``src`` 是占位/空值且 ``data-src`` 是 http(s) → 下载并内联为 base64；
+    3. 下载失败 → 把 ``src`` 指向 ``data-src`` 的 URL（有网时还能显示）。
+    """
+    budget = [_IMG_TOTAL_BUDGET]
+    stats = {"inline": 0, "fallback": 0, "dropped": 0}
+
+    def _attr(tag, name):
+        # (?<![\w-]) 而非 \b：否则 ``data-src=`` 里的 ``src=`` 会被当成 src。
+        m = re.search(
+            rf'(?<![\w-]){name}=(?:"([^"]*)"|(\S+?))(?=[\s>])',
+            tag, re.IGNORECASE,
+        )
+        if not m:
+            return None
+        return m.group(1) if m.group(1) is not None else m.group(2)
+
+    def _set_src(tag, value):
+        if re.search(r'(?<![\w-])src=', tag, re.IGNORECASE):
+            return re.sub(
+                r'(?<![\w-])src=(?:"[^"]*"|\S+?)(?=[\s>])',
+                'src="' + value.replace('\\', '\\\\') + '"', tag,
+                count=1, flags=re.IGNORECASE,
+            )
+        return tag[:-1] + ' src="%s">' % value.replace('\\', '\\\\')
+
+    def _is_real_src(src):
+        if not src:
+            return False
+        if src.startswith("http"):
+            return True
+        if not src.startswith("data:image/"):
+            return False
+        if src.startswith("data:image/svg+xml"):
+            return False          # 1x1 占位 SVG
+        return len(src) > 2048    # 过短视为占位
+
+    def _repl(m):
+        tag = m.group(0)
+        if not re.search(r'\bdata-src=', tag, re.IGNORECASE):
+            return tag
+        src = _attr(tag, "src")
+        ds = _attr(tag, "data-src")
+        if ds and ds.startswith("//"):
+            ds = "https:" + ds
+        if not ds or not ds.startswith("http"):
+            return tag
+        ds = html.unescape(ds)
+
+        if _is_real_src(src):
+            stats["dropped"] += 1
+        else:
+            data_uri = _fetch_image_data_uri(ds, budget)
+            if data_uri:
+                tag = _set_src(tag, data_uri)
+                stats["inline"] += 1
+            else:
+                tag = _set_src(tag, ds)
+                stats["fallback"] += 1
+        tag = re.sub(r'\s*data-src=(?:"[^"]*"|\S+?)(?=[\s>])', '', tag,
+                     flags=re.IGNORECASE)
+        return tag
+
+    new_html = re.sub(r'<img[^>]*>', _repl, document, flags=re.IGNORECASE | re.S)
+    n = stats["inline"] + stats["fallback"] + stats["dropped"]
+    if stats["inline"] or stats["fallback"]:
+        print(f"🖼️  WeChat images: {stats['inline']} inlined"
+              + (f", {stats['fallback']} 回退为外链" if stats["fallback"] else "")
+              + (f", {stats['dropped']} 保留原内嵌图" if stats["dropped"] else ""))
+    return new_html, n
+
+
 def _fix_wechat_html(filepath):
     """Post-process monolith-saved WeChat MP HTML for offline/Zotero viewing.
 
@@ -504,8 +638,10 @@ def _fix_wechat_html(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         html = f.read()
 
-    # Guard: must contain the WeChat article body div
-    if 'id="js_content"' not in html:
+    # Guard: must contain the WeChat article body div。monolith 会把属性压缩成
+    # 无引号形式（``id=js_content``），所以不能只匹配 ``id="js_content"``。
+    js_content_re = r'id=["\']?js_content["\']?'
+    if not re.search(js_content_re, html):
         return False
 
     changed = False
@@ -521,24 +657,16 @@ def _fix_wechat_html(filepath):
         return tag
 
     html, n1 = re.subn(
-        r'<div[^>]*\s+id="js_content"[^>]*style="[^"]*"[^>]*>',
+        r'<div[^>]*\s+' + js_content_re + r'[^>]*style="[^"]*"[^>]*>',
         _clean_js_content_style, html
     )
 
-    # 2. Strip data-src from lazy-loaded images, KEEPING the inline base64 src.
-    #    WeChat pages have <img data-src="https://..." src="data:image/...;base64,..."/>
-    #    The src is the ACTUAL image data (inlined for offline caching) — NOT a
-    #    placeholder. v1.8.1's bug replaced src with data-src URL, losing 19.6MB
-    #    of image data. We now just drop the redundant data-src attribute.
-    def _strip_data_src(m):
-        tag = m.group(0)
-        tag = re.sub(r'\s*data-src="[^"]*"', '', tag)
-        return tag
-
-    html, n2 = re.subn(
-        r'<img[^>]*data-src="https?://[^"]*"[^>]*>',
-        _strip_data_src, html
-    )
+    # 2. Images: WeChat lazy-loads with <img data-src="URL" src="<1x1 占位图>">。
+    #    v1.8.2 的教训是：src 有时是真实 base64 数据（必须保留），但 2026 年的
+    #    页面改成 src 只给 1x1 SVG/空值，真实图在 data-src。因此按 src 的实际
+    #    状态分支：已经是真图就只删 data-src；是占位/空值就把 data-src 下载下来
+    #    内联成 base64（离线 Zotero 无网络、无 JS 也能看图）。
+    html, n2 = _inline_wechat_lazy_images(html)
 
     # 3. Strip WeChat-specific debugging attributes (cosmetic noise, ~8KB savings)
     def _strip_wechat_attrs(m):
@@ -1155,10 +1283,12 @@ def _fetch_all_tags_raw(min_count=3, max_pages=12, page_size=100):
     url = f"{zot.endpoint}/{zot.library_type}/{zot.library_id}/tags"
     out, start = [], 0
     for _ in range(max_pages):
+        # pyzotero ≥1.17 把认证放在 per-request default headers 里，不再挂到
+        # 共享 client 上；直接走 zot.client.get 会漏掉 Authorization → 403。
         resp = zot.client.get(url, params={
             "sort": "numItems", "direction": "desc",
             "limit": page_size, "start": start,
-        })
+        }, headers=zot.default_headers())
         resp.raise_for_status()
         page = resp.json()
         if not page:
@@ -2313,6 +2443,67 @@ def _detect_binary_url(url):
     return False, None, None
 
 
+_WECHAT_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+
+def _is_wechat_article_url(url):
+    return "mp.weixin.qq.com" in (url or "") or "weixin.qq.com/s/" in (url or "")
+
+
+def _wechat_offline_via_curl(url, out_path):
+    """微信公众号兜底：monolith 直连会拿到「环境异常」验证页。
+
+    monolith 的请求特征会触发微信风控，而 curl + 移动端 UA 能拿到完整正文
+    （内嵌 base64 图）。因此先用 curl 落一份本地 HTML，再让 monolith 以它为
+    输入（``-b <url>`` 提供 base URL 以内联站外 CSS/字体）。
+
+    返回 True 表示已生成可用的离线文件。
+    """
+    import tempfile
+    src = os.path.join(tempfile.mkdtemp(prefix="zot_wechat_"), "src.html")
+    try:
+        r = subprocess.run(
+            ["curl", "-sL", "--max-time", "60", "-A", _WECHAT_UA,
+             "-H", "Accept-Language: zh-CN,zh;q=0.9",
+             "-o", src, url],
+            capture_output=True, text=True, timeout=90,
+        )
+        if r.returncode != 0 or not os.path.exists(src):
+            print(f"⚠️  WeChat curl fallback failed: {r.stderr[:200]}")
+            return False
+        with open(src, "r", encoding="utf-8", errors="replace") as f:
+            html = f.read()
+        if 'id="js_content"' not in html:
+            print("⚠️  WeChat curl fallback also got a verification page")
+            return False
+        print(f"🔁 WeChat 环境异常兜底：curl 已取得正文 ({len(html)} bytes)，改用本地 monolith")
+        # monolith 不会覆盖已存在的 -o 目标（静默 rc=0 且文件不变），
+        # 而 out_path 此时正是那张 303KB 的验证页，必须先删掉。
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        r = subprocess.run(
+            ["monolith", "-b", url, src, "-o", out_path],
+            capture_output=True, text=True, timeout=240,
+        )
+        if r.returncode != 0:
+            print(f"⚠️  monolith (local input) failed: {r.stderr[:200]}")
+            return False
+        return os.path.exists(out_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  WeChat curl fallback error: {e}")
+        return False
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(os.path.dirname(src), ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     """保存离线副本（自动识别 HTML 或二进制文件）
 
@@ -2396,6 +2587,18 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     if not os.path.exists(tmp_html):
         print("⚠️  Offline file not generated")
         return None
+
+    # 微信公众号风控：monolith 直连只会拿到「当前环境异常，完成验证后即可继续访问」
+    # 的验证页（约 303KB、0 张图、正文为空）。curl + 移动端 UA 能拿到完整正文，
+    # 于是用 curl 落盘后再让 monolith 以本地文件为输入。
+    if _is_wechat_article_url(url):
+        try:
+            with open(tmp_html, "r", encoding="utf-8", errors="replace") as f:
+                probe = f.read()
+            if not re.search(r'id=["\']?js_content["\']?', probe):
+                _wechat_offline_via_curl(url, tmp_html)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  WeChat offline probe failed: {e}")
 
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
@@ -2656,7 +2859,12 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
                     zot.endpoint,
                     f"/{zot.library_type}/{zot.library_id}/items/{existing_key}",
                 ),
-                headers={"If-Unmodified-Since-Version": str(version)},
+                # 同 _fetch_all_tags_raw：pyzotero ≥1.17 的认证在 default
+                # headers 里，裸 client 调用必须显式带上。
+                headers={
+                    **zot.default_headers(),
+                    "If-Unmodified-Since-Version": str(version),
+                },
                 json={
                     "md5": md5,
                     "mtime": mtime,
