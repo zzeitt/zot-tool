@@ -1419,15 +1419,29 @@ def _read_vocab_file():
 
 
 def _write_vocab_file(vocab):
-    """原子写（tmp + replace），失败静默 —— 词表落盘失败不该影响归档"""
+    """落盘标签词表 —— **原地写**，不用 tmp + rename（2026-11-25 修复）。
+
+    为什么不用 ``tmp + os.replace``（原实现）：
+    ``os.replace`` 是 "rename 覆盖已存在文件"。在 Minis / iSH 里这被文件
+    删除保护（FileGuard）判成"删除"，于是每次刷新词表都会弹
+    "把旧文件移到回收站？"确认框。用户点"不允许" → 写入被拒 →
+    ``generated_ts`` 永远不更新 → 下次仍判定词表过期 → 再拉 API → 再弹窗，
+    变成自锁循环（不是偶发）。
+
+    原地写（打开已有文件改内容）既不是 unlink 也不是 rename-over，
+    不触发保护。代价：写一半被打断会留下截断的 JSON ——
+    ``_read_vocab_file`` 捕获 ValueError 返回 None，``load_vocab``
+    随即回退到 API 拉取，不会炸。
+
+    失败静默 —— 词表落盘失败不该影响归档。
+    """
     try:
         os.makedirs(_get_vocab_dir(), exist_ok=True)
-        tmp = _vocab_path() + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(vocab, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _vocab_path())
+        payload = json.dumps(vocab, ensure_ascii=False, indent=2)
+        with open(_vocab_path(), "w", encoding="utf-8") as f:
+            f.write(payload)
         return True
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return False
 
 

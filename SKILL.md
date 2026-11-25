@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.5.3
+version: 2.5.4
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -462,8 +462,25 @@ alias zot="python3 scripts/zot.py"
 - 二进制附件通过 `_detect_binary_url` + `archive_binary_url` + `save_file_attachment` 自动处理
 - HTML 附件通过 `monolith` 抓取，经 `_upload_to_webdav` 上传
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
+- 标签词表（`$ZOTERO_VOCAB_DIR/tags.json`）用**原地写**落盘（不用 tmp + rename）：
+  rename 覆盖已存在文件会被 Minis 的文件删除保护判成"删除"并弹回收站确认框，
+  写入被拒后 `generated_ts` 不更新 → 每次都判定词表过期 → 弹窗自锁（2026-11-25 修复）
 
 ## 版本历史
+
+### v2.5.4 — 词表落盘不再触发删除保护弹窗
+
+- **根因**：`_write_vocab_file()` 原用 tmp + `os.replace` 落盘 `tags.json`。
+  `os.replace` 是 "rename 覆盖已存在文件"，在 Minis / iSH 里被文件删除保护
+  （FileGuard）判成"删除" → **每次刷新词表都弹**"把旧文件移到回收站？"确认框；
+  用户点"不允许" → 写入被拒 → `generated_ts` 永远不更新 → 下次仍判定词表过期
+  → 再拉 API → 再弹窗，形成**自锁循环**（不是偶发）。
+- **修复**：改为原地写（`open(path, "w")`）—— 改内容既不是 unlink 也不是
+  rename-over，不触发保护。写一半被打断会留下截断 JSON，但 `_read_vocab_file()`
+  捕获 ValueError 返回 None，`load_vocab()` 随即回退到 API 拉取，不会炸。
+  非法载荷（如不可序列化对象）改为静默失败而不是抛异常。
+- **回归测试**：`tests/test_vocab_write.py`（4 例，无需 API）—— 把 `os.replace`
+  换成毒丸断言写盘仍成功 + 覆盖已有文件且不留 `.tmp` + 非法载荷静默失败。
 
 ### v2.5.3 — 微信离线副本图片修复 + pyzotero 1.17 认证适配
 
