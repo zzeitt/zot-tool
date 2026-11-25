@@ -270,7 +270,7 @@ python3 scripts/zot_guard.py --json "<url>"           # 机器可读
   4. 异常时主动重抓或提示用户
 - **为什么必要**：之前的感知机文章归档后用户报告 CSS 缺失，本地浏览器打开其实是好的——是 Zotero 客户端渲染 bug。提前发现能避免上传错误文件。
 
-### 微信公众号 HTML 后处理（v1.8.1 → **v1.8.2 数据丢失修复**）
+### 微信公众号 HTML 后处理（v1.8.1 → v1.8.2 数据丢失修复 → **v2.5.3 懒加载图内联**）
 
 **v1.8.2 修复了 v1.8.1 的严重数据丢失 bug**：之前替换 `<img data-src="URL" src="data:image/...;base64,...">` 时把 src 的真实 base64 内嵌图（1.5MB / 张）替换成 data-src 的 100 字符外链 URL，导致 **20.9MB 文章变成 322KB、丢失全部 28 张内嵌图、Zotero 离线看不到图**。
 
@@ -281,7 +281,21 @@ python3 scripts/zot_guard.py --json "<url>"           # 机器可读
   3. 删 `data-aistatus / data-imgfileid / data-s / data-ratio / data-type / data-w` 等 WeChat 内部调试属性（~8KB 噪音）
 - **函数签名**：`_fix_wechat_html(filepath)`，返回 `True` 表示做了修改，`False` 表示无需处理（非微信文章或已修复）
 - **幂等性**：通过检测特征字符串 `id="js_content"` 判断是否需要处理，重复调用安全
-- **已知局限**：微信 CDN 图片（`mmbiz.qpic.cn`）的 `data-src` 在 Zotero 内仍可能因网络策略无法加载，但**内嵌 base64 图全保留**，离线 Zotero 仍能看到所有图
+
+**v2.5.3 补充**（2026 版微信 HTML 的 `src` 已不再是真实 base64，而是 1x1 SVG / 空白占位）：
+
+1. **懒加载图内联**：`_inline_wechat_lazy_images()` 逐个 `<img>` 判定——
+   - `src` 已是真实图片（非 SVG、非短 data URI、或 http 外链）→ 保留 `src`，只删 `data-src`；
+   - `src` 是占位且 `data-src` 是 http(s) → 下载并内联为 base64（单图 ≤10MB，整篇总预算 40MB）；
+   - 下载失败 → `src` 回退为 `data-src` 的外链 URL，至少联网时能显示。
+   MIME 由文件头嗅探（JPEG/PNG/GIF/WEBP/BMP/**SVG**），不信任 `Content-Type`。
+   属性匹配用 `(?<![\w-])src=`，否则 `data-src=` 会被误当成 `src=`。
+2. **反爬兜底**：monolith 直连微信常拿到 303KB「环境异常」验证页。`_wechat_offline_via_curl()` 先用
+   iPhone 移动端 UA 的 curl 抓原始页，再 `monolith -b <url> <本地文件>` 处理；monolith 不会覆盖已存在的
+   `-o` 目标（静默 rc=0），所以调用前先删旧文件。
+3. **正文检测**：判断 `id=js_content` 用正则（minified HTML 里可能是 `id=js_content` 无引号）。
+
+- **已知局限**：未启用内联预算时（>40MB）剩余图片仍走外链，Zotero 内可能因网络策略无法加载。
 
 ### Collection 匹配策略（v1.7.0 重构 + v1.7.4 关键修复 + **v1.8.0 域名硬映射优先级最高**）
 
@@ -450,6 +464,22 @@ alias zot="python3 scripts/zot.py"
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
 
 ## 版本历史
+
+### v2.5.3 — 微信离线副本图片修复 + pyzotero 1.17 认证适配
+
+- **pyzotero ≥1.17 认证**：新版把 `Authorization` 从 `client.headers` 移到按请求生成的
+  `default_headers()`，裸 `client.get()` / 手写 `headers=` 的调用会 403。词表分页拉取与
+  附件原地 PATCH（`If-Unmodified-Since-Version`）都改为合并 `zot.default_headers()`。
+- **微信懒加载图内联**：2026 版微信把真实图片放在 `data-src`，`src` 只是 1x1 SVG/空白占位，
+  旧逻辑直接删 `data-src` → 离线副本全部缺图。新增 `_inline_wechat_lazy_images()`：
+  真实图保留、占位图下载后转 base64（单图 ≤10MB / 整篇 ≤40MB）、失败回退外链；
+  `_sniff_image_mime()` 支持 JPEG/PNG/GIF/WEBP/BMP/SVG，不依赖 `Content-Type`。
+- **反爬兜底**：`monolith` 直连微信会拿到「环境异常」验证页，新增
+  `_wechat_offline_via_curl()` —— iPhone UA 的 curl 抓原始 HTML，再 `monolith -b` 本地处理。
+  另外 monolith **不会覆盖**已存在的 `-o` 目标（静默 rc=0），调用前先删除旧文件。
+- **正文检测**：`id=js_content` 改为正则匹配，兼容 minified HTML 的无引号写法。
+- **测试**：新增 `TestWechatLazyImages`（5 例）与 `TestSniffImageMime`（7 例参数化），
+  全量 185 例通过。
 
 ### v2.5.2 — collection 重复创建的根因修复
 
