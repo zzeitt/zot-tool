@@ -10,24 +10,29 @@ Architecture (see /var/minis/workspace/zot-classify-spec.md for full spec):
   Layer 5: Fallback chain
 
 PR status:
-  PR 1 (current): Refactor + zero behavior change.
-    - Layer 1 (extract_signals): stub returning []
-    - Layer 2 (signature): not implemented
+  PR 1: Refactor + zero behavior change (MERGED, v2.5.0).
     - Layer 3 (scoring): replicates current find_best_collection logic
+    - Layer 2 (signature): not implemented
     - Layer 4 (gate): not implemented (no-op)
     - Layer 5 (fallback): not implemented (returns None when scoring fails)
-  PR 2: Will populate extract_signals with 6 sources
+  PR 2 (current): Multi-signal extraction.
+    - Layer 1 (extract_signals): 6 sources implemented
+    - Layer 3 (scoring): STILL the PR 1 text-keyword logic — signals are
+      extracted and reported but do NOT yet change the decision
+    - New: `zot explain` CLI subcommand prints the signal table
   PR 3: Will add corpus signatures
-  PR 4: Will add confidence gate + fallback chain
+  PR 4: Will add confidence gate + fallback chain (signals start deciding)
   PR 5: Will add negative-example memory
 
-Public API contract (PR 1):
+Public API contract:
     find_best_collection(title, description) → (coll_key, coll_name) | None
-    Behavior MUST be identical to the pre-refactor version.
+    PR 1/2: behavior MUST be identical to the pre-refactor version.
+    PR 4+: behavior changes by design (gate + fallback).
 """
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -60,6 +65,30 @@ MIN_MARGIN = 0.15
 # TTL for collection signature cache.
 SIGNATURE_TTL_SECONDS = 3600
 
+# URL path patterns → (collection_hint, confidence). First match wins.
+# Ordered most-specific-first.
+#
+# Patterns are matched against "<netloc><path>" (e.g. "zhihu.com/question/123"),
+# NOT the path alone — otherwise "/question/123" (zhihu) would be swallowed by
+# the stackoverflow pattern "/questions?/\d", since "questions?" also matches
+# the singular "question".
+#
+# Domain-specific paths keep the netloc in the pattern. Only the two generic
+# Substack shapes ("/post/", "/p/") stay netloc-agnostic, because a custom
+# domain on Substack is still a Substack post.
+URL_PATH_PATTERNS: tuple[tuple[str, str, float], ...] = (
+    (r"(^|\.)arxiv\.org/(abs|pdf)/\d",        "arxiv",        0.95),
+    (r"(^|\.)youtube\.com/watch|^youtu\.be/", "youtube",      0.90),
+    (r"(^|\.)stackoverflow\.com/questions?/\d", "stackoverflow", 0.90),
+    (r"(^|\.)wikipedia\.org/wiki/",            "wikipedia",    0.90),
+    (r"(^|\.)ycombinator\.com/item",           "hn",           0.90),
+    (r"(^|\.)bilibili\.com/video/BV",          "bilibili",     0.85),
+    (r"(^|\.)xiaohongshu\.com/discovery/item/", "xhs",          0.85),
+    (r"(^|\.)zhihu\.com/question/\d",          "zhihu",        0.80),
+    (r"/post/",                                "substack",     0.70),
+    (r"/p/",                                   "substack",     0.60),
+)
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -69,7 +98,7 @@ SIGNATURE_TTL_SECONDS = 3600
 class ArticleInput:
     """Normalized article data passed into classification.
 
-    PR 1 only uses title+description. URL/body/user_hints are populated in PR 2+.
+    PR 2 populates url/body_text/user_hints when the caller has them.
     """
     url: str = ""
     title: str = ""
@@ -112,17 +141,163 @@ class ClassificationDecision:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1: Signal extraction
+# Layer 1: Signal extraction (PR 2)
 # ---------------------------------------------------------------------------
+
+def _signal_user_hint(article: ArticleInput) -> Optional[Signal]:
+    """User-supplied hints — the most reliable signal when present."""
+    hints = [h for h in (article.user_hints or []) if h and h.strip()]
+    if not hints:
+        return None
+    return Signal(
+        source="user_hint",
+        collection_hint=hints[0],
+        confidence=0.99,
+        evidence=f"user hint: {', '.join(hints[:3])}",
+    )
+
+
+def _signal_domain(article: ArticleInput) -> Optional[Signal]:
+    """URL netloc → known platform, via zot.py's DOMAIN_TO_SUBCOLL."""
+    if not article.url:
+        return None
+    try:
+        import zot
+        sub = zot._domain_subcoll_name(article.url)
+    except Exception:  # noqa: BLE001 — signals must never raise
+        return None
+    if not sub:
+        return None
+    return Signal(
+        source="domain",
+        collection_hint=f"Misc--{sub}",
+        confidence=0.90,
+        evidence=f"URL domain → {sub}",
+    )
+
+
+def _signal_url_path(article: ArticleInput) -> Optional[Signal]:
+    """URL path shape → platform (covers custom domains on known platforms)."""
+    if not article.url:
+        return None
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(article.url)
+        # Match against netloc+path, not path alone — see URL_PATH_PATTERNS.
+        target = (parsed.netloc or "") + (parsed.path or "")
+    except Exception:  # noqa: BLE001
+        return None
+    for pattern, hint, confidence in URL_PATH_PATTERNS:
+        if re.search(pattern, target):
+            return Signal(
+                source="url_path",
+                collection_hint=f"Misc--{hint}",
+                confidence=confidence,
+                evidence=f"URL {target!r} matches {pattern!r} → {hint}",
+            )
+    return None
+
+
+def _signal_body(article: ArticleInput) -> Optional[Signal]:
+    """Full article body — richest text signal, but only when available."""
+    body = (article.body_text or "").strip()
+    if len(body) < 80:
+        return None
+    keywords = _top_keywords(body, limit=6)
+    if not keywords:
+        return None
+    return Signal(
+        source="body",
+        collection_hint=None,          # PR 3 will match against coll signatures
+        confidence=0.40,
+        evidence=f"body keywords: {', '.join(keywords)}",
+    )
+
+
+def _signal_description(article: ArticleInput) -> Optional[Signal]:
+    """Meta description — often generic, so low weight."""
+    desc = (article.description or "").strip()
+    if len(desc) < 20:
+        return None
+    keywords = _top_keywords(desc, limit=5)
+    if not keywords:
+        return None
+    return Signal(
+        source="description",
+        collection_hint=None,
+        confidence=0.20,
+        evidence=f"description keywords: {', '.join(keywords)}",
+    )
+
+
+def _signal_title(article: ArticleInput) -> Optional[Signal]:
+    """Article title — short, so low weight, but always present."""
+    title = (article.title or "").strip()
+    if not title or title.lower().startswith("http"):
+        return None
+    keywords = _top_keywords(title, limit=4)
+    if not keywords:
+        return None
+    return Signal(
+        source="title",
+        collection_hint=None,
+        confidence=0.15,
+        evidence=f"title keywords: {', '.join(keywords)}",
+    )
+
+
+def _top_keywords(text: str, limit: int = 5) -> list[str]:
+    """Top content words of a text (reuses zot.py's stopword-filtered extractor)."""
+    try:
+        import zot
+        words = zot._title_keywords(text)
+    except Exception:  # noqa: BLE001
+        return []
+    # Drop very short / numeric tokens, keep the longest (most specific) first
+    useful = [w for w in words if len(w) >= 4 and not w.isdigit()]
+    return sorted(useful, key=len, reverse=True)[:limit]
+
 
 def extract_signals(article: ArticleInput) -> list[Signal]:
     """Extract all available signals from an article.
 
-    PR 1: stub returning empty list. PR 2 will populate from 6 sources.
+    PR 2: 6 sources, each independent — one failing never blocks the others.
+    Sources are returned in descending SOURCE_WEIGHTS order so the most
+    reliable signal comes first in the diagnostic output.
 
     Never raises; returns [] on any error. Caller must handle empty case.
     """
-    return []
+    extractors = (
+        _signal_user_hint,
+        _signal_domain,
+        _signal_url_path,
+        _signal_body,
+        _signal_description,
+        _signal_title,
+    )
+    signals: list[Signal] = []
+    for extractor in extractors:
+        try:
+            sig = extractor(article)
+        except Exception:  # noqa: BLE001 — a broken extractor must not
+            continue                   # take down the whole pipeline
+        if sig is not None:
+            signals.append(sig)
+    signals.sort(key=lambda s: -SOURCE_WEIGHTS.get(s.source, 0.0))
+    return signals
+
+
+def format_signals(signals: list[Signal]) -> str:
+    """Render the signal table for `zot explain` output."""
+    if not signals:
+        return "  (no signals extracted)"
+    lines = []
+    for sig in signals:
+        hint = sig.collection_hint or "-"
+        lines.append(
+            f"  {sig.source:<12} conf={sig.confidence:.2f}  hint={hint:<24} {sig.evidence}"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
