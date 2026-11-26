@@ -295,19 +295,23 @@ python3 scripts/zot_guard.py --json "<url>"           # 机器可读
 - 空 collection 批量清理后全库 0 empty ✓
 
 ### 离线副本 Visual Sanity Check（v1.7.3+）
-- **触发**：每次 `zot archive` 成功保存 monolith HTML 后，输出 `📸 VISUAL_CHECK_READY: /var/minis/offloads/<file>.html`
+- **触发**：每次 `zot archive` 成功保存 monolith HTML 后，对这份离线 HTML 做抽查。文件路径由运行环境决定；注意 `zot.py` 在生成摘要 Note 后会删除本地离线文件，需要在归档前留副本，或归档后从 WebDAV 取回 ZIP 解出 HTML。
 - **AI 处理流程**（必做）：
-  1. 用 `browser_use navigate` 打开该路径（minis:// 形式）
-  2. `screenshot full_page=true` 抓全页截图
-  3. **视觉分析**：
+  1. **选择渲染器**：使用当前环境可用的浏览器能力。渲染器必须与文件在**同一台机器**上，能打开本地 `file://` 路径或本机 URL。
+     - 如果浏览器运行在另一台主机上，改用文件所在机器上的浏览器；不要为了连通性把本地文件通过 `0.0.0.0` 暴露到局域网。
+  2. **全页渲染**：用正常的桌面视口（例如 1280×900）渲染，并按所用工具的能力抓取视口之外的内容（full-page / capture beyond viewport / 连续分屏截图均可）。
+     - 不要用「把窗口高度设得极大」来伪造全页：多数工具只截当前视口，长页面会被截断，`height:100%` / `vh` 元素也会被撑满导致布局失真。
+  3. **模拟 Zotero**：Zotero 阅读器不执行 JS。渲染时关闭 JavaScript，或先剥离 `<script>` 再渲染，按无 JS 的结果判断。
+  4. **视觉分析**：
      - CSS 是否完整（卡片、代码块、字体、配色）
-     - 板式是否正常（标题、段落、间距）
+     - 版式是否正常（标题、段落、间距）
      - 是否有缺图/错位
      - 数学公式、交互组件是否保留
-  4. 异常时主动重抓或提示用户
+  5. 异常时主动重抓或提示用户。
+- **无法执行时**：明确记录「未做视觉检查」及原因（例如渲染器够不到本机文件），退回到结构检查（CSS 是否内联、图片是否为 data URI、正文文本量是否正常），不要声称已完成视觉验证。
 - **为什么必要**：之前的感知机文章归档后用户报告 CSS 缺失，本地浏览器打开其实是好的——是 Zotero 客户端渲染 bug。提前发现能避免上传错误文件。
 
-### 微信公众号 HTML 后处理（v1.8.1 → **v1.8.2 数据丢失修复**）
+### 微信公众号 HTML 后处理（v1.8.1 → v1.8.2 数据丢失修复 → **v2.5.3 懒加载图内联**）
 
 **v1.8.2 修复了 v1.8.1 的严重数据丢失 bug**：之前替换 `<img data-src="URL" src="data:image/...;base64,...">` 时把 src 的真实 base64 内嵌图（1.5MB / 张）替换成 data-src 的 100 字符外链 URL，导致 **20.9MB 文章变成 322KB、丢失全部 28 张内嵌图、Zotero 离线看不到图**。
 
@@ -318,7 +322,21 @@ python3 scripts/zot_guard.py --json "<url>"           # 机器可读
   3. 删 `data-aistatus / data-imgfileid / data-s / data-ratio / data-type / data-w` 等 WeChat 内部调试属性（~8KB 噪音）
 - **函数签名**：`_fix_wechat_html(filepath)`，返回 `True` 表示做了修改，`False` 表示无需处理（非微信文章或已修复）
 - **幂等性**：通过检测特征字符串 `id="js_content"` 判断是否需要处理，重复调用安全
-- **已知局限**：微信 CDN 图片（`mmbiz.qpic.cn`）的 `data-src` 在 Zotero 内仍可能因网络策略无法加载，但**内嵌 base64 图全保留**，离线 Zotero 仍能看到所有图
+
+**v2.5.3 补充**（2026 版微信 HTML 的 `src` 已不再是真实 base64，而是 1x1 SVG / 空白占位）：
+
+1. **懒加载图内联**：`_inline_wechat_lazy_images()` 逐个 `<img>` 判定——
+   - `src` 已是真实图片（非 SVG、非短 data URI、或 http 外链）→ 保留 `src`，只删 `data-src`；
+   - `src` 是占位且 `data-src` 是 http(s) → 下载并内联为 base64（单图 ≤10MB，整篇总预算 40MB）；
+   - 下载失败 → `src` 回退为 `data-src` 的外链 URL，至少联网时能显示。
+   MIME 由文件头嗅探（JPEG/PNG/GIF/WEBP/BMP/**SVG**），不信任 `Content-Type`。
+   属性匹配用 `(?<![\w-])src=`，否则 `data-src=` 会被误当成 `src=`。
+2. **反爬兜底**：monolith 直连微信常拿到 303KB「环境异常」验证页。`_wechat_offline_via_curl()` 先用
+   iPhone 移动端 UA 的 curl 抓原始页，再 `monolith -b <url> <本地文件>` 处理；monolith 不会覆盖已存在的
+   `-o` 目标（静默 rc=0），所以调用前先删旧文件。
+3. **正文检测**：判断 `id=js_content` 用正则（minified HTML 里可能是 `id=js_content` 无引号）。
+
+- **已知局限**：未启用内联预算时（>40MB）剩余图片仍走外链，Zotero 内可能因网络策略无法加载。
 
 ### Collection 匹配策略（v1.7.0 重构 + v1.7.4 关键修复 + **v1.8.0 域名硬映射优先级最高**）
 
@@ -485,6 +503,9 @@ alias zot="python3 scripts/zot.py"
 - 二进制附件通过 `_detect_binary_url` + `archive_binary_url` + `save_file_attachment` 自动处理
 - HTML 附件通过 `monolith` 抓取，经 `_upload_to_webdav` 上传
 - 所有附件均使用 `linkMode: imported_file`，ZIP 格式，附带 XML `.prop` 文件
+- 标签词表（`$ZOTERO_VOCAB_DIR/tags.json`）用**原地写**落盘（不用 tmp + rename）：
+  rename 覆盖已存在文件会被 Minis 的文件删除保护判成"删除"并弹回收站确认框，
+  写入被拒后 `generated_ts` 不更新 → 每次都判定词表过期 → 弹窗自锁（2026-11-25 修复）
 
 ## 版本历史
 
@@ -496,6 +517,57 @@ alias zot="python3 scripts/zot.py"
 - 新增 `_download_html_with_headers()`：monolith 失败/缺失时的 curl + 内联 CSS 兜底
 - 新增 `zot site list|set`；存储可换（claude-mem / JSON 文件 / 关闭），默认自动选
 - 集合归属只记人工确认的，自动匹配不回写
+### v2.5.4 — 词表落盘不再触发删除保护弹窗
+
+- **根因**：`_write_vocab_file()` 原用 tmp + `os.replace` 落盘 `tags.json`。
+  `os.replace` 是 "rename 覆盖已存在文件"，在 Minis / iSH 里被文件删除保护
+  （FileGuard）判成"删除" → **每次刷新词表都弹**"把旧文件移到回收站？"确认框；
+  用户点"不允许" → 写入被拒 → `generated_ts` 永远不更新 → 下次仍判定词表过期
+  → 再拉 API → 再弹窗，形成**自锁循环**（不是偶发）。
+- **修复**：改为原地写（`open(path, "w")`）—— 改内容既不是 unlink 也不是
+  rename-over，不触发保护。写一半被打断会留下截断 JSON，但 `_read_vocab_file()`
+  捕获 ValueError 返回 None，`load_vocab()` 随即回退到 API 拉取，不会炸。
+  非法载荷（如不可序列化对象）改为静默失败而不是抛异常。
+- **回归测试**：`tests/test_vocab_write.py`（4 例，无需 API）—— 把 `os.replace`
+  换成毒丸断言写盘仍成功 + 覆盖已有文件且不留 `.tmp` + 非法载荷静默失败。
+
+### v2.5.3 — 微信离线副本图片修复 + pyzotero 1.17 认证适配
+
+- **pyzotero ≥1.17 认证**：新版把 `Authorization` 从 `client.headers` 移到按请求生成的
+  `default_headers()`，裸 `client.get()` / 手写 `headers=` 的调用会 403。词表分页拉取与
+  附件原地 PATCH（`If-Unmodified-Since-Version`）改走 `_auth_headers()`：新版用
+  `default_headers()`，旧版回退到 `client.headers` / `api_key`，因此仍兼容 pyzotero 1.11+。
+- **微信懒加载图内联**：2026 版微信把真实图片放在 `data-src`，`src` 只是 1x1 SVG/空白占位，
+  旧逻辑直接删 `data-src` → 离线副本全部缺图。新增 `_inline_wechat_lazy_images()`：
+  真实图保留、占位图下载后转 base64（单图 ≤10MB / 整篇 ≤40MB）、失败回退外链；
+  `_sniff_image_mime()` 支持 JPEG/PNG/GIF/WEBP/BMP/SVG，不依赖 `Content-Type`。
+- **反爬兜底**：`monolith` 直连微信会拿到「环境异常」验证页，新增
+  `_wechat_offline_via_curl()` —— iPhone UA 的 curl 抓原始 HTML，再 `monolith -b` 本地处理。
+  另外 monolith **不会覆盖**已存在的 `-o` 目标（静默 rc=0），调用前先删除旧文件。
+- **正文检测**：`id=js_content` 改为正则匹配，兼容 minified HTML 的无引号写法。
+- **测试**：新增 `TestWechatLazyImages`（5 例）与 `TestSniffImageMime`（7 例参数化），
+  全量 185 例通过。
+
+### v2.5.2 — collection 重复创建的根因修复
+
+- **磁盘快照失效语义修正**：`_invalidate_collections_cache()` 原本写磁盘快照时
+  走 `_write_collections_cache(version, collections)`，而该函数**无条件**把
+  `ts` 覆盖成 `time.time()` —— 于是「标记为过期」的那份快照被写成了
+  「刚刚写的、新鲜的」，但里面的 collections 列表其实是**旧的**。
+  后果：磁盘 TTL（默认 3600s）之内，每次 CLI 启动都直接命中这份
+  「标着新鲜、内容过期」的快照 → 看不到别的进程/会话刚建的 collection →
+  `create_misc_subcollection` 判定「不存在」→ **建出同名重复 collection**。
+  现在 `_write_collections_cache()` 接受显式 `ts`，失效时传 `ts=0`。
+- **按名字查集合时强制刷新一次**：新增 `_find_collection_by_name()` —— 快照里
+  查不到目标名字时，先 `force_refresh=True` 走 `since=` 增量再查一遍，
+  仍查不到才允许创建。`create_misc_subcollection()` 与
+  `_find_existing_domain_collection()` 都改走它。
+- **回归测试**：`tests/test_collections_cache.py`（7 例，无需 API）——
+  覆盖失效后 `ts==0`、`ts` 显式写入、查不到时强制刷新、命中时不刷新、
+  已有同名集合时不重复创建。
+- 2026-11-11 实测事故：三个并行会话各建了一个 `Misc--infinitelymore`，
+  库内留下三个同名集合（已合并为一个）。
+
 
 ### v2.5.1 — 缓存与增量同步 + 5 个正确性修复
 

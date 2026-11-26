@@ -83,6 +83,24 @@ zot = zotero.Zotero(LIBRARY_ID, LIBRARY_TYPE, API_KEY)
 zot.client.timeout = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
 
 
+def _auth_headers(client=None):
+    """返回带认证的请求头，兼容 pyzotero 1.16 与 ≥1.17。
+
+    pyzotero ≥1.17 把 ``Authorization`` 从共享 client 移到按请求生成的
+    ``default_headers()``；直接调 ``client.get()`` 会漏掉认证 → 403。
+    旧版本没有该方法，认证仍挂在 ``client.headers`` 上。
+    """
+    client = client or zot
+    default_headers = getattr(client, "default_headers", None)
+    if callable(default_headers):
+        return default_headers()
+    headers = dict(getattr(client, "headers", {}) or {})
+    api_key = getattr(client, "api_key", None)
+    if api_key and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 # ---------------------------------------------------------------------------
 # v1.8.0 — Domain hard-mapping & helpers
 # ---------------------------------------------------------------------------
@@ -185,11 +203,16 @@ def _read_collections_cache():
     return None
 
 
-def _write_collections_cache(version, collections):
-    """原子写；失败静默 —— 缓存写不进去不该让归档失败。"""
+def _write_collections_cache(version, collections, ts=None):
+    """原子写；失败静默 —— 缓存写不进去不该让归档失败。
+
+    ``ts`` 显式传入时原样写入（用于把快照标记为过期）；
+    缺省写当前时间。
+    """
     try:
         os.makedirs(_cache_dir(), exist_ok=True)
-        out = {"version": int(version or 0), "ts": time.time(),
+        out = {"version": int(version or 0),
+               "ts": time.time() if ts is None else float(ts),
                "collections": collections}
         tmp = _collections_cache_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -302,10 +325,14 @@ def _all_collections(force_refresh=False):
     if not force_refresh and _collections_cache["data"] is not None and (now - _collections_cache["ts"]) < _COLLECTIONS_CACHE_TTL:
         return _collections_cache["data"]
 
-    disk = _read_collections_cache() if not force_refresh else None
+    # force_refresh 只是**跳过「磁盘快照仍然新鲜」这条捷径**，磁盘快照本身
+    # 仍然要读 —— 有了它里的 version 才能走 `since=` 增量。
+    # （早先写成 `if not force_refresh else None` → force_refresh 直接掉进
+    # 全量分页，660 个 collection 要 10.5s。）
+    disk = _read_collections_cache()
 
     # 磁盘命中且未过期 → 直接用
-    if disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
+    if not force_refresh and disk and (now - disk.get("ts", 0)) < _collections_disk_ttl():
         _collections_cache["data"] = disk["collections"]
         _collections_cache["ts"] = now
         return disk["collections"]
@@ -364,9 +391,33 @@ def _find_existing_domain_collection(url):
     if not sub:
         return None
     target_name = f"Misc--{sub}"
+    key = _find_collection_by_name(target_name)
+    if key:
+        return key, target_name
+    return None
+
+
+def _find_collection_by_name(full_name):
+    """按**精确名字**在库内找 collection —— 带一次强制刷新兜底。
+
+    只靠 ``_all_collections()`` 的快照不够：快照可能因为 TTL 未到 / 别的
+    进程刚建过 collection 而不含目标名字，于是
+    ``create_misc_subcollection`` 会建出**同名重复 collection**
+    （2026-11-11 实测：三个并行会话各建了一个 ``Misc--infinitelymore``）。
+
+    所以查不到时强制刷新一次（走 ``since=`` 增量，通常只多一次请求），
+    再查一遍；仍查不到才允许创建。
+    """
     for c in _all_collections():
-        if c['data'].get('name') == target_name:
-            return c['key'], target_name
+        if c['data'].get('name') == full_name:
+            return c['key']
+    # 快照可能过期 —— 强制刷新后再查一次
+    try:
+        for c in _all_collections(force_refresh=True):
+            if c['data'].get('name') == full_name:
+                return c['key']
+    except Exception:                                  # noqa: BLE001
+        pass
     return None
 
 
@@ -416,13 +467,25 @@ def _invalidate_collections_cache():
 
     进程内清空 + 磁盘 ts 置 0。**保留 version**：下次走 `since=` 增量而不是全量，
     新建/改名一个 collection 只需要拉那一页。
+
+    ⚠️ 2026-11-11 修复：原先这里写的是
+    ``_write_collections_cache(version, collections)``，而该函数无条件把
+    ``ts`` 覆盖成 ``time.time()`` —— 于是磁盘快照被标成「刚刚写的、新鲜的」，
+    但里面的 collections 列表其实是**旧的**（不包含本次刚建的 collection）。
+
+    后果：磁盘 TTL（默认 3600s）之内，后续每次 CLI 启动都直接命中这份
+    「标着新鲜、内容过期」的快照 → 看不到别的进程/别的会话刚建的 collection
+    → ``create_misc_subcollection`` 判定「不存在」→ **建出同名重复 collection**。
+
+    2026-11-11 实测：三个并行会话各建了一个 ``Misc--infinitelymore``，
+    库内留下三个同名集合。现在显式传 ``ts=0``，快照真正被标记为过期。
     """
     _collections_cache["data"] = None
     _collections_cache["ts"] = 0.0
     disk = _read_collections_cache()
     if disk is not None:
-        disk["ts"] = 0
-        _write_collections_cache(disk.get("version") or 0, disk.get("collections") or [])
+        _write_collections_cache(disk.get("version") or 0,
+                                 disk.get("collections") or [], ts=0)
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +494,140 @@ def _invalidate_collections_cache():
 # 微信公众号文章由 monolith 保存后，正文被 visibility:hidden + opacity:0 隐藏，
 # 图片用 data-src 懒加载——两者都依赖 JS。Zotero 禁用 JS，导致正文空白。
 # 此函数在 monolith 完成后对 HTML 做后处理，移除反爬样式并展开图片 src。
+
+
+_IMG_MAX_BYTES = 10 * 1024 * 1024      # 单图上限
+_IMG_TOTAL_BUDGET = 40 * 1024 * 1024   # 整篇内联图片总预算
+
+
+def _sniff_image_mime(data):
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    # 微信的矢量图（公式/示意图）常以 SVG 返回，Content-Type 也是 image/svg+xml
+    _head = data.lstrip(b"\r\n\t ")[:5].lower()
+    if _head.startswith(b"<?xml") or _head.startswith(b"<svg"):
+        return "image/svg+xml"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _fetch_image_data_uri(url, _budget):
+    """下载图片并转成 data URI；失败返回 None。``_budget`` 是单元素 list（剩余预算）。"""
+    if not url.startswith("http"):
+        if url.startswith("//"):
+            url = "https:" + url
+        else:
+            return None
+    if _budget[0] <= 0:
+        return None
+    try:
+        # 用模块级 httpx（venv 里装的可能是 httpx2，plain httpx 不一定有）
+        resp = httpx.get(
+            url,
+            headers={
+                "User-Agent": _WECHAT_UA,
+                "Referer": "https://mp.weixin.qq.com/",
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            },
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0),
+        )
+        resp.raise_for_status()
+        data = resp.content
+    except Exception:  # noqa: BLE001
+        return None
+    if not data or len(data) > _IMG_MAX_BYTES or len(data) > _budget[0]:
+        return None
+    mime = _sniff_image_mime(data)
+    if not mime:
+        return None
+    _budget[0] -= len(data)
+    import base64
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+def _inline_wechat_lazy_images(document):
+    """把微信图片的 ``data-src`` 落成可离线渲染的 ``src``。
+
+    返回 ``(new_html, n_changed)``。分三种情况：
+
+    1. ``src`` 已经是真实图片（非 1x1 SVG 占位、非空白 gif）→ 只删 ``data-src``；
+    2. ``src`` 是占位/空值且 ``data-src`` 是 http(s) → 下载并内联为 base64；
+    3. 下载失败 → 把 ``src`` 指向 ``data-src`` 的 URL（有网时还能显示）。
+    """
+    budget = [_IMG_TOTAL_BUDGET]
+    stats = {"inline": 0, "fallback": 0, "dropped": 0}
+
+    def _attr(tag, name):
+        # (?<![\w-]) 而非 \b：否则 ``data-src=`` 里的 ``src=`` 会被当成 src。
+        m = re.search(
+            rf'(?<![\w-]){name}=(?:"([^"]*)"|(\S+?))(?=[\s>])',
+            tag, re.IGNORECASE,
+        )
+        if not m:
+            return None
+        return m.group(1) if m.group(1) is not None else m.group(2)
+
+    def _set_src(tag, value):
+        if re.search(r'(?<![\w-])src=', tag, re.IGNORECASE):
+            return re.sub(
+                r'(?<![\w-])src=(?:"[^"]*"|\S+?)(?=[\s>])',
+                'src="' + value.replace('\\', '\\\\') + '"', tag,
+                count=1, flags=re.IGNORECASE,
+            )
+        return tag[:-1] + ' src="%s">' % value.replace('\\', '\\\\')
+
+    def _is_real_src(src):
+        if not src:
+            return False
+        if src.startswith("http"):
+            return True
+        if not src.startswith("data:image/"):
+            return False
+        if src.startswith("data:image/svg+xml"):
+            return False          # 1x1 占位 SVG
+        return len(src) > 2048    # 过短视为占位
+
+    def _repl(m):
+        tag = m.group(0)
+        if not re.search(r'\bdata-src=', tag, re.IGNORECASE):
+            return tag
+        src = _attr(tag, "src")
+        ds = _attr(tag, "data-src")
+        if ds and ds.startswith("//"):
+            ds = "https:" + ds
+        if not ds or not ds.startswith("http"):
+            return tag
+        ds = html.unescape(ds)
+
+        if _is_real_src(src):
+            stats["dropped"] += 1
+        else:
+            data_uri = _fetch_image_data_uri(ds, budget)
+            if data_uri:
+                tag = _set_src(tag, data_uri)
+                stats["inline"] += 1
+            else:
+                tag = _set_src(tag, ds)
+                stats["fallback"] += 1
+        tag = re.sub(r'\s*data-src=(?:"[^"]*"|\S+?)(?=[\s>])', '', tag,
+                     flags=re.IGNORECASE)
+        return tag
+
+    new_html = re.sub(r'<img[^>]*>', _repl, document, flags=re.IGNORECASE | re.S)
+    n = stats["inline"] + stats["fallback"] + stats["dropped"]
+    if stats["inline"] or stats["fallback"]:
+        print(f"🖼️  WeChat images: {stats['inline']} inlined"
+              + (f", {stats['fallback']} 回退为外链" if stats["fallback"] else "")
+              + (f", {stats['dropped']} 保留原内嵌图" if stats["dropped"] else ""))
+    return new_html, n
 
 
 def _fix_wechat_html(filepath):
@@ -460,8 +657,10 @@ def _fix_wechat_html(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         html = f.read()
 
-    # Guard: must contain the WeChat article body div
-    if 'id="js_content"' not in html:
+    # Guard: must contain the WeChat article body div。monolith 会把属性压缩成
+    # 无引号形式（``id=js_content``），所以不能只匹配 ``id="js_content"``。
+    js_content_re = r'id=["\']?js_content["\']?'
+    if not re.search(js_content_re, html):
         return False
 
     changed = False
@@ -477,24 +676,16 @@ def _fix_wechat_html(filepath):
         return tag
 
     html, n1 = re.subn(
-        r'<div[^>]*\s+id="js_content"[^>]*style="[^"]*"[^>]*>',
+        r'<div[^>]*\s+' + js_content_re + r'[^>]*style="[^"]*"[^>]*>',
         _clean_js_content_style, html
     )
 
-    # 2. Strip data-src from lazy-loaded images, KEEPING the inline base64 src.
-    #    WeChat pages have <img data-src="https://..." src="data:image/...;base64,..."/>
-    #    The src is the ACTUAL image data (inlined for offline caching) — NOT a
-    #    placeholder. v1.8.1's bug replaced src with data-src URL, losing 19.6MB
-    #    of image data. We now just drop the redundant data-src attribute.
-    def _strip_data_src(m):
-        tag = m.group(0)
-        tag = re.sub(r'\s*data-src="[^"]*"', '', tag)
-        return tag
-
-    html, n2 = re.subn(
-        r'<img[^>]*data-src="https?://[^"]*"[^>]*>',
-        _strip_data_src, html
-    )
+    # 2. Images: WeChat lazy-loads with <img data-src="URL" src="<1x1 占位图>">。
+    #    v1.8.2 的教训是：src 有时是真实 base64 数据（必须保留），但 2026 年的
+    #    页面改成 src 只给 1x1 SVG/空值，真实图在 data-src。因此按 src 的实际
+    #    状态分支：已经是真图就只删 data-src；是占位/空值就把 data-src 下载下来
+    #    内联成 base64（离线 Zotero 无网络、无 JS 也能看图）。
+    html, n2 = _inline_wechat_lazy_images(html)
 
     # 3. Strip WeChat-specific debugging attributes (cosmetic noise, ~8KB savings)
     def _strip_wechat_attrs(m):
@@ -1415,10 +1606,12 @@ def _fetch_all_tags_raw(min_count=3, max_pages=12, page_size=100):
     url = f"{zot.endpoint}/{zot.library_type}/{zot.library_id}/tags"
     out, start = [], 0
     for _ in range(max_pages):
+        # pyzotero ≥1.17 把认证放在 per-request default headers 里，不再挂到
+        # 共享 client 上；直接走 zot.client.get 会漏掉 Authorization → 403。
         resp = zot.client.get(url, params={
             "sort": "numItems", "direction": "desc",
             "limit": page_size, "start": start,
-        })
+        }, headers=_auth_headers())
         resp.raise_for_status()
         page = resp.json()
         if not page:
@@ -1531,15 +1724,29 @@ def _read_vocab_file():
 
 
 def _write_vocab_file(vocab):
-    """原子写（tmp + replace），失败静默 —— 词表落盘失败不该影响归档"""
+    """落盘标签词表 —— **原地写**，不用 tmp + rename（2026-11-25 修复）。
+
+    为什么不用 ``tmp + os.replace``（原实现）：
+    ``os.replace`` 是 "rename 覆盖已存在文件"。在 Minis / iSH 里这被文件
+    删除保护（FileGuard）判成"删除"，于是每次刷新词表都会弹
+    "把旧文件移到回收站？"确认框。用户点"不允许" → 写入被拒 →
+    ``generated_ts`` 永远不更新 → 下次仍判定词表过期 → 再拉 API → 再弹窗，
+    变成自锁循环（不是偶发）。
+
+    原地写（打开已有文件改内容）既不是 unlink 也不是 rename-over，
+    不触发保护。代价：写一半被打断会留下截断的 JSON ——
+    ``_read_vocab_file`` 捕获 ValueError 返回 None，``load_vocab``
+    随即回退到 API 拉取，不会炸。
+
+    失败静默 —— 词表落盘失败不该影响归档。
+    """
     try:
         os.makedirs(_get_vocab_dir(), exist_ok=True)
-        tmp = _vocab_path() + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(vocab, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _vocab_path())
+        payload = json.dumps(vocab, ensure_ascii=False, indent=2)
+        with open(_vocab_path(), "w", encoding="utf-8") as f:
+            f.write(payload)
         return True
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return False
 
 
@@ -2490,11 +2697,12 @@ def create_misc_subcollection(name_hint, url=None):
         sub_name = _fallback_sub_name_from_title(name_hint)
     full_name = f"Misc--{sub_name}"
 
-    for c in _all_collections():
-        if c['data'].get('name') == full_name:
-            print(f"📁 Collection already exists: {full_name}")
-            _invalidate_collections_cache()
-            return c['key']
+    # 查重时强制刷新一次：快照过期会导致建出同名重复 collection
+    existing = _find_collection_by_name(full_name)
+    if existing:
+        print(f"📁 Collection already exists: {full_name}")
+        _invalidate_collections_cache()
+        return existing
 
     coll_template = {'name': full_name, 'parentCollection': MISC_COLLECTION}
     try:
@@ -2570,6 +2778,67 @@ def _detect_binary_url(url):
         return True, "application/pdf", f"{arxiv_id}.pdf"
 
     return False, None, None
+
+
+_WECHAT_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+
+def _is_wechat_article_url(url):
+    return "mp.weixin.qq.com" in (url or "") or "weixin.qq.com/s/" in (url or "")
+
+
+def _wechat_offline_via_curl(url, out_path):
+    """微信公众号兜底：monolith 直连会拿到「环境异常」验证页。
+
+    monolith 的请求特征会触发微信风控，而 curl + 移动端 UA 能拿到完整正文
+    （内嵌 base64 图）。因此先用 curl 落一份本地 HTML，再让 monolith 以它为
+    输入（``-b <url>`` 提供 base URL 以内联站外 CSS/字体）。
+
+    返回 True 表示已生成可用的离线文件。
+    """
+    import tempfile
+    src = os.path.join(tempfile.mkdtemp(prefix="zot_wechat_"), "src.html")
+    try:
+        r = subprocess.run(
+            ["curl", "-sL", "--max-time", "60", "-A", _WECHAT_UA,
+             "-H", "Accept-Language: zh-CN,zh;q=0.9",
+             "-o", src, url],
+            capture_output=True, text=True, timeout=90,
+        )
+        if r.returncode != 0 or not os.path.exists(src):
+            print(f"⚠️  WeChat curl fallback failed: {r.stderr[:200]}")
+            return False
+        with open(src, "r", encoding="utf-8", errors="replace") as f:
+            html = f.read()
+        if 'id="js_content"' not in html:
+            print("⚠️  WeChat curl fallback also got a verification page")
+            return False
+        print(f"🔁 WeChat 环境异常兜底：curl 已取得正文 ({len(html)} bytes)，改用本地 monolith")
+        # monolith 不会覆盖已存在的 -o 目标（静默 rc=0 且文件不变），
+        # 而 out_path 此时正是那张 303KB 的验证页，必须先删掉。
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        r = subprocess.run(
+            ["monolith", "-b", url, src, "-o", out_path],
+            capture_output=True, text=True, timeout=240,
+        )
+        if r.returncode != 0:
+            print(f"⚠️  monolith (local input) failed: {r.stderr[:200]}")
+            return False
+        return os.path.exists(out_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  WeChat curl fallback error: {e}")
+        return False
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(os.path.dirname(src), ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _absolutize_css_urls(css, base_url):
@@ -2783,6 +3052,18 @@ def save_offline_copy(url, parent_item_key, title_hint=None, save_binary=None):
     if monolith_failed or not os.path.exists(tmp_html):
         # monolith 不支持自定义请求头，遇 WAF 站点（Akamai 403）必然失败。
         return _via_curl_css()
+
+    # 微信公众号风控：monolith 直连只会拿到「当前环境异常，完成验证后即可继续访问」
+    # 的验证页（约 303KB、0 张图、正文为空）。curl + 移动端 UA 能拿到完整正文，
+    # 于是用 curl 落盘后再让 monolith 以本地文件为输入。
+    if _is_wechat_article_url(url):
+        try:
+            with open(tmp_html, "r", encoding="utf-8", errors="replace") as f:
+                probe = f.read()
+            if not re.search(r'id=["\']?js_content["\']?', probe):
+                _wechat_offline_via_curl(url, tmp_html)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  WeChat offline probe failed: {e}")
 
     file_size = os.path.getsize(tmp_html)
     print(f"💾 Offline HTML: {tmp_html} ({file_size} bytes)")
@@ -3042,7 +3323,12 @@ def _upload_to_webdav(tmp_file_path, parent_item_key, url, webdav_url, webdav_us
                     zot.endpoint,
                     f"/{zot.library_type}/{zot.library_id}/items/{existing_key}",
                 ),
-                headers={"If-Unmodified-Since-Version": str(version)},
+                # 同 _fetch_all_tags_raw：pyzotero ≥1.17 的认证在 default
+                # headers 里，裸 client 调用必须显式带上。
+                headers={
+                    **_auth_headers(),
+                    "If-Unmodified-Since-Version": str(version),
+                },
                 json={
                     "md5": md5,
                     "mtime": mtime,

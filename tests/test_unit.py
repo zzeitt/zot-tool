@@ -1003,3 +1003,102 @@ class TestCiTraceNote:
         assert "actions/checkout@v6" in text
         step = text.split("actions/checkout@v6", 1)[1].split("- uses:", 1)[0]
         assert "fetch-depth: 2" in step
+
+
+class TestWechatLazyImages:
+    """_inline_wechat_lazy_images() — data-src → offline-visible src."""
+
+    SVG = ('data:image/svg+xml,%3Csvg width=%271px%27 height=%271px%27'
+           '%3E%3C/svg%3E')
+    REAL = "data:image/jpeg;base64," + "A" * 3000
+
+    def test_placeholder_is_replaced_by_inline_data(self, zot, monkeypatch):
+        monkeypatch.setattr(zot, "_fetch_image_data_uri",
+                            lambda url, budget: "data:image/jpeg;base64,QUJD")
+        doc = ('<img class="rich_pages" src="%s" '
+               'data-src="https://mmbiz.qpic.cn/a.jpg/640?wx_fmt=webp&amp;x=1">'
+               % self.SVG)
+        out, n = zot._inline_wechat_lazy_images(doc)
+        assert n == 1
+        assert 'src="data:image/jpeg;base64,QUJD"' in out
+        assert "data-src" not in out
+
+    def test_real_base64_src_is_kept(self, zot, monkeypatch):
+        def _boom(url, budget):
+            raise AssertionError("must not re-download a real image")
+        monkeypatch.setattr(zot, "_fetch_image_data_uri", _boom)
+        doc = ('<img src="%s" data-src="https://mmbiz.qpic.cn/a.jpg">'
+               % self.REAL)
+        out, n = zot._inline_wechat_lazy_images(doc)
+        assert n == 1
+        assert self.REAL in out
+        assert "data-src" not in out
+
+    def test_fetch_failure_falls_back_to_url(self, zot, monkeypatch):
+        monkeypatch.setattr(zot, "_fetch_image_data_uri",
+                            lambda url, budget: None)
+        url = "https://mmbiz.qpic.cn/a.jpg/640"
+        doc = '<img src="%s" data-src="%s">' % (self.SVG, url)
+        out, n = zot._inline_wechat_lazy_images(doc)
+        assert n == 1
+        assert 'src="%s"' % url in out
+        assert "data-src" not in out
+
+    def test_img_without_data_src_untouched(self, zot):
+        doc = '<img src="https://example.com/a.png">'
+        out, n = zot._inline_wechat_lazy_images(doc)
+        assert n == 0 and out == doc
+
+    def test_idempotent(self, zot, monkeypatch):
+        monkeypatch.setattr(zot, "_fetch_image_data_uri",
+                            lambda url, budget: "data:image/jpeg;base64,QUJD")
+        doc = ('<img src="%s" data-src="https://mmbiz.qpic.cn/a.jpg">'
+               % self.SVG)
+        once, _ = zot._inline_wechat_lazy_images(doc)
+        twice, n = zot._inline_wechat_lazy_images(once)
+        assert n == 0 and twice == once
+
+
+class TestSniffImageMime:
+    @pytest.mark.parametrize("data,expected", [
+        (b"\xff\xd8\xff\xe0abc", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\nabc", "image/png"),
+        (b"GIF89a", "image/gif"),
+        (b"RIFF\x00\x00\x00\x00WEBPVP8 ", "image/webp"),
+        (b'<?xml version="1.0"?><svg></svg>', "image/svg+xml"),
+        (b"  \n<svg xmlns='...'></svg>", "image/svg+xml"),
+        (b"<html>not an image</html>", None),
+    ])
+    def test_sniff(self, zot, data, expected):
+        assert zot._sniff_image_mime(data) == expected
+
+
+class TestAuthHeaders:
+    """_auth_headers() — pyzotero <1.17 vs >=1.17 compatibility."""
+
+    def test_uses_default_headers_when_available(self, zot):
+        class NewClient:
+            def default_headers(self):
+                return {"Authorization": "Bearer new"}
+
+        assert zot._auth_headers(NewClient()) == {"Authorization": "Bearer new"}
+
+    def test_legacy_client_headers_are_preserved(self, zot):
+        class LegacyClient:
+            headers = {"Authorization": "Bearer old"}
+
+        assert zot._auth_headers(LegacyClient()) == {
+            "Authorization": "Bearer old"}
+
+    def test_legacy_client_without_headers_builds_bearer(self, zot):
+        class LegacyClient:
+            headers = {}
+            api_key = "KEY123"
+
+        assert zot._auth_headers(LegacyClient()) == {
+            "Authorization": "Bearer KEY123"}
+
+    def test_real_client_carries_auth(self, zot):
+        """The actual client's headers must include the API key."""
+        headers = zot._auth_headers()
+        assert headers.get("Authorization") == "Bearer dummy-key"
