@@ -1,7 +1,7 @@
 ---
 name: zot-tool
 description: Zotero 文献库命令行管理工具
-version: 2.5.5
+version: 2.6.0
 ---
 # Zot Tool - Zotero 文献管理工具
 
@@ -471,6 +471,25 @@ alias zot="python3 scripts/zot.py"
   写入被拒后 `generated_ts` 不更新 → 每次都判定词表过期 → 弹窗自锁（2026-11-25 修复）
 
 ## 版本历史
+
+### v2.6.0 — 分类引擎 PR 2：多信号提取 + `zot explain`
+
+- **6 个信号源**：`zot_classify.extract_signals()` 现在从 6 个独立来源提取证据
+  —— `user_hint`（用户提示，权重 1.00，最高）、`domain`（netloc → 平台，0.70）、
+  `url_path`（路径形状 → 平台，0.50）、`body`（正文关键词，0.40）、
+  `description`（meta 描述，0.20）、`title`（标题，0.15）。
+  每个提取器独立 try/except，一个坏了不影响其它。
+- **URL_PATH_PATTERNS 表**：按 `<netloc><path>` 匹配（**不是只匹配 path**）——
+  否则 zhihu 的 `/question/123` 会被 stackoverflow 的 `/questions?/\d` 抢先命中
+  （`questions?` 也匹配单数 "question"）。域名特异的路径都把 netloc 写进 pattern；
+  只有 Substack 的 `/post/` `/p/` 保持 netloc 无关（自定义域上的 Substack 仍是 Substack）。
+- **`zot explain` 新命令**：打印一个 URL 会被怎样分类 —— 信号表 + 逐候选评分 +
+  最终选择 + runner-up。纯诊断，不写入任何东西。
+- **`find_best_collection()` 接受 `url` / `body_text` / `user_hints`**：
+  `archive_url` 现在把 URL 和 tag_hints 传进去，domain / url_path 信号才有数据。
+- **scoring 未变**（PR 2 contract）：决策仍走旧的文本关键词逻辑，
+  信号只被提取和报告，**还不参与决策**。PR 4 才让它们说话。
+  7 个 behavior-preservation 回归测试全绿（决策结果与重构前逐字一致）。
 
 ### v2.5.4 — 词表落盘不再触发删除保护弹窗
 

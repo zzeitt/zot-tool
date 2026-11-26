@@ -108,15 +108,19 @@ class TestConstants:
 # ---------------------------------------------------------------------------
 
 class TestExtractSignals:
-    def test_returns_empty_list(self):
+    def test_returns_signals_for_title(self, zot):
+        """PR 2: title signal is extracted."""
         article = ArticleInput(
             url="https://example.com",
             title="FLT: Anthropic has beaten me to it",
             description="I guess technically...",
         )
-        assert extract_signals(article) == []
+        signals = extract_signals(article)
+        assert signals, "expected at least a title signal"
+        sources = {s.source for s in signals}
+        assert "title" in sources
 
-    def test_no_exceptions_on_garbage(self):
+    def test_empty_inputs_gives_no_signals(self, zot):
         a = ArticleInput(url="", title="", description="")
         assert extract_signals(a) == []
 
@@ -163,7 +167,7 @@ class TestClassifyOrchestrator:
         a = ArticleInput(url="", title="Lean", description="Mathlib")
         decision = classify(a, candidates=CANDIDATES)
         assert isinstance(decision, ClassificationDecision)
-        assert decision.signals == []
+        assert decision.signals, "PR 2: signals are now extracted"
         assert decision.signature_used is False
         assert decision.fallback_used is None
 

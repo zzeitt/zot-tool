@@ -2338,7 +2338,8 @@ def _legacy_find_best_collection(title, description):
     return best_match
 
 
-def find_best_collection(title, description):
+def find_best_collection(title, description, url=None, body_text=None,
+                         user_hints=None):
     """匹配最合适的 collection，无匹配则返回 None
 
     v1.8.0: 改用 _all_collections() (分页 + 缓存) 替代裸 zot.collections()。
@@ -2350,6 +2351,9 @@ def find_best_collection(title, description):
             不再 `import zot`，避免 CLI 下把 zot.py 以 `zot` 之名再加载一份
             （第二个 Zotero client + 第二份 collection 缓存，且 collection
             列表会被完整分页拉两遍）。
+    v2.6.0 (PR 2): 接受 url/body_text/user_hints，供信号提取使用。
+            **scoring 仍是旧的文本关键词逻辑** —— 信号只被提取和报告，
+            还不参与决策（PR 4 才让它们说话）。
     """
     import zot_classify
 
@@ -2368,13 +2372,90 @@ def find_best_collection(title, description):
     ]
 
     decision = zot_classify.classify(
-        zot_classify.ArticleInput(title=title, description=description),
+        zot_classify.ArticleInput(
+            url=url or "",
+            title=title,
+            description=description,
+            body_text=body_text,
+            user_hints=list(user_hints or []),
+        ),
         candidates=candidates,
         text_keywords=text_keywords,
         extract_coll_keywords=_extract_collection_keywords,
         url_title_guard=_is_url,
     )
     return decision.chosen
+
+
+def explain_classification(title, description, url=None, body_text=None,
+                           user_hints=None):
+    """返回 (decision, signals) —— 供 `zot explain` 打印诊断信息。
+
+    不做任何写操作，纯诊断。PR 2：scoring 仍是旧逻辑，signals 仅报告。
+    """
+    import zot_classify
+
+    text = (title + " " + description).lower()
+    decision = zot_classify.classify(
+        zot_classify.ArticleInput(
+            url=url or "",
+            title=title,
+            description=description,
+            body_text=body_text,
+            user_hints=list(user_hints or []),
+        ),
+        candidates=None,
+        text_keywords=_extract_text_keywords(text),
+        extract_coll_keywords=_extract_collection_keywords,
+        url_title_guard=_is_url,
+    )
+    return decision
+
+
+def _cmd_explain(url, title, description, hints):
+    """`zot explain` — 打印一个 URL 会被怎样分类，以及提取到了哪些信号。
+
+    纯诊断，不写入任何东西。PR 2：scoring 仍是旧的文本关键词逻辑；
+    signals 只被报告，还不参与决策（PR 4 才让它们说话）。
+    """
+    import zot_classify
+
+    url = url or ""
+    title = title or ""
+    description = description or ""
+    hints = list(hints or [])
+
+    if not url and not title:
+        print("Usage: zot explain <url> [--title T] [--desc D] [--hint H]")
+        return
+
+    # 未给 title/desc 时，从 URL 抓元数据（失败不致命）
+    if url and not title:
+        try:
+            meta = fetch_url_metadata(url)
+            title = meta.get("title") or ""
+            if not description:
+                description = meta.get("description") or ""
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️  metadata fetch failed: {e}")
+
+    decision = explain_classification(
+        title, description, url=url, user_hints=hints
+    )
+
+    print("🔍 Classification signals")
+    print(zot_classify.format_signals(decision.signals))
+    print()
+    print("📊 Scoring (current text-keyword logic — signals do not decide yet)")
+    for line in decision.debug_log:
+        print(line)
+    print()
+    if decision.chosen:
+        print(f"✅ Would choose: {decision.chosen[1]}  (key={decision.chosen[0]})")
+    else:
+        print("❌ No collection matched — would fall back to creating Misc--<slug>")
+    if decision.runner_up:
+        print(f"   runner-up: {decision.runner_up[1]}  score={decision.runner_up_score:.2f}")
 
 
 def create_misc_subcollection(name_hint, url=None):
@@ -4378,7 +4459,8 @@ def archive_url(url, title_hint=None, tag_hints=None, save_offline=True):
         coll_name = target_name
         print(f"📁 Domain-mapped new collection: {coll_name}")
     else:
-        matched = find_best_collection(title, description)
+        matched = find_best_collection(title, description, url=url,
+                                       user_hints=tag_hints)
         if matched:
             coll_key, coll_name = matched
             print(f"📁 Matched collection: {coll_name}")
@@ -4598,6 +4680,17 @@ def _build_parser():
 
     atl = att_s.add_parser("list", help="List child items")
     atl.add_argument("parent_key")
+
+    # ── explain ───────────────────────────────────────────────
+    explain = subs.add_parser(
+        "explain",
+        help="Explain how a URL/title/description would be classified",
+    )
+    explain.add_argument("url", nargs="?", help="URL to classify")
+    explain.add_argument("--title", default="", help="Article title")
+    explain.add_argument("--desc", default="", help="Article description")
+    explain.add_argument("--hint", action="append", default=[],
+                         help="User tag/collection hint (repeatable)")
 
     # ── help ──────────────────────────────────────────────────
     subs.add_parser("help", help="Show this help")
@@ -4826,7 +4919,9 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(0)
 
-    if args.action is None:
+    # `explain` is a single-verb command — it has no `action` attribute.
+    _action = getattr(args, "action", None)
+    if _action is None and cmd != "explain":
         # User typed a noun without a verb — show that noun's help
         for _cmd, _sub in [
             ("item", "item"), ("tag", "tag"), ("coll", "coll"),
@@ -4839,7 +4934,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     try:
-        if cmd == "item":
+        if cmd == "explain":
+            _cmd_explain(args.url, args.title, args.desc, args.hint)
+        elif cmd == "item":
             action = args.action
             if action == "add":
                 add_item(args.item_type, args.title, args.url,
