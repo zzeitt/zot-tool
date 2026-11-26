@@ -48,6 +48,8 @@ Optional:
 | `ZOTERO_OFFLINE_DIR` | local fallback dir for offline HTML when WebDAV is unavailable (default `/tmp/zotero-offline`) |
 | `ZOTERO_VOCAB_DIR` | root for library-derived data — tag vocabulary + domain overlay. **Must stay outside the repo** (default `%TEMP%/zot_vocab`) |
 | `ZOTERO_DOMAIN_MAP` | path to `domain_overrides.json` (default `<ZOTERO_VOCAB_DIR>/domain_overrides.json`) |
+| `ZOTERO_SITE_MEM` | site-memory backend: `auto` (default), `claude-mem`, `file`, `off` |
+| `ZOTERO_SITE_MEM_FILE` | JSON store used by the `file` backend (default `<ZOTERO_CACHE_DIR>/sites.json`) |
 
 ## Dependencies
 
